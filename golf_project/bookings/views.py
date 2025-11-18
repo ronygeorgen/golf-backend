@@ -3,6 +3,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework import serializers
+from django.db import transaction
 from django.db.models import Q, Sum
 from django.utils import timezone
 from datetime import datetime, timedelta
@@ -10,6 +11,7 @@ from .models import Booking
 from .serializers import BookingSerializer, BookingCreateSerializer
 from users.models import User
 from simulators.models import Simulator
+from coaching.models import CoachingPackagePurchase
 
 class BookingViewSet(viewsets.ModelViewSet):
     serializer_class = BookingSerializer
@@ -56,40 +58,102 @@ class BookingViewSet(viewsets.ModelViewSet):
             return BookingCreateSerializer
         return BookingSerializer
     
+    def _find_optimal_simulator(self, start_time, end_time):
+        """Assign the best simulator by filling gaps and balancing usage."""
+        active_simulators = Simulator.objects.filter(
+            is_active=True,
+            is_coaching_bay=False
+        ).order_by('bay_number')
+        
+        best_choice = None
+        for simulator in active_simulators:
+            conflict_exists = Booking.objects.filter(
+                simulator=simulator,
+                start_time__lt=end_time,
+                end_time__gt=start_time,
+                status__in=['confirmed', 'completed'],
+                booking_type='simulator'
+            ).exists()
+            
+            if conflict_exists:
+                continue
+            
+            previous_booking = Booking.objects.filter(
+                simulator=simulator,
+                end_time__lte=start_time,
+                booking_type='simulator',
+                status__in=['confirmed', 'completed']
+            ).order_by('-end_time').first()
+            
+            next_booking = Booking.objects.filter(
+                simulator=simulator,
+                start_time__gte=end_time,
+                booking_type='simulator',
+                status__in=['confirmed', 'completed']
+            ).order_by('start_time').first()
+            
+            gap_before = (start_time - previous_booking.end_time).total_seconds() / 60 if previous_booking else 24 * 60
+            gap_after = (next_booking.start_time - end_time).total_seconds() / 60 if next_booking else 24 * 60
+            day_usage = Booking.objects.filter(
+                simulator=simulator,
+                start_time__date=start_time.date(),
+                status__in=['confirmed', 'completed']
+            ).count()
+            
+            # Lower scores are preferred. Encourage filling tight gaps first, then balancing day usage.
+            score = gap_before + gap_after + (day_usage * 15)
+            
+            choice = (score, day_usage, simulator.bay_number, simulator)
+            if not best_choice or choice < best_choice:
+                best_choice = choice
+        
+        return best_choice[-1] if best_choice else None
+    
+    def _consume_package_session(self, package):
+        purchase = CoachingPackagePurchase.objects.select_for_update().filter(
+            client=self.request.user,
+            package=package,
+            sessions_remaining__gt=0
+        ).order_by('purchased_at').first()
+        
+        if not purchase:
+            raise serializers.ValidationError(
+                "You do not have any remaining sessions for the selected package."
+            )
+        
+        purchase.sessions_remaining -= 1
+        purchase.save(update_fields=['sessions_remaining', 'updated_at'])
+        return purchase
+    
     def perform_create(self, serializer):
         # Set the client to the current user
         booking_data = serializer.validated_data
         booking_type = booking_data.get('booking_type')
         
-        # For simulator bookings, assign simulator if not provided
-        if booking_type == 'simulator' and not booking_data.get('simulator'):
-            # Find first available simulator for the time slot
-            start_time = booking_data.get('start_time')
-            end_time = booking_data.get('end_time')
-            duration = booking_data.get('duration_minutes', 60)
-            
-            if start_time and end_time:
-                # Check for available simulators
-                conflicting_bookings = Booking.objects.filter(
-                    start_time__lt=end_time,
-                    end_time__gt=start_time,
-                    status__in=['confirmed', 'completed'],
-                    booking_type='simulator'
+        with transaction.atomic():
+            if booking_type == 'simulator':
+                start_time = booking_data.get('start_time')
+                end_time = booking_data.get('end_time')
+                
+                if start_time and end_time:
+                    assigned_simulator = booking_data.get('simulator') or self._find_optimal_simulator(start_time, end_time)
+                    if not assigned_simulator:
+                        raise serializers.ValidationError("No simulators available for this time slot")
+                    serializer.save(client=self.request.user, simulator=assigned_simulator)
+                    return
+            elif booking_type == 'coaching':
+                package = booking_data.get('coaching_package')
+                if not package:
+                    raise serializers.ValidationError("A coaching package is required for coaching bookings.")
+                
+                purchase = self._consume_package_session(package)
+                serializer.save(
+                    client=self.request.user,
+                    package_purchase=purchase,
+                    total_price=0
                 )
-                booked_simulator_ids = conflicting_bookings.values_list('simulator_id', flat=True)
-                
-                available_simulator = Simulator.objects.filter(
-                    is_active=True,
-                    is_coaching_bay=False
-                ).exclude(id__in=booked_simulator_ids).first()
-                
-                if available_simulator:
-                    serializer.save(client=self.request.user, simulator=available_simulator)
-                else:
-                    raise serializers.ValidationError("No simulators available for this time slot")
-            else:
-                serializer.save(client=self.request.user)
-        else:
+                return
+            
             serializer.save(client=self.request.user)
     
     @action(detail=False, methods=['get'])
@@ -275,6 +339,7 @@ class BookingViewSet(viewsets.ModelViewSet):
         
         date_str = request.query_params.get('date')
         duration_minutes = request.query_params.get('duration', 60)
+        show_bay_details = request.user.role in ['admin', 'staff']
         
         if not date_str:
             return Response(
@@ -368,23 +433,27 @@ class BookingViewSet(viewsets.ModelViewSet):
                         existing_slot = next((s for s in available_slots if s['start_time'] == slot_start_str), None)
                         
                         if not existing_slot:
-                            available_slots.append({
+                            slot_payload = {
+                                'slot_id': f"{slot_start_str}:{duration_minutes}",
                                 'start_time': slot_start_str,
                                 'end_time': slot_end.isoformat(),
                                 'duration_minutes': duration_minutes,
                                 'availability_end_time': availability_end_datetime.isoformat(),
                                 'fits_duration': slot_fits_duration,
-                                'available_simulators': [{
+                                'bay_count': 1,
+                            }
+                            if show_bay_details:
+                                slot_payload['available_simulators'] = [{
                                     'id': simulator.id,
                                     'name': simulator.name,
                                     'bay_number': simulator.bay_number
-                                }],
-                                'assigned_simulator': {
+                                }]
+                                slot_payload['assigned_simulator'] = {
                                     'id': simulator.id,
                                     'name': simulator.name,
                                     'bay_number': simulator.bay_number
                                 }
-                            })
+                            available_slots.append(slot_payload)
                         else:
                             # Keep the furthest availability end time and mark as fitting if any simulator fits
                             if availability_end_datetime.isoformat() > existing_slot.get('availability_end_time', ''):
@@ -392,13 +461,14 @@ class BookingViewSet(viewsets.ModelViewSet):
                             if slot_fits_duration:
                                 existing_slot['fits_duration'] = True
                             existing_slot['end_time'] = slot_end.isoformat()
-                            # Add simulator to existing slot
-                            if simulator.id not in [s['id'] for s in existing_slot['available_simulators']]:
-                                existing_slot['available_simulators'].append({
-                                    'id': simulator.id,
-                                    'name': simulator.name,
-                                    'bay_number': simulator.bay_number
-                                })
+                            existing_slot['bay_count'] = existing_slot.get('bay_count', 1) + 1
+                            if show_bay_details:
+                                if simulator.id not in [s['id'] for s in existing_slot.get('available_simulators', [])]:
+                                    existing_slot.setdefault('available_simulators', []).append({
+                                        'id': simulator.id,
+                                        'name': simulator.name,
+                                        'bay_number': simulator.bay_number
+                                    })
                     
                     current_time += timedelta(minutes=slot_interval)
         
@@ -424,6 +494,12 @@ class BookingViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
+        if not package_id:
+            return Response(
+                {'error': 'package_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
         try:
             booking_date = datetime.strptime(date_str, '%Y-%m-%d').date()
         except ValueError:
@@ -445,17 +521,14 @@ class BookingViewSet(viewsets.ModelViewSet):
         
         # Build the coach queryset based on package/coach selections
         coaches_qs = User.objects.filter(role__in=['staff', 'admin'], is_active=True)
-        selected_package = None
-        
-        if package_id:
-            try:
-                selected_package = CoachingPackage.objects.get(id=package_id, is_active=True)
-                coaches_qs = selected_package.staff_members.filter(role__in=['staff', 'admin'], is_active=True)
-            except CoachingPackage.DoesNotExist:
-                return Response(
-                    {'error': 'Package not found'},
-                    status=status.HTTP_404_NOT_FOUND
-                )
+        try:
+            selected_package = CoachingPackage.objects.get(id=package_id, is_active=True)
+            coaches_qs = selected_package.staff_members.filter(role__in=['staff', 'admin'], is_active=True)
+        except CoachingPackage.DoesNotExist:
+            return Response(
+                {'error': 'Package not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
         
         if coach_id:
             coaches_qs = coaches_qs.filter(id=coach_id)
@@ -474,8 +547,17 @@ class BookingViewSet(viewsets.ModelViewSet):
                 'message': 'No coaches available'
             })
         
-        # Get duration from request (default 60 minutes)
-        duration_minutes = int(request.query_params.get('duration', 60))
+        # Session duration is dictated by package; allow optional override only if it matches
+        requested_duration = request.query_params.get('duration')
+        if requested_duration:
+            duration_minutes = int(requested_duration)
+            if duration_minutes != selected_package.session_duration_minutes:
+                return Response(
+                    {'error': f'Coaching sessions for this package must be {selected_package.session_duration_minutes} minutes.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        else:
+            duration_minutes = selected_package.session_duration_minutes
         
         # Get day of week (0=Monday, 6=Sunday)
         day_of_week = booking_date.weekday()

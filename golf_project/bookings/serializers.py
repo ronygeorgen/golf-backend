@@ -12,6 +12,12 @@ class BookingCreateSerializer(serializers.ModelSerializer):
             'coaching_package', 'coach', 'start_time', 'end_time', 'total_price'
         ]
     
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Make total_price optional - it will be set automatically in validate()
+        if 'total_price' in self.fields:
+            self.fields['total_price'].required = False
+    
     def validate(self, data):
         # Check for booking conflicts
         start_time = data.get('start_time')
@@ -19,6 +25,7 @@ class BookingCreateSerializer(serializers.ModelSerializer):
         simulator = data.get('simulator')
         coach = data.get('coach')
         booking_type = data.get('booking_type')
+        coaching_package = data.get('coaching_package')
         
         if start_time and end_time:
             if start_time >= end_time:
@@ -47,10 +54,21 @@ class BookingCreateSerializer(serializers.ModelSerializer):
                 if conflicting_bookings.exists():
                     raise serializers.ValidationError("This time slot is already booked for the selected coach")
         
-        # Calculate price if not provided
-        if not data.get('total_price'):
-            if booking_type == 'simulator':
-                # Get price from DurationPrice
+        # Booking-type specific validation
+        if booking_type == 'coaching':
+            if not coaching_package:
+                raise serializers.ValidationError("A coaching package is required for coaching bookings.")
+            
+            session_duration = coaching_package.session_duration_minutes
+            if data.get('duration_minutes') and data['duration_minutes'] != session_duration:
+                raise serializers.ValidationError(
+                    f"Coaching sessions must be {session_duration} minutes for the selected package."
+                )
+            data['duration_minutes'] = session_duration
+            data['total_price'] = 0  # Session already prepaid via package
+        elif booking_type == 'simulator':
+            # Calculate price if not provided
+            if not data.get('total_price'):
                 duration = data.get('duration_minutes')
                 if duration:
                     from simulators.models import DurationPrice
@@ -58,15 +76,7 @@ class BookingCreateSerializer(serializers.ModelSerializer):
                         duration_price = DurationPrice.objects.get(duration_minutes=duration)
                         data['total_price'] = duration_price.price
                     except DurationPrice.DoesNotExist:
-                        # Default price if not found
                         data['total_price'] = 0
-            elif booking_type == 'coaching':
-                # Get price from coaching package
-                package = data.get('coaching_package')
-                if package:
-                    data['total_price'] = package.price
-                else:
-                    data['total_price'] = 0
         
         return data
 

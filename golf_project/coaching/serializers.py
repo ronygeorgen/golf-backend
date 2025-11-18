@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import CoachingPackage
+from .models import CoachingPackage, CoachingPackagePurchase
 from users.serializers import UserSerializer
 
 class CoachingPackageSerializer(serializers.ModelSerializer):
@@ -49,4 +49,50 @@ class CoachingPackageSerializer(serializers.ModelSerializer):
             instance.staff_members.set(cleaned_staff_members)
         
         return instance
+
+
+class CoachingPackagePurchaseSerializer(serializers.ModelSerializer):
+    package_details = CoachingPackageSerializer(source='package', read_only=True)
+    client_details = UserSerializer(source='client', read_only=True)
+    
+    class Meta:
+        model = CoachingPackagePurchase
+        fields = [
+            'id',
+            'client',
+            'client_details',
+            'package',
+            'package_details',
+            'sessions_total',
+            'sessions_remaining',
+            'notes',
+            'purchased_at',
+            'updated_at',
+        ]
+        read_only_fields = ['client', 'sessions_remaining', 'purchased_at', 'updated_at']
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Make sessions_total optional - it will be set automatically from package
+        if 'sessions_total' in self.fields:
+            self.fields['sessions_total'].required = False
+    
+    def validate(self, attrs):
+        package = attrs.get('package')
+        sessions_total = attrs.get('sessions_total')
+        request = self.context.get('request')
+        
+        if not package:
+            raise serializers.ValidationError("Package is required.")
+        
+        # Clients cannot override sessions_total. Admins may optionally set one.
+        if not sessions_total or (request and getattr(request.user, 'role', None) == 'client'):
+            attrs['sessions_total'] = package.session_count
+            sessions_total = attrs['sessions_total']
+        
+        if sessions_total < 1:
+            raise serializers.ValidationError("sessions_total must be at least 1.")
+        
+        attrs['sessions_remaining'] = attrs['sessions_total']
+        return attrs
 

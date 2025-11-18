@@ -24,6 +24,13 @@ class Booking(models.Model):
     # Coaching booking fields
     coaching_package = models.ForeignKey('coaching.CoachingPackage', on_delete=models.CASCADE, null=True, blank=True)
     coach = models.ForeignKey('users.User', on_delete=models.CASCADE, null=True, blank=True, related_name='coaching_sessions')
+    package_purchase = models.ForeignKey(
+        'coaching.CoachingPackagePurchase',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='bookings'
+    )
     
     # Common fields
     start_time = models.DateTimeField()

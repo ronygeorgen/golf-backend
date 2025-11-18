@@ -1,10 +1,10 @@
-from rest_framework import viewsets, status
+from rest_framework import viewsets, status, serializers
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, IsAdminUser, AllowAny
 from django.db.models import Q
-from .models import CoachingPackage
-from .serializers import CoachingPackageSerializer
+from .models import CoachingPackage, CoachingPackagePurchase
+from .serializers import CoachingPackageSerializer, CoachingPackagePurchaseSerializer
 
 class CoachingPackageViewSet(viewsets.ModelViewSet):
     queryset = CoachingPackage.objects.all().order_by('-id')
@@ -91,4 +91,30 @@ class CoachingPackageViewSet(viewsets.ModelViewSet):
     def active_packages(self, request):
         active_packages = CoachingPackage.objects.filter(is_active=True)
         serializer = self.get_serializer(active_packages, many=True)
+        return Response(serializer.data)
+
+
+class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
+    serializer_class = CoachingPackagePurchaseSerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        user = self.request.user
+        base_qs = CoachingPackagePurchase.objects.select_related('client', 'package').prefetch_related('package__staff_members')
+        
+        if user.role in ['admin', 'staff']:
+            return base_qs
+        return base_qs.filter(client=user)
+    
+    def perform_create(self, serializer):
+        package = serializer.validated_data.get('package')
+        if not package or not package.is_active:
+            raise serializers.ValidationError("Selected package is not available.")
+        
+        serializer.save(client=self.request.user)
+    
+    @action(detail=False, methods=['get'])
+    def my(self, request):
+        purchases = self.get_queryset().filter(client=request.user)
+        serializer = self.get_serializer(purchases, many=True)
         return Response(serializer.data)
