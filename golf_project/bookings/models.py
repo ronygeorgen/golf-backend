@@ -36,6 +36,13 @@ class Booking(models.Model):
     start_time = models.DateTimeField()
     end_time = models.DateTimeField()
     total_price = models.DecimalField(max_digits=8, decimal_places=2)
+    simulator_credit_redemption = models.OneToOneField(
+        'simulators.SimulatorCredit',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='redeemed_booking'
+    )
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

@@ -1,15 +1,19 @@
+from decimal import Decimal, ROUND_HALF_UP
 from rest_framework import serializers
 from .models import Booking
 from users.serializers import UserSerializer
-from simulators.serializers import SimulatorSerializer
+from simulators.serializers import SimulatorSerializer, SimulatorCreditSerializer
 from coaching.serializers import CoachingPackageSerializer
 
 class BookingCreateSerializer(serializers.ModelSerializer):
+    use_simulator_credit = serializers.BooleanField(write_only=True, required=False, default=False)
+    
     class Meta:
         model = Booking
         fields = [
             'booking_type', 'simulator', 'duration_minutes', 
-            'coaching_package', 'coach', 'start_time', 'end_time', 'total_price'
+            'coaching_package', 'coach', 'start_time', 'end_time', 'total_price',
+            'use_simulator_credit'
         ]
     
     def __init__(self, *args, **kwargs):
@@ -37,6 +41,9 @@ class BookingCreateSerializer(serializers.ModelSerializer):
                 end_time__gt=start_time,
                 status__in=['confirmed', 'completed']
             )
+            exclude_id = self.context.get('exclude_booking_id')
+            if exclude_id:
+                conflicting_bookings = conflicting_bookings.exclude(id=exclude_id)
             
             if booking_type == 'simulator' and simulator:
                 conflicting_bookings = conflicting_bookings.filter(
@@ -56,6 +63,8 @@ class BookingCreateSerializer(serializers.ModelSerializer):
         
         # Booking-type specific validation
         if booking_type == 'coaching':
+            if data.get('use_simulator_credit'):
+                raise serializers.ValidationError("Simulator credits cannot be applied to coaching bookings.")
             if not coaching_package:
                 raise serializers.ValidationError("A coaching package is required for coaching bookings.")
             
@@ -65,18 +74,20 @@ class BookingCreateSerializer(serializers.ModelSerializer):
                     f"Coaching sessions must be {session_duration} minutes for the selected package."
                 )
             data['duration_minutes'] = session_duration
-            data['total_price'] = 0  # Session already prepaid via package
+            if coaching_package.session_count:
+                per_session = (Decimal(coaching_package.price) / Decimal(coaching_package.session_count)).quantize(
+                    Decimal('0.01'),
+                    rounding=ROUND_HALF_UP
+                )
+            else:
+                per_session = Decimal(coaching_package.price).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            data['total_price'] = per_session
         elif booking_type == 'simulator':
-            # Calculate price if not provided
-            if not data.get('total_price'):
-                duration = data.get('duration_minutes')
-                if duration:
-                    from simulators.models import DurationPrice
-                    try:
-                        duration_price = DurationPrice.objects.get(duration_minutes=duration)
-                        data['total_price'] = duration_price.price
-                    except DurationPrice.DoesNotExist:
-                        data['total_price'] = 0
+            data['use_simulator_credit'] = bool(data.get('use_simulator_credit'))
+            if data.get('use_simulator_credit'):
+                data['total_price'] = 0
+        else:
+            data['use_simulator_credit'] = False
         
         return data
 
@@ -85,8 +96,28 @@ class BookingSerializer(serializers.ModelSerializer):
     simulator_details = SimulatorSerializer(source='simulator', read_only=True)
     coach_details = UserSerializer(source='coach', read_only=True)
     package_details = CoachingPackageSerializer(source='coaching_package', read_only=True)
+    simulator_credit_details = SimulatorCreditSerializer(source='simulator_credit_redemption', read_only=True)
+    uses_simulator_credit = serializers.SerializerMethodField()
+    coaching_session_price = serializers.SerializerMethodField()
     
     class Meta:
         model = Booking
         fields = '__all__'
         read_only_fields = ['client', 'created_at', 'updated_at']
+
+    def get_uses_simulator_credit(self, obj):
+        return obj.simulator_credit_redemption_id is not None
+
+    def get_coaching_session_price(self, obj):
+        if obj.booking_type != 'coaching':
+            return None
+        if obj.total_price:
+            return obj.total_price
+        package = getattr(obj, 'coaching_package', None)
+        if package and package.session_count:
+            value = (Decimal(package.price) / Decimal(package.session_count)).quantize(
+                Decimal('0.01'),
+                rounding=ROUND_HALF_UP
+            )
+            return value
+        return Decimal(package.price).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP) if package else None

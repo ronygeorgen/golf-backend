@@ -4,8 +4,13 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, IsAdminUser, AllowAny
 from django.utils import timezone
 from datetime import datetime
-from .models import Simulator, DurationPrice, SimulatorAvailability
-from .serializers import SimulatorSerializer, DurationPriceSerializer, SimulatorAvailabilitySerializer
+from .models import Simulator, DurationPrice, SimulatorAvailability, SimulatorCredit
+from .serializers import (
+    SimulatorSerializer,
+    DurationPriceSerializer,
+    SimulatorAvailabilitySerializer,
+    SimulatorCreditSerializer
+)
 
 class SimulatorViewSet(viewsets.ModelViewSet):
     queryset = Simulator.objects.all().order_by('bay_number')
@@ -168,3 +173,24 @@ class DurationPriceViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         serializer.save()
+
+
+class SimulatorCreditViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = SimulatorCreditSerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        user = self.request.user
+        queryset = SimulatorCredit.objects.select_related('client', 'source_booking').order_by('-issued_at')
+        
+        status_filter = self.request.query_params.get('status')
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+        
+        if getattr(user, 'role', None) == 'admin' or getattr(user, 'is_superuser', False):
+            client_id = self.request.query_params.get('client_id')
+            if client_id:
+                queryset = queryset.filter(client_id=client_id)
+            return queryset
+        
+        return queryset.filter(client=user)

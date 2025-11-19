@@ -1,21 +1,37 @@
+from decimal import Decimal, ROUND_HALF_UP
 from rest_framework import viewsets, status
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework import serializers
 from django.db import transaction
-from django.db.models import Q, Sum
+from django.db.models import Q, Sum, F
 from django.utils import timezone
 from datetime import datetime, timedelta
 from .models import Booking
 from .serializers import BookingSerializer, BookingCreateSerializer
 from users.models import User
-from simulators.models import Simulator
+from simulators.models import Simulator, SimulatorCredit
 from coaching.models import CoachingPackagePurchase
+
+class TenPerPagePagination(PageNumberPagination):
+    page_size = 10
+    page_query_param = 'page'
+    page_size_query_param = None
+
+
+class FivePerPagePagination(PageNumberPagination):
+    page_size = 5
+    page_query_param = 'page'
+    page_size_query_param = None
+
 
 class BookingViewSet(viewsets.ModelViewSet):
     serializer_class = BookingSerializer
     permission_classes = [IsAuthenticated]
+    lock_window = timedelta(hours=24)
+    pagination_class = TenPerPagePagination
     
     def get_queryset(self):
         user = self.request.user
@@ -126,9 +142,10 @@ class BookingViewSet(viewsets.ModelViewSet):
         return purchase
     
     def perform_create(self, serializer):
-        # Set the client to the current user
         booking_data = serializer.validated_data
         booking_type = booking_data.get('booking_type')
+        use_simulator_credit = booking_data.pop('use_simulator_credit', False)
+        redeemed_credit = None
         
         with transaction.atomic():
             if booking_type == 'simulator':
@@ -139,7 +156,29 @@ class BookingViewSet(viewsets.ModelViewSet):
                     assigned_simulator = booking_data.get('simulator') or self._find_optimal_simulator(start_time, end_time)
                     if not assigned_simulator:
                         raise serializers.ValidationError("No simulators available for this time slot")
-                    serializer.save(client=self.request.user, simulator=assigned_simulator)
+                    
+                    if use_simulator_credit:
+                        redeemed_credit = self._reserve_simulator_credit()
+                    
+                    booking = serializer.save(
+                        client=self.request.user,
+                        simulator=assigned_simulator,
+                        total_price=Decimal('0.00')
+                    )
+                    
+                    if redeemed_credit:
+                        redeemed_credit.status = SimulatorCredit.Status.REDEEMED
+                        redeemed_credit.redeemed_at = timezone.now()
+                        redeemed_credit.save(update_fields=['status', 'redeemed_at'])
+                        booking.simulator_credit_redemption = redeemed_credit
+                        booking.total_price = 0
+                        booking.save(update_fields=['simulator_credit_redemption', 'total_price', 'updated_at'])
+                    else:
+                        booking.total_price = self._calculate_simulator_price(
+                            assigned_simulator,
+                            booking.duration_minutes
+                        )
+                        booking.save(update_fields=['total_price', 'updated_at'])
                     return
             elif booking_type == 'coaching':
                 package = booking_data.get('coaching_package')
@@ -150,7 +189,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                 serializer.save(
                     client=self.request.user,
                     package_purchase=purchase,
-                    total_price=0
+                    total_price=booking_data.get('total_price', 0)
                 )
                 return
             
@@ -159,10 +198,20 @@ class BookingViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def upcoming(self, request):
         """Get all upcoming bookings for the current user"""
+        booking_type = request.query_params.get('booking_type')
         upcoming_bookings = Booking.objects.filter(
             client=request.user,
             start_time__gte=timezone.now()
         ).exclude(status='cancelled').order_by('start_time')
+        if booking_type in ['simulator', 'coaching']:
+            upcoming_bookings = upcoming_bookings.filter(booking_type=booking_type)
+        
+        # Use 5 per page pagination for upcoming bookings
+        paginator = FivePerPagePagination()
+        page = paginator.paginate_queryset(upcoming_bookings, request)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return paginator.get_paginated_response(serializer.data)
         
         serializer = self.get_serializer(upcoming_bookings, many=True)
         return Response(serializer.data)
@@ -183,6 +232,89 @@ class BookingViewSet(viewsets.ModelViewSet):
         
         serializer = self.get_serializer(today_bookings, many=True)
         return Response(serializer.data)
+    
+    def _is_admin(self, user):
+        return getattr(user, 'role', None) == 'admin' or getattr(user, 'is_superuser', False)
+    
+    def _lock_applies(self, booking):
+        return booking.start_time - timezone.now() < self.lock_window
+    
+    def _user_can_manage_booking(self, user, booking):
+        if user.role in ['admin', 'staff']:
+            return True
+        return booking.client_id == user.id
+    
+    def _reserve_simulator_credit(self):
+        credit = SimulatorCredit.objects.select_for_update().filter(
+            status=SimulatorCredit.Status.AVAILABLE,
+            client=self.request.user
+        ).order_by('issued_at').first()
+        if not credit:
+            raise serializers.ValidationError("No simulator credits available to redeem.")
+        return credit
+
+    def _calculate_simulator_price(self, simulator, duration_minutes):
+        if not simulator or not duration_minutes:
+            return Decimal('0.00')
+        if simulator.is_coaching_bay:
+            return Decimal('0.00')
+        if simulator.hourly_price:
+            hours = Decimal(duration_minutes) / Decimal(60)
+            price = (Decimal(simulator.hourly_price) * hours).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+            return price
+        from simulators.models import DurationPrice
+        try:
+            duration_price = DurationPrice.objects.get(duration_minutes=duration_minutes)
+            return Decimal(duration_price.price)
+        except DurationPrice.DoesNotExist:
+            return Decimal('0.00')
+    
+    def _restore_coaching_session(self, booking):
+        purchase = booking.package_purchase
+        if not purchase:
+            return None
+        purchase.sessions_remaining = F('sessions_remaining') + 1
+        purchase.save(update_fields=['sessions_remaining', 'updated_at'])
+        purchase.refresh_from_db(fields=['sessions_remaining'])
+        return purchase.sessions_remaining
+    
+    def _issue_simulator_credit(self, booking, issued_by=None, reason=SimulatorCredit.Reason.CANCELLATION):
+        credit = SimulatorCredit.objects.create(
+            client=booking.client,
+            reason=reason,
+            issued_by=issued_by if issued_by and self._is_admin(issued_by) else None,
+            source_booking=booking,
+            notes=f"Credit issued for booking #{booking.id}"
+        )
+        return credit
+    
+    def update(self, request, *args, **kwargs):
+        booking = self.get_object()
+        if not self._user_can_manage_booking(request.user, booking):
+            return Response(
+                {'error': 'Permission denied'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        if self._lock_applies(booking) and not self._is_admin(request.user):
+            return Response(
+                {'error': 'Bookings within 24 hours cannot be modified. Contact an admin for assistance.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        return super().update(request, *args, **kwargs)
+    
+    def partial_update(self, request, *args, **kwargs):
+        booking = self.get_object()
+        if not self._user_can_manage_booking(request.user, booking):
+            return Response(
+                {'error': 'Permission denied'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        if self._lock_applies(booking) and not self._is_admin(request.user):
+            return Response(
+                {'error': 'Bookings within 24 hours cannot be modified. Contact an admin for assistance.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        return super().partial_update(request, *args, **kwargs)
     
     @action(detail=True, methods=['post'])
     def update_status(self, request, pk=None):
@@ -218,19 +350,132 @@ class BookingViewSet(viewsets.ModelViewSet):
     def cancel(self, request, pk=None):
         """Cancel a booking"""
         booking = self.get_object()
+        force_override_value = request.data.get('force_override', False)
+        force_override = str(force_override_value).lower() in ['1', 'true', 'yes']
         
-        # Check if user has permission to cancel this booking
-        if booking.client != request.user and request.user.role not in ['admin', 'staff']:
+        if not self._user_can_manage_booking(request.user, booking):
             return Response(
                 {'error': 'Permission denied'}, 
                 status=status.HTTP_403_FORBIDDEN
             )
         
-        booking.status = 'cancelled'
-        booking.save()
+        if booking.status == 'cancelled':
+            serializer = self.get_serializer(booking)
+            return Response({
+                'message': 'Booking already cancelled',
+                'booking': serializer.data
+            }, status=status.HTTP_200_OK)
         
+        lock_applies = self._lock_applies(booking)
+        if lock_applies and not (force_override and self._is_admin(request.user)):
+            return Response(
+                {
+                    'error': 'This booking starts within 24 hours and cannot be cancelled online. Contact an admin for assistance.',
+                    'lock_applies': True
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        with transaction.atomic():
+            booking.status = 'cancelled'
+            booking.save(update_fields=['status', 'updated_at'])
+            restitution = {}
+            
+            if booking.booking_type == 'coaching':
+                remaining = self._restore_coaching_session(booking)
+                restitution['sessions_remaining'] = remaining
+            elif booking.booking_type == 'simulator':
+                credit = self._issue_simulator_credit(
+                    booking,
+                    issued_by=request.user if force_override and self._is_admin(request.user) else None
+                )
+                restitution['simulator_credit_id'] = credit.id
+        
+        serializer = self.get_serializer(booking)
         return Response({
-            'message': 'Booking cancelled successfully'
+            'message': 'Booking cancelled successfully',
+            'booking': serializer.data,
+            'lock_applies': lock_applies,
+            'lock_overridden': lock_applies and force_override and self._is_admin(request.user),
+            'restitution': restitution
+        })
+
+    @action(detail=True, methods=['post'])
+    def reschedule(self, request, pk=None):
+        """Reschedule a booking to a new time"""
+        booking = self.get_object()
+        force_override_value = request.data.get('force_override', False)
+        force_override = str(force_override_value).lower() in ['1', 'true', 'yes']
+        
+        if not self._user_can_manage_booking(request.user, booking):
+            return Response(
+                {'error': 'Permission denied'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        lock_applies = self._lock_applies(booking)
+        if lock_applies and not (force_override and self._is_admin(request.user)):
+            return Response(
+                {
+                    'error': 'Bookings within 24 hours cannot be rescheduled online. Contact an admin for assistance.',
+                    'lock_applies': True
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        incoming_data = request.data.copy()
+        incoming_data['booking_type'] = booking.booking_type
+        incoming_data.setdefault('duration_minutes', booking.duration_minutes)
+        if booking.booking_type == 'coaching':
+            if not booking.coaching_package:
+                return Response({'error': 'This coaching booking is missing its package reference.'}, status=status.HTTP_400_BAD_REQUEST)
+            incoming_data.setdefault('coaching_package', booking.coaching_package_id)
+            if booking.coach_id:
+                incoming_data.setdefault('coach', booking.coach_id)
+        elif booking.booking_type == 'simulator' and booking.simulator_id:
+            incoming_data.setdefault('simulator', booking.simulator_id)
+        
+        serializer = BookingCreateSerializer(
+            data=incoming_data,
+            context={'exclude_booking_id': booking.id}
+        )
+        serializer.is_valid(raise_exception=True)
+        validated = serializer.validated_data
+        
+        with transaction.atomic():
+            booking.start_time = validated['start_time']
+            booking.end_time = validated['end_time']
+            booking.duration_minutes = validated.get('duration_minutes', booking.duration_minutes)
+            
+            update_fields = ['start_time', 'end_time', 'duration_minutes', 'updated_at']
+            if booking.booking_type == 'simulator':
+                assigned_simulator = validated.get('simulator')
+                if not assigned_simulator:
+                    assigned_simulator = self._find_optimal_simulator(booking.start_time, booking.end_time)
+                if not assigned_simulator:
+                    raise serializers.ValidationError("No simulators available for this time slot")
+                booking.simulator = assigned_simulator
+                update_fields.append('simulator')
+            elif booking.booking_type == 'coaching':
+                if validated.get('coach'):
+                    booking.coach = validated['coach']
+                    update_fields.append('coach')
+
+            if booking.booking_type == 'simulator' and not booking.simulator_credit_redemption_id:
+                booking.total_price = self._calculate_simulator_price(
+                    booking.simulator,
+                    booking.duration_minutes
+                )
+                update_fields.append('total_price')
+            
+            booking.save(update_fields=update_fields)
+        
+        serializer = self.get_serializer(booking)
+        return Response({
+            'message': 'Booking rescheduled successfully',
+            'booking': serializer.data,
+            'lock_applies': lock_applies,
+            'lock_overridden': lock_applies and force_override and self._is_admin(request.user)
         })
     
     @action(detail=False, methods=['get'])

@@ -1,11 +1,29 @@
 from rest_framework import serializers
 from datetime import datetime
-from .models import Simulator, DurationPrice, SimulatorAvailability
+from .models import Simulator, DurationPrice, SimulatorAvailability, SimulatorCredit
+from users.serializers import UserSerializer
 
 class SimulatorSerializer(serializers.ModelSerializer):
     class Meta:
         model = Simulator
         fields = '__all__'
+    
+    def validate(self, attrs):
+        is_coaching = attrs.get('is_coaching_bay')
+        if is_coaching is None and self.instance:
+            is_coaching = self.instance.is_coaching_bay
+        
+        hourly_price = attrs.get('hourly_price')
+        if hourly_price is None and self.instance:
+            hourly_price = self.instance.hourly_price
+        
+        if not is_coaching:
+            if hourly_price is None or hourly_price <= 0:
+                raise serializers.ValidationError("Normal simulators require a positive hourly price.")
+        else:
+            attrs['hourly_price'] = None
+        
+        return attrs
 
 class DurationPriceSerializer(serializers.ModelSerializer):
     class Meta:
@@ -57,4 +75,31 @@ class SimulatorAvailabilitySerializer(serializers.ModelSerializer):
                 except ValueError:
                     pass
         return super().to_internal_value(data)
+
+
+class SimulatorCreditSerializer(serializers.ModelSerializer):
+    client_details = UserSerializer(source='client', read_only=True)
+    
+    class Meta:
+        model = SimulatorCredit
+        fields = [
+            'id',
+            'client',
+            'client_details',
+            'status',
+            'reason',
+            'issued_by',
+            'issued_at',
+            'redeemed_at',
+            'source_booking',
+            'notes',
+        ]
+        read_only_fields = [
+            'status',
+            'reason',
+            'issued_by',
+            'issued_at',
+            'redeemed_at',
+            'source_booking',
+        ]
 

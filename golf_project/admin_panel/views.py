@@ -1,15 +1,18 @@
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from django.db.models import Count, Sum, Q
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.exceptions import PermissionDenied
+from django.db.models import Count, Sum, Q, F
 from django.utils import timezone
 from datetime import datetime, timedelta
 from users.models import User, StaffAvailability
-from simulators.models import Simulator
-from coaching.models import CoachingPackage
+from simulators.models import Simulator, SimulatorCredit
 from bookings.models import Booking
 from users.serializers import UserSerializer, StaffSerializer, StaffAvailabilitySerializer
 from bookings.serializers import BookingSerializer
+from .serializers import CoachingSessionAdjustmentSerializer, SimulatorCreditGrantSerializer
+from simulators.serializers import SimulatorCreditSerializer
 
 class AdminDashboardViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'])
@@ -145,3 +148,62 @@ class StaffViewSet(viewsets.ModelViewSet):
             # Return updated availability list
             serializer = StaffAvailabilitySerializer(updated_availability, many=True)
             return Response(serializer.data)
+
+
+class AdminOverrideViewSet(viewsets.ViewSet):
+    permission_classes = [IsAuthenticated]
+    
+    def _ensure_admin(self, request):
+        if getattr(request.user, 'role', None) != 'admin' and not getattr(request.user, 'is_superuser', False):
+            raise PermissionDenied("Administrator privileges are required for this action.")
+    
+    @action(detail=False, methods=['post'], url_path='coaching-sessions')
+    def coaching_sessions(self, request):
+        self._ensure_admin(request)
+        serializer = CoachingSessionAdjustmentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        purchase = serializer.validated_data['purchase']
+        session_count = serializer.validated_data['session_count']
+        note = serializer.validated_data.get('note')
+        
+        purchase.sessions_remaining = F('sessions_remaining') + session_count
+        purchase.save(update_fields=['sessions_remaining', 'updated_at'])
+        if note:
+            updated_note = f"{purchase.notes}\n{note}".strip() if purchase.notes else note
+            purchase.notes = updated_note[:255]
+            purchase.save(update_fields=['notes'])
+        purchase.refresh_from_db(fields=['sessions_remaining', 'notes', 'updated_at'])
+        
+        return Response({
+            'message': f'{session_count} session(s) added back to the package.',
+            'purchase_id': purchase.id,
+            'sessions_remaining': purchase.sessions_remaining,
+            'notes': purchase.notes
+        })
+    
+    @action(detail=False, methods=['post'], url_path='simulator-credits')
+    def simulator_credits(self, request):
+        self._ensure_admin(request)
+        serializer = SimulatorCreditGrantSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        client = serializer.validated_data['client']
+        token_count = serializer.validated_data['token_count']
+        reason = serializer.validated_data['reason']
+        note = serializer.validated_data.get('note') or ''
+        
+        credits = []
+        for _ in range(token_count):
+            credit = SimulatorCredit.objects.create(
+                client=client,
+                issued_by=request.user,
+                reason=reason,
+                notes=note[:255] if note else f"Manual credit issued on {timezone.now().date()}"
+            )
+            credits.append(credit)
+        
+        credit_data = SimulatorCreditSerializer(credits, many=True).data
+        return Response({
+            'message': f'{token_count} simulator credit(s) granted.',
+            'credits': credit_data
+        }, status=status.HTTP_201_CREATED)

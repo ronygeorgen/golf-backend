@@ -12,6 +12,7 @@ router.register(r'simulators', SimulatorViewSet, basename='admin-simulators')
 router.register(r'duration-prices', DurationPriceViewSet, basename='admin-duration-prices')
 router.register(r'packages', CoachingPackageViewSet, basename='admin-packages')
 router.register(r'bookings', BookingViewSet, basename='admin-bookings')
+router.register(r'overrides', views.AdminOverrideViewSet, basename='admin-overrides')
 
 urlpatterns = [
     path('', include(router.urls)),
