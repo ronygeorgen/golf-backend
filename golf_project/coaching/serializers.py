@@ -1,6 +1,9 @@
 from rest_framework import serializers
-from .models import CoachingPackage, CoachingPackagePurchase
+from django.utils import timezone
+from datetime import timedelta
+from .models import CoachingPackage, CoachingPackagePurchase, SessionTransfer
 from users.serializers import UserSerializer
+from users.models import User
 
 class CoachingPackageSerializer(serializers.ModelSerializer):
     staff_members_details = UserSerializer(source='staff_members', many=True, read_only=True)
@@ -54,6 +57,8 @@ class CoachingPackageSerializer(serializers.ModelSerializer):
 class CoachingPackagePurchaseSerializer(serializers.ModelSerializer):
     package_details = CoachingPackageSerializer(source='package', read_only=True)
     client_details = UserSerializer(source='client', read_only=True)
+    original_owner_details = UserSerializer(source='original_owner', read_only=True)
+    recipient_name = serializers.SerializerMethodField()
     
     class Meta:
         model = CoachingPackagePurchase
@@ -63,13 +68,36 @@ class CoachingPackagePurchaseSerializer(serializers.ModelSerializer):
             'client_details',
             'package',
             'package_details',
+            'purchase_name',
             'sessions_total',
             'sessions_remaining',
             'notes',
+            'purchase_type',
+            'recipient_phone',
+            'recipient_name',
+            'gift_status',
+            'gift_token',
+            'original_owner',
+            'original_owner_details',
+            'package_status',
             'purchased_at',
             'updated_at',
+            'gift_expires_at',
         ]
-        read_only_fields = ['client', 'sessions_remaining', 'purchased_at', 'updated_at']
+        read_only_fields = [
+            'client', 'sessions_remaining', 'purchased_at', 'updated_at',
+            'gift_token', 'original_owner', 'package_status'
+        ]
+    
+    def get_recipient_name(self, obj):
+        """Get recipient name if user exists"""
+        if obj.recipient_phone:
+            try:
+                user = User.objects.get(phone=obj.recipient_phone)
+                return user.get_full_name() or user.username
+            except User.DoesNotExist:
+                return None
+        return None
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -80,10 +108,40 @@ class CoachingPackagePurchaseSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         package = attrs.get('package')
         sessions_total = attrs.get('sessions_total')
+        purchase_type = attrs.get('purchase_type', 'normal')
+        recipient_phone = attrs.get('recipient_phone')
         request = self.context.get('request')
         
         if not package:
             raise serializers.ValidationError("Package is required.")
+        
+        purchase_name = attrs.get('purchase_name')
+
+        if not purchase_name or not purchase_name.strip():
+            raise serializers.ValidationError({
+                'purchase_name': 'A purchase name is required.'
+            })
+        attrs['purchase_name'] = purchase_name.strip()
+
+        # Validate gift purchase
+        if purchase_type == 'gift':
+            if not recipient_phone:
+                raise serializers.ValidationError({
+                    'recipient_phone': 'Recipient phone number is required for gift purchases.'
+                })
+            
+            # Check if recipient exists
+            try:
+                recipient = User.objects.get(phone=recipient_phone)
+                # Don't allow gifting to yourself
+                if request and request.user == recipient:
+                    raise serializers.ValidationError({
+                        'recipient_phone': 'You cannot gift a package to yourself.'
+                    })
+            except User.DoesNotExist:
+                raise serializers.ValidationError({
+                    'recipient_phone': 'Recipient with this phone number does not exist in the system.'
+                })
         
         # Clients cannot override sessions_total. Admins may optionally set one.
         if not sessions_total or (request and getattr(request.user, 'role', None) == 'client'):
@@ -94,5 +152,129 @@ class CoachingPackagePurchaseSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("sessions_total must be at least 1.")
         
         attrs['sessions_remaining'] = attrs['sessions_total']
+        
+        # Set gift-related fields
+        if purchase_type == 'gift':
+            attrs['gift_status'] = 'pending'
+            attrs['original_owner'] = request.user if request else None
+            # Gift expires in 30 days
+            attrs['gift_expires_at'] = timezone.now() + timedelta(days=30)
+        else:
+            attrs['gift_status'] = None
+            attrs['package_status'] = 'active'
+        
         return attrs
+    
+    def create(self, validated_data):
+        # Handle extra kwargs from serializer.save() calls (like client=recipient)
+        # This is needed because DRF passes extra kwargs to create()
+        purchase_type = validated_data.get('purchase_type', 'normal')
+        
+        # Generate gift token if it's a gift purchase
+        if purchase_type == 'gift':
+            instance = CoachingPackagePurchase(**validated_data)
+            instance.gift_token = instance.generate_gift_token()
+            instance.save()
+            return instance
+        
+        return super().create(validated_data)
+
+
+class SessionTransferSerializer(serializers.ModelSerializer):
+    from_user_details = UserSerializer(source='from_user', read_only=True)
+    to_user_details = UserSerializer(source='to_user', read_only=True)
+    package_purchase_details = CoachingPackagePurchaseSerializer(source='package_purchase', read_only=True)
+    recipient_name = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = SessionTransfer
+        fields = [
+            'id',
+            'from_user',
+            'from_user_details',
+            'to_user_phone',
+            'to_user',
+            'to_user_details',
+            'recipient_name',
+            'package_purchase',
+            'package_purchase_details',
+            'session_count',
+            'transfer_status',
+            'transfer_token',
+            'notes',
+            'created_at',
+            'updated_at',
+            'expires_at',
+        ]
+        read_only_fields = [
+            'from_user', 'to_user', 'transfer_token', 'transfer_status',
+            'created_at', 'updated_at'
+        ]
+    
+    def get_recipient_name(self, obj):
+        """Get recipient name if user exists"""
+        if obj.to_user_phone:
+            try:
+                user = User.objects.get(phone=obj.to_user_phone)
+                return user.get_full_name() or user.username
+            except User.DoesNotExist:
+                return None
+        return None
+    
+    def validate(self, attrs):
+        package_purchase = attrs.get('package_purchase')
+        session_count = attrs.get('session_count')
+        to_user_phone = attrs.get('to_user_phone')
+        request = self.context.get('request')
+        
+        if not package_purchase:
+            raise serializers.ValidationError("Package purchase is required.")
+        
+        # Validate package ownership
+        if request and package_purchase.client != request.user:
+            raise serializers.ValidationError({
+                'package_purchase': 'You can only transfer sessions from your own packages.'
+            })
+        
+        # Validate session count
+        if session_count < 1:
+            raise serializers.ValidationError({
+                'session_count': 'Session count must be at least 1.'
+            })
+        
+        if session_count > package_purchase.sessions_remaining:
+            raise serializers.ValidationError({
+                'session_count': f'Cannot transfer more sessions than available. Available: {package_purchase.sessions_remaining}'
+            })
+        
+        # Check if recipient exists
+        if to_user_phone:
+            try:
+                recipient = User.objects.get(phone=to_user_phone)
+                # Don't allow transferring to yourself
+                if request and request.user == recipient:
+                    raise serializers.ValidationError({
+                        'to_user_phone': 'You cannot transfer sessions to yourself.'
+                    })
+            except User.DoesNotExist:
+                raise serializers.ValidationError({
+                    'to_user_phone': 'Recipient with this phone number does not exist in the system.'
+                })
+        
+        # Check if package can be transferred
+        if not package_purchase.can_be_transferred:
+            raise serializers.ValidationError({
+                'package_purchase': 'This package cannot be transferred. It may be depleted, completed, or have a pending gift.'
+            })
+        
+        # Transfer expires in 30 days
+        attrs['expires_at'] = timezone.now() + timedelta(days=30)
+        
+        return attrs
+    
+    def create(self, validated_data):
+        instance = SessionTransfer(**validated_data)
+        instance.transfer_token = instance.generate_transfer_token()
+        instance.save()
+        return instance
 

@@ -2,9 +2,17 @@ from rest_framework import viewsets, status, serializers
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, IsAdminUser, AllowAny
+from rest_framework.views import APIView
 from django.db.models import Q
-from .models import CoachingPackage, CoachingPackagePurchase
-from .serializers import CoachingPackageSerializer, CoachingPackagePurchaseSerializer
+from django.utils import timezone
+from django.shortcuts import get_object_or_404
+from .models import CoachingPackage, CoachingPackagePurchase, SessionTransfer
+from .serializers import (
+    CoachingPackageSerializer, 
+    CoachingPackagePurchaseSerializer,
+    SessionTransferSerializer
+)
+from users.models import User
 
 class CoachingPackageViewSet(viewsets.ModelViewSet):
     queryset = CoachingPackage.objects.all().order_by('-id')
@@ -100,21 +108,250 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
-        base_qs = CoachingPackagePurchase.objects.select_related('client', 'package').prefetch_related('package__staff_members')
+        base_qs = CoachingPackagePurchase.objects.select_related(
+            'client', 'package', 'original_owner'
+        ).prefetch_related('package__staff_members')
         
         if user.role in ['admin', 'staff']:
             return base_qs
-        return base_qs.filter(client=user)
+        
+        # Clients see their own purchases and gifts received
+        return base_qs.filter(
+            Q(client=user) | Q(recipient_phone=user.phone, gift_status='accepted')
+        )
     
     def perform_create(self, serializer):
         package = serializer.validated_data.get('package')
+        purchase_type = serializer.validated_data.get('purchase_type', 'normal')
+        
         if not package or not package.is_active:
             raise serializers.ValidationError("Selected package is not available.")
         
-        serializer.save(client=self.request.user)
+        # For gift purchases, set client to recipient when creating
+        if purchase_type == 'gift':
+            recipient_phone = serializer.validated_data.get('recipient_phone')
+            try:
+                recipient = User.objects.get(phone=recipient_phone)
+                serializer.save(client=recipient, original_owner=self.request.user)
+            except User.DoesNotExist:
+                raise serializers.ValidationError("Recipient not found.")
+        else:
+            serializer.save(client=self.request.user)
     
     @action(detail=False, methods=['get'])
     def my(self, request):
-        purchases = self.get_queryset().filter(client=request.user)
+        purchases = self.get_queryset().filter(
+            Q(client=request.user) | 
+            Q(recipient_phone=request.user.phone, gift_status='accepted')
+        )
         serializer = self.get_serializer(purchases, many=True)
         return Response(serializer.data)
+    
+    @action(detail=False, methods=['get'])
+    def gifts_pending(self, request):
+        """Get gifts pending acceptance for current user"""
+        pending_gifts = CoachingPackagePurchase.objects.filter(
+            recipient_phone=request.user.phone,
+            gift_status='pending',
+            gift_expires_at__gt=timezone.now()
+        )
+        serializer = self.get_serializer(pending_gifts, many=True)
+        return Response(serializer.data)
+
+
+class GiftClaimView(APIView):
+    """Handle gift claim (accept/reject)"""
+    permission_classes = [IsAuthenticated]
+    
+    def post(self, request, token):
+        purchase = get_object_or_404(
+            CoachingPackagePurchase,
+            gift_token=token,
+            gift_status='pending'
+        )
+        
+        # Verify recipient
+        if purchase.recipient_phone != request.user.phone:
+            return Response(
+                {'error': 'You are not authorized to claim this gift.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Check expiration
+        if purchase.gift_expires_at and purchase.gift_expires_at < timezone.now():
+            purchase.gift_status = 'expired'
+            purchase.save()
+            return Response(
+                {'error': 'This gift has expired.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        action = request.data.get('action', 'accept')
+        
+        if action == 'accept':
+            purchase.gift_status = 'accepted'
+            purchase.package_status = 'active'
+            purchase.client = request.user
+            purchase.save()
+            serializer = CoachingPackagePurchaseSerializer(purchase)
+            return Response({
+                'message': 'Gift accepted successfully.',
+                'purchase': serializer.data
+            })
+        elif action == 'reject':
+            purchase.gift_status = 'rejected'
+            purchase.save()
+            return Response({
+                'message': 'Gift rejected.',
+                'purchase': CoachingPackagePurchaseSerializer(purchase).data
+            })
+        else:
+            return Response(
+                {'error': 'Invalid action. Use "accept" or "reject".'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+
+class SessionTransferViewSet(viewsets.ModelViewSet):
+    serializer_class = SessionTransferSerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        user = self.request.user
+        base_qs = SessionTransfer.objects.select_related(
+            'from_user', 'to_user', 'package_purchase'
+        )
+        
+        if user.role in ['admin', 'staff']:
+            return base_qs
+        
+        # Users see transfers they sent or received
+        return base_qs.filter(
+            Q(from_user=user) | 
+            Q(to_user_phone=user.phone) |
+            Q(to_user=user)
+        )
+    
+    def perform_create(self, serializer):
+        serializer.save(from_user=self.request.user)
+    
+    @action(detail=True, methods=['post'])
+    def claim(self, request, pk=None):
+        """Claim a session transfer"""
+        transfer = self.get_object()
+        
+        # Verify recipient
+        if transfer.to_user_phone != request.user.phone:
+            return Response(
+                {'error': 'You are not authorized to claim this transfer.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        if transfer.transfer_status != 'pending':
+            return Response(
+                {'error': f'This transfer is already {transfer.transfer_status}.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Check expiration
+        if transfer.expires_at and transfer.expires_at < timezone.now():
+            transfer.transfer_status = 'expired'
+            transfer.save()
+            return Response(
+                {'error': 'This transfer has expired.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        action = request.data.get('action', 'accept')
+        
+        if action == 'accept':
+            # Create or update recipient's package purchase
+            package_purchase = transfer.package_purchase
+            
+            # Check if recipient already has this package
+            recipient_purchase = CoachingPackagePurchase.objects.filter(
+                client=request.user,
+                package=package_purchase.package,
+                package_status='active'
+            ).first()
+            
+            if recipient_purchase:
+                # Add sessions to existing purchase
+                recipient_purchase.sessions_remaining += transfer.session_count
+                recipient_purchase.sessions_total += transfer.session_count
+                recipient_purchase.save()
+            else:
+                # Create new purchase for recipient
+                recipient_purchase = CoachingPackagePurchase.objects.create(
+                    client=request.user,
+                    package=package_purchase.package,
+                    sessions_total=transfer.session_count,
+                    sessions_remaining=transfer.session_count,
+                    purchase_type='normal',
+                    package_status='active'
+                )
+            
+            # Deduct sessions from original purchase
+            package_purchase.consume_session(transfer.session_count)
+            
+            # Update transfer
+            transfer.transfer_status = 'accepted'
+            transfer.to_user = request.user
+            transfer.save()
+            
+            return Response({
+                'message': 'Transfer accepted successfully.',
+                'transfer': SessionTransferSerializer(transfer).data,
+                'new_purchase': CoachingPackagePurchaseSerializer(recipient_purchase).data
+            })
+        
+        elif action == 'reject':
+            transfer.transfer_status = 'rejected'
+            transfer.save()
+            return Response({
+                'message': 'Transfer rejected.',
+                'transfer': SessionTransferSerializer(transfer).data
+            })
+        else:
+            return Response(
+                {'error': 'Invalid action. Use "accept" or "reject".'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+    
+    @action(detail=False, methods=['get'])
+    def pending(self, request):
+        """Get pending transfers for current user"""
+        pending_transfers = SessionTransfer.objects.filter(
+            to_user_phone=request.user.phone,
+            transfer_status='pending',
+            expires_at__gt=timezone.now()
+        )
+        serializer = self.get_serializer(pending_transfers, many=True)
+        return Response(serializer.data)
+
+
+class UserPhoneCheckView(APIView):
+    """Check if user exists by phone number"""
+    permission_classes = [IsAuthenticated]
+    
+    def get(self, request):
+        phone = request.query_params.get('phone')
+        if not phone:
+            return Response(
+                {'error': 'Phone parameter is required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            user = User.objects.get(phone=phone)
+            return Response({
+                'exists': True,
+                'phone': user.phone,
+                'name': user.get_full_name() or user.username,
+                'username': user.username
+            })
+        except User.DoesNotExist:
+            return Response({
+                'exists': False,
+                'phone': phone
+            })

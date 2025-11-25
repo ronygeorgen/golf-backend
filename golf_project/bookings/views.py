@@ -126,10 +126,16 @@ class BookingViewSet(viewsets.ModelViewSet):
         return best_choice[-1] if best_choice else None
     
     def _consume_package_session(self, package):
+        # Find an active package purchase for the user
+        # Include normal purchases and accepted gifts
         purchase = CoachingPackagePurchase.objects.select_for_update().filter(
             client=self.request.user,
             package=package,
-            sessions_remaining__gt=0
+            sessions_remaining__gt=0,
+            package_status='active'
+        ).exclude(
+            # Exclude pending gifts
+            gift_status='pending'
         ).order_by('purchased_at').first()
         
         if not purchase:
@@ -137,8 +143,8 @@ class BookingViewSet(viewsets.ModelViewSet):
                 "You do not have any remaining sessions for the selected package."
             )
         
-        purchase.sessions_remaining -= 1
-        purchase.save(update_fields=['sessions_remaining', 'updated_at'])
+        # Use the consume_session method which handles status updates
+        purchase.consume_session(1)
         return purchase
     
     def perform_create(self, serializer):
