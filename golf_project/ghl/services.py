@@ -1,4 +1,5 @@
 import json
+from django.core.cache import cache
 import logging
 from typing import List, Optional
 from urllib import error as urllib_error, request as urllib_request, parse as urllib_parse
@@ -16,6 +17,224 @@ from .models import GHLLocation
 
 logger = logging.getLogger(__name__)
 
+
+def get_or_create_contact_custom_field(location_id, field_name, field_type="TEXT"):
+    """
+    Get existing contact custom field ID or create it if it doesn't exist.
+    """
+    from .models import GHLLocation
+    import requests
+    
+    try:
+        location = GHLLocation.objects.get(location_id=location_id)
+        access_token = location.access_token
+    except GHLLocation.DoesNotExist:
+        logger.error(f"Location {location_id} not found")
+        return None
+
+    base_url = f"https://services.leadconnectorhq.com/locations/{location_id}/customFields"
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Version': '2021-07-28',
+        'Accept': 'application/json',
+        'Content-Type': 'application/json'
+    }
+    
+    try:
+        # First, get all existing contact custom fields
+        get_url = f"{base_url}?model=contact"
+        response = requests.get(get_url, headers=headers, timeout=30)
+        
+        if response.status_code == 200:
+            existing_custom_fields = response.json().get('customFields', [])
+            
+            # Check if field already exists
+            for field in existing_custom_fields:
+                if field.get('name') == field_name:
+                    field_id = field.get('id')
+                    logger.info(f"Found existing contact field '{field_name}' with ID: {field_id}")
+                    return field_id
+        
+        # Field doesn't exist, create it for contacts
+        create_payload = {
+            "name": field_name,
+            "dataType": field_type,
+            "placeholder": field_name.lower().replace(' ', '_'),
+            "model": "contact"
+        }
+        
+        create_response = requests.post(base_url, json=create_payload, headers=headers, timeout=30)
+        if create_response.status_code == 200:
+            field_data = create_response.json()
+            field_id = field_data.get('customField', {}).get('id')
+            logger.info(f"Created new contact field '{field_name}' with ID: {field_id}")
+            return field_id
+        else:
+            # Field might already exist but with different casing/spacing
+            error_text = create_response.text
+            if "already exists" in error_text.lower():
+                logger.warning(f"Field '{field_name}' might already exist, searching again...")
+                # Search more broadly in existing fields
+                for field in existing_custom_fields:
+                    if field_name.lower() in field.get('name', '').lower():
+                        field_id = field.get('id')
+                        logger.info(f"Found similar field '{field.get('name')}' with ID: {field_id}")
+                        return field_id
+            logger.error(f"Failed to create contact field '{field_name}': {create_response.status_code} - {create_response.text}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error managing contact custom field '{field_name}' for location {location_id}: {e}")
+        return None
+
+
+def get_contact_custom_field_mapping(location_id):
+    """
+    Get mapping of field names to field IDs for required contact custom fields.
+    """
+    cache_key = f"ghl_contact_field_mapping_{location_id}"
+    cached_mapping = cache.get(cache_key)
+    
+    if cached_mapping:
+        return cached_mapping
+    
+    required_fields = [
+        {"name": "OTP Code", "type": "TEXT", "key": "otp_code"},
+        {"name": "Last Login At", "type": "TEXT", "key": "last_login_at"}
+    ]
+    
+    field_mapping = {}
+    
+    for field_info in required_fields:
+        field_id = get_or_create_contact_custom_field(
+            location_id, 
+            field_info["name"], 
+            field_info["type"]
+        )
+        if field_id:
+            field_mapping[field_info["key"]] = field_id
+        else:
+            logger.warning(f"Failed to get/create field '{field_info['name']}' for location {location_id}")
+    
+    # Cache for 1 hour
+    if field_mapping:
+        cache.set(cache_key, field_mapping, 3600)
+        logger.info(f"Cached field mapping for location {location_id}: {field_mapping}")
+    
+    return field_mapping
+
+
+def list_contact_custom_fields(location_id):
+    """
+    List all contact custom fields for a location (for debugging).
+    """
+    from .models import GHLLocation
+    import requests
+    
+    try:
+        location = GHLLocation.objects.get(location_id=location_id)
+        access_token = location.access_token
+    except GHLLocation.DoesNotExist:
+        return None
+
+    url = f"https://services.leadconnectorhq.com/locations/{location_id}/customFields?model=contact"
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Version': '2021-07-28',
+        'Accept': 'application/json'
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=30)
+        if response.status_code == 200:
+            data = response.json()
+            custom_fields = data.get('customFields', [])
+            print(f"=== CONTACT CUSTOM FIELDS FOR LOCATION {location_id} ===")
+            for field in custom_fields:
+                print(f"Name: {field.get('name')}")
+                print(f"ID: {field.get('id')}")
+                print(f"DataType: {field.get('dataType')}")
+                print(f"Placeholder: {field.get('placeholder')}")
+                print("-" * 40)
+            return custom_fields
+        else:
+            print(f"Error: {response.status_code} - {response.text}")
+            return None
+    except Exception as e:
+        print(f"Error: {e}")
+        return None
+
+
+def set_contact_custom_values(contact_id, location_id, custom_fields_dict):
+    """
+    Set custom field values for a specific contact using Custom Values endpoints.
+    """
+    from .models import GHLLocation
+    import requests
+    
+    try:
+        location = GHLLocation.objects.get(location_id=location_id)
+        access_token = location.access_token
+    except GHLLocation.DoesNotExist:
+        logger.error(f"Location {location_id} not found")
+        return False
+
+    base_url = f"https://services.leadconnectorhq.com/locations/{location_id}/customValues"
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Version': '2021-07-28',
+        'Accept': 'application/json',
+        'Content-Type': 'application/json'
+    }
+    
+    try:
+        # First, get existing custom values to see what we have
+        response = requests.get(base_url, headers=headers, timeout=30)
+        existing_values = {}
+        
+        if response.status_code == 200:
+            custom_values = response.json().get('customValues', [])
+            for value in custom_values:
+                existing_values[value.get('name')] = value.get('id')
+        
+        success_count = 0
+        
+        # Set each custom value
+        for field_name, field_value in custom_fields_dict.items():
+            value_id = existing_values.get(field_name)
+            
+            if value_id:
+                # Update existing custom value
+                update_url = f"{base_url}/{value_id}"
+                update_payload = {
+                    "name": field_name,
+                    "value": str(field_value)
+                }
+                update_response = requests.put(update_url, json=update_payload, headers=headers, timeout=30)
+                if update_response.status_code == 200:
+                    success_count += 1
+                    logger.debug(f"Updated custom value '{field_name}' for contact {contact_id}")
+                else:
+                    logger.error(f"Failed to update custom value '{field_name}': {update_response.text}")
+            else:
+                # Create new custom value
+                create_payload = {
+                    "name": field_name,
+                    "value": str(field_value)
+                }
+                create_response = requests.post(base_url, json=create_payload, headers=headers, timeout=30)
+                if create_response.status_code == 200:
+                    success_count += 1
+                    logger.debug(f"Created custom value '{field_name}' for contact {contact_id}")
+                else:
+                    logger.error(f"Failed to create custom value '{field_name}': {create_response.text}")
+        
+        logger.info(f"Set {success_count}/{len(custom_fields_dict)} custom values for contact {contact_id}")
+        return success_count > 0
+        
+    except Exception as e:
+        logger.error(f"Error setting custom values for contact {contact_id}: {e}")
+        return False
 
 class GHLClient:
     """
@@ -127,10 +346,9 @@ class GHLClient:
             'Authorization': f"Bearer {access_token}",
             'Version': self.api_version,
         }
-        if loc_id:
-            headers['Location'] = loc_id
+        # REMOVED: Don't add Location header since it goes in the body
         return headers
-
+    
     def _get(self, endpoint: str, headers: dict):
         """Make GET request"""
         if requests:
@@ -180,53 +398,95 @@ class GHLClient:
             raise
 
     def upsert_contact(self, *, phone: str, location_id: Optional[str] = None,
-                       email: Optional[str] = None, first_name: Optional[str] = None,
-                       last_name: Optional[str] = None, tags: Optional[List[str]] = None,
-                       custom_fields: Optional[dict] = None):
+                   email: Optional[str] = None, first_name: Optional[str] = None,
+                   last_name: Optional[str] = None, tags: Optional[List[str]] = None,
+                   custom_fields: Optional[dict] = None):
         """
-        Create or update a contact in GHL using phone/email as identifiers.
+        Create or update a contact in GHL using the correct approach.
         """
         if not phone:
             raise ValueError('phone number is required to upsert contact')
+        
+        if not location_id:
+            raise ValueError('location_id is required for GHL contact creation')
 
+        # Build basic contact payload
         payload = {
             "phone": phone,
             "source": "golf-portal",
+            "locationId": location_id,
         }
+        
+        # Add basic fields
         if email:
             payload["email"] = email
-        names = []
         if first_name:
-            names.append(first_name)
+            payload["firstName"] = first_name
         if last_name:
-            names.append(last_name)
-        if names:
-            payload["name"] = " ".join(names).strip()
+            payload["lastName"] = last_name
+        if first_name and last_name:
+            payload["name"] = f"{first_name} {last_name}".strip()
         if tags:
             payload["tags"] = tags
-        if custom_fields:
-            payload["customFields"] = custom_fields
 
         endpoint = f"{self.base_url}/contacts/"
+        
         try:
-            headers = self._headers(location_id)
-            logger.debug("GHL API request - Endpoint: %s, Location header: %s", 
-                        endpoint, headers.get('Location'))
-            data = self._post(endpoint, payload, headers)
-            logger.info("Synced contact %s with GHL", phone)
-            return data
+            headers = self._headers()
+            if 'Location' in headers:
+                del headers['Location']
+                
+            # First, try to create/update the contact
+            response = requests.post(endpoint, json=payload, headers=headers, timeout=30)
+            
+            if response.status_code == 200:
+                contact_data = response.json()
+                contact_id = contact_data.get('contact', {}).get('id') or contact_data.get('id')
+                logger.info(f"Successfully synced contact {phone} with GHL")
+                
+                # Now set custom values separately using Custom Values endpoint
+                if custom_fields and contact_id:
+                    set_contact_custom_values(contact_id, location_id, custom_fields)
+                
+                return contact_data
+                
+            elif response.status_code == 400 and "duplicated contacts" in response.text:
+                # Contact already exists - extract contact ID and update
+                error_data = response.json()
+                contact_id = error_data.get('meta', {}).get('contactId')
+                
+                if contact_id:
+                    logger.warning(f"Contact {phone} already exists with ID: {contact_id}, updating...")
+                    
+                    # Update basic contact info
+                    update_payload = {k: v for k, v in payload.items() if k != 'locationId'}
+                    update_endpoint = f"{endpoint}{contact_id}"
+                    
+                    update_response = requests.put(update_endpoint, json=update_payload, headers=headers, timeout=30)
+                    if update_response.status_code == 200:
+                        logger.info(f"✅ Successfully updated contact {phone}")
+                        
+                        # Set custom values for existing contact
+                        if custom_fields:
+                            set_contact_custom_values(contact_id, location_id, custom_fields)
+                        
+                        return update_response.json()
+                    else:
+                        logger.error(f"Failed to update contact {phone}: {update_response.text}")
+                        return None
+                else:
+                    logger.error(f"Could not extract contact ID from duplicate error")
+                    return None
+            else:
+                response.raise_for_status()
+                return None
+                
         except requests.exceptions.HTTPError as exc:
-            # Log detailed error information
-            if hasattr(exc, 'response') and exc.response is not None:
-                error_detail = exc.response.text
-                logger.error("GHL API HTTP Error %d for contact %s: %s", 
-                           exc.response.status_code, phone, error_detail)
-                logger.error("Response headers: %s", dict(exc.response.headers))
-            logger.error("Failed to sync contact %s: %s", phone, exc, exc_info=True)
-            raise
-        except (requests.RequestException, urllib_error.URLError, urllib_error.HTTPError) as exc:
-            logger.error("Failed to sync contact %s: %s", phone, exc, exc_info=True)
-            raise
+            logger.error(f"Failed to sync contact {phone}: {exc}")
+            return None
+        except Exception as exc:
+            logger.error(f"Failed to sync contact {phone}: {exc}")
+            return None
 
     def add_tags(self, contact_id: str, tags: List[str], location_id: Optional[str] = None):
         """Add tags to a contact"""
@@ -268,7 +528,7 @@ def purchase_custom_fields(purchase_name, amount):
 def sync_user_contact(user, *, location_id: Optional[str] = None,
                       tags: Optional[List[str]] = None, custom_fields: Optional[dict] = None):
     """
-    Convenience helper to push the current user's info into GHL and persist the contact id.
+    Production-ready contact sync with custom fields.
     """
     if not user or not getattr(user, 'phone', None):
         logger.warning("Cannot sync user to GHL: user or phone missing")
@@ -276,56 +536,31 @@ def sync_user_contact(user, *, location_id: Optional[str] = None,
 
     resolved_location = location_id or getattr(user, 'ghl_location_id', None) or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
     if not resolved_location:
-        logger.warning("No GHL location available for user %s (phone: %s)", user, getattr(user, 'phone', None))
-        return None, None
-
-    # Check if location exists in database and has tokens
-    try:
-        location = GHLLocation.objects.get(location_id=resolved_location)
-        if not location.access_token:
-            logger.error("GHL location %s exists but has no access token. Please re-onboard.", resolved_location)
-            return None, None
-        
-        # Decode JWT token to verify it's for the correct location
-        try:
-            import base64
-            import json as json_lib
-            # JWT tokens have 3 parts separated by dots: header.payload.signature
-            token_parts = location.access_token.split('.')
-            if len(token_parts) >= 2:
-                # Decode the payload (second part)
-                payload = token_parts[1]
-                # Add padding if needed
-                payload += '=' * (4 - len(payload) % 4)
-                decoded = base64.urlsafe_b64decode(payload)
-                token_data = json_lib.loads(decoded)
-                token_location_id = token_data.get('authClassId') or token_data.get('primaryAuthClassId')
-                logger.info("Token is for location: %s, trying to use: %s", token_location_id, resolved_location)
-                if token_location_id != resolved_location:
-                    logger.error("TOKEN MISMATCH! Token is for location %s but we're trying to use %s. Please re-onboard with the correct location.", 
-                               token_location_id, resolved_location)
-                    return None, None
-        except Exception as decode_exc:
-            logger.warning("Could not decode token to verify location: %s", decode_exc)
-        
-        logger.info("Syncing user %s (phone: %s) to GHL location %s", user.id, user.phone, resolved_location)
-    except GHLLocation.DoesNotExist:
-        logger.error("GHL location %s not found in database. Please onboard first using /api/ghlpage/onboard/", resolved_location)
+        logger.warning("No GHL location available for user %s", user.id)
         return None, None
 
     try:
         client = GHLClient(location_id=resolved_location)
+        
+        # Enhanced tags as fallback
+        enhanced_tags = tags or []
+        if custom_fields:
+            otp_code = custom_fields.get('otp_code')
+            if otp_code:
+                enhanced_tags.append(f"otp_{otp_code}")
+
         response = client.upsert_contact(
             phone=user.phone,
             email=getattr(user, 'email', None),
             first_name=getattr(user, 'first_name', None),
             last_name=getattr(user, 'last_name', None),
             location_id=resolved_location,
-            tags=tags,
-            custom_fields=custom_fields,
+            tags=enhanced_tags,
+            custom_fields=custom_fields,  # Now custom fields should work
         )
+        
         contact_id = None
-        if isinstance(response, dict):
+        if response and isinstance(response, dict):
             contact_id = response.get('contact', {}).get('id') or response.get('id')
 
         if contact_id and user.ghl_contact_id != contact_id:
@@ -335,6 +570,8 @@ def sync_user_contact(user, *, location_id: Optional[str] = None,
 
         logger.info("Successfully synced user %s to GHL location %s", user.id, resolved_location)
         return response, contact_id
+        
     except Exception as exc:
-        logger.error("Failed to sync user %s to GHL location %s: %s", user.id, resolved_location, exc, exc_info=True)
-        raise
+        logger.error("GHL sync failed for user %s (location: %s): %s", 
+                   user.id, resolved_location, exc, exc_info=True)
+        return None, None

@@ -194,7 +194,7 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 GHL_CLIENT_ID = config("GHL_CLIENT_ID")
 GHL_CLIENT_SECRET = config("GHL_CLIENT_SECRET")
 GHL_REDIRECTED_URI = config("GHL_REDIRECTED_URI")
-GHL_SCOPE = config("GHL_SCOPE", default="contacts.readonly contacts.write locations.readonly tags.read tags.write customValues.read customValues.write")
+GHL_SCOPE = 'contacts.readonly contacts.write locations.readonly locations/tags.readonly locations/tags.write locations/customValues.readonly locations/customValues.write conversations.readonly conversations.write locations/customFields.write locations/customFields.readonly'
 GHL_BASE_URL = "https://services.leadconnectorhq.com"
 GHL_AUTH_URL = "https://marketplace.leadconnectorhq.com/oauth/chooselocation"
 GHL_API_VERSION = config('GHL_API_VERSION', default='2021-07-28')

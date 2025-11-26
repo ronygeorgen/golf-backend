@@ -95,6 +95,11 @@ def verify_otp(request):
         location_id = serializer.validated_data.get('location_id')
         
         logger.info("Processing - Phone: %s, OTP: %s, Location: %s", phone, otp, location_id)
+
+        print(f"🔍 DEBUG OTP VERIFICATION:")
+        print(f"🔍 Phone: {phone}")
+        print(f"🔍 OTP: {otp}")
+        print(f"🔍 Location ID from request: {location_id}")
         
         try:
             user = User.objects.get(phone=phone)

@@ -93,6 +93,9 @@ class GHLOAuthCallbackView(APIView):
         code = request.query_params.get('code')
         # locationId might come from query params OR from token response
         location_id = request.query_params.get('locationId')
+        print(f"🔍 DEBUG: OAuth callback received")
+        print(f"🔍 DEBUG: code = {code}")
+        print(f"🔍 DEBUG: locationId from query = {location_id}")
         
         if not code:
             return Response(
@@ -127,6 +130,8 @@ class GHLOAuthCallbackView(APIView):
             response = requests.post(token_url, data=payload, timeout=30)
             response.raise_for_status()
             token_data = response.json()
+            print(f"🔍 Token data locationId: {token_data.get('locationId')}")
+            print(f"🔍 Full token data keys: {token_data.keys()}")
         except requests.exceptions.HTTPError as exc:
             error_text = response.text if hasattr(response, 'text') else str(exc)
             logger.error("Failed to exchange OAuth code for tokens: %s - %s", exc, error_text, exc_info=True)
@@ -150,6 +155,24 @@ class GHLOAuthCallbackView(APIView):
                 {"error": "locationId not found in token response"},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        
+        # Decode the access token to see what location it's actually for
+        access_token = token_data.get('access_token')
+        if access_token:
+            try:
+                import base64
+                import json as json_lib
+                token_parts = access_token.split('.')
+                if len(token_parts) >= 2:
+                    payload = token_parts[1]
+                    payload += '=' * (4 - len(payload) % 4)
+                    decoded = base64.urlsafe_b64decode(payload)
+                    token_payload = json_lib.loads(decoded)
+                    actual_location = token_payload.get('authClassId') or token_payload.get('primaryAuthClassId')
+                    print(f"🔍 ACTUAL LOCATION IN TOKEN: {actual_location}")
+                    print(f"🔍 LOCATION WE'RE SAVING TO: {location_id}")
+            except Exception as e:
+                print(f"🔍 Error decoding token in callback: {e}")
         
         # Get location name from GHL API (optional)
         location_name = None
