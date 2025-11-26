@@ -1,18 +1,35 @@
-from rest_framework import viewsets, status, serializers
-from rest_framework.decorators import action
-from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated, IsAdminUser, AllowAny
-from rest_framework.views import APIView
+import logging
+
+from django.conf import settings
 from django.db.models import Q
-from django.utils import timezone
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
+from rest_framework import serializers, status, viewsets
+from rest_framework.decorators import action
+from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from ghl.services import (
+    build_purchase_tags,
+    purchase_custom_fields,
+)
+
+try:
+    from ghl.tasks import sync_purchase_with_ghl_task
+    CELERY_AVAILABLE = True
+except ImportError:
+    CELERY_AVAILABLE = False
+    sync_purchase_with_ghl_task = None
+from users.models import User
 from .models import CoachingPackage, CoachingPackagePurchase, SessionTransfer
 from .serializers import (
-    CoachingPackageSerializer, 
+    CoachingPackageSerializer,
     CoachingPackagePurchaseSerializer,
-    SessionTransferSerializer
+    SessionTransferSerializer,
 )
-from users.models import User
+
+logger = logging.getLogger(__name__)
 
 class CoachingPackageViewSet(viewsets.ModelViewSet):
     queryset = CoachingPackage.objects.all().order_by('-id')
@@ -123,6 +140,7 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         package = serializer.validated_data.get('package')
         purchase_type = serializer.validated_data.get('purchase_type', 'normal')
+        location_id = self.request.data.get('location_id')
         
         if not package or not package.is_active:
             raise serializers.ValidationError("Selected package is not available.")
@@ -132,11 +150,17 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
             recipient_phone = serializer.validated_data.get('recipient_phone')
             try:
                 recipient = User.objects.get(phone=recipient_phone)
-                serializer.save(client=recipient, original_owner=self.request.user)
+                purchase = serializer.save(client=recipient, original_owner=self.request.user)
             except User.DoesNotExist:
                 raise serializers.ValidationError("Recipient not found.")
         else:
-            serializer.save(client=self.request.user)
+            purchase = serializer.save(client=self.request.user)
+
+        if location_id and self.request.user.ghl_location_id != location_id:
+            self.request.user.ghl_location_id = location_id
+            self.request.user.save(update_fields=['ghl_location_id'])
+
+        self._sync_purchase_with_ghl(purchase)
     
     @action(detail=False, methods=['get'])
     def my(self, request):
@@ -157,6 +181,40 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
         )
         serializer = self.get_serializer(pending_gifts, many=True)
         return Response(serializer.data)
+
+    def _sync_purchase_with_ghl(self, purchase):
+        """
+        Push purchase info into GHL so workflows can react to spend/tag updates.
+        Uses Celery task for async processing if available, otherwise sync.
+        """
+        if not purchase:
+            return
+
+        contact_owner = purchase.original_owner or purchase.client
+        if not contact_owner:
+            return
+
+        location_id = contact_owner.ghl_location_id or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+        if not location_id:
+            return
+
+        # Queue async task to sync purchase with GHL
+        try:
+            if CELERY_AVAILABLE and sync_purchase_with_ghl_task:
+                sync_purchase_with_ghl_task.delay(purchase.id)
+            else:
+                # Fallback to synchronous call if Celery not available
+                from ghl.services import sync_user_contact
+                amount = getattr(purchase.package, 'price', 0)
+                purchase_name = purchase.purchase_name or (purchase.package.title if purchase.package else 'Unknown')
+                sync_user_contact(
+                    contact_owner,
+                    location_id=location_id,
+                    tags=build_purchase_tags(amount),
+                    custom_fields=purchase_custom_fields(purchase_name, amount),
+                )
+        except Exception as exc:
+            logger.warning("Failed to sync GHL for purchase %s: %s", purchase.id, exc)
 
 
 class GiftClaimView(APIView):

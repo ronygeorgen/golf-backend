@@ -118,10 +118,9 @@ class CoachingPackagePurchaseSerializer(serializers.ModelSerializer):
         purchase_name = attrs.get('purchase_name')
 
         if not purchase_name or not purchase_name.strip():
-            raise serializers.ValidationError({
-                'purchase_name': 'A purchase name is required.'
-            })
-        attrs['purchase_name'] = purchase_name.strip()
+            attrs['purchase_name'] = package.title if package else 'Coaching Package'
+        else:
+            attrs['purchase_name'] = purchase_name.strip()
 
         # Validate gift purchase
         if purchase_type == 'gift':

@@ -1,11 +1,21 @@
+import logging
+import random
+from datetime import timedelta
+
+from django.conf import settings
+from django.utils import timezone
 from rest_framework import status
+from rest_framework.authtoken.models import Token
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.authtoken.models import Token
-from django.utils import timezone
-from datetime import timedelta
-import random
+
+try:
+    from ghl.tasks import sync_user_contact_task
+    CELERY_AVAILABLE = True
+except ImportError:
+    CELERY_AVAILABLE = False
+    sync_user_contact_task = None
 from .models import User
 from .serializers import (
     PhoneLoginSerializer, 
@@ -14,6 +24,9 @@ from .serializers import (
     SignupSerializer,
     LoginSerializer
 )
+
+logger = logging.getLogger(__name__)
+
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
@@ -61,10 +74,27 @@ def request_otp(request):
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def verify_otp(request):
+    # DEBUG: Log everything
+    logger.info("=== OTP VERIFICATION DEBUG ===")
+    logger.info("Request data: %s", request.data)
+    logger.info("Request data type: %s", type(request.data))
+    logger.info("Request data keys: %s", list(request.data.keys()) if hasattr(request.data, 'keys') else 'N/A')
+    logger.info("Location_id in request.data: %s", request.data.get('location_id'))
+    logger.info("All request.data contents: %s", dict(request.data) if hasattr(request.data, '__dict__') else request.data)
+    
     serializer = VerifyOTPSerializer(data=request.data)
+    logger.info("Serializer data: %s", serializer.initial_data)
+    
     if serializer.is_valid():
+        logger.info("✅ Serializer IS VALID")
+        logger.info("Validated data: %s", serializer.validated_data)
+        logger.info("Location_id in validated_data: %s", serializer.validated_data.get('location_id'))
+        
         phone = serializer.validated_data['phone']
         otp = serializer.validated_data['otp']
+        location_id = serializer.validated_data.get('location_id')
+        
+        logger.info("Processing - Phone: %s, OTP: %s, Location: %s", phone, otp, location_id)
         
         try:
             user = User.objects.get(phone=phone)
@@ -77,10 +107,80 @@ def verify_otp(request):
                 user.otp_code = None
                 user.otp_created_at = None
                 user.phone_verified = True
-                user.save()
+
+                # Get location_id from multiple sources (priority order)
+                location_id = (
+                    serializer.validated_data.get('location_id') or 
+                    request.data.get('location_id') or
+                    request.query_params.get('location')  # Also check query params
+                )
+                
+                # Clean up location_id (remove whitespace)
+                if location_id:
+                    location_id = location_id.strip()
+                
+                logger.info("OTP verification for user %s (phone: %s)", user.id, user.phone)
+                logger.info("  - location_id from serializer: %s", serializer.validated_data.get('location_id'))
+                logger.info("  - location_id from request.data: %s", request.data.get('location_id'))
+                logger.info("  - location_id from query_params: %s", request.query_params.get('location'))
+                logger.info("  - Final location_id: %s", location_id)
+                
+                fields_to_update = ['otp_code', 'otp_created_at', 'phone_verified']
+                if location_id:
+                    user.ghl_location_id = location_id
+                    fields_to_update.append('ghl_location_id')
+                    logger.info("Saved location_id '%s' to user %s", location_id, user.id)
+                else:
+                    logger.warning("No location_id provided in OTP verification request")
+
+                user.save(update_fields=fields_to_update)
                 
                 # Get or create authentication token
                 token, created = Token.objects.get_or_create(user=user)
+
+                # Resolve location for GHL sync (explicit priority)
+                resolved_location = (
+                    location_id or  # First: from current request
+                    user.ghl_location_id or  # Second: from user's saved location
+                    getattr(settings, 'GHL_DEFAULT_LOCATION', None)  # Third: from settings
+                )
+                
+                logger.info("Resolved GHL location for sync: %s", resolved_location)
+                if not resolved_location:
+                    logger.warning("No GHL location available - contact will NOT be synced to GHL")
+                if resolved_location:
+                    # Sync with GHL (store OTP code before clearing it)
+                    # Try async first, fallback to sync for immediate error visibility
+                    try:
+                        from ghl.services import sync_user_contact
+                        # Use synchronous call to see errors immediately
+                        # You can switch back to async later once it's working
+                        sync_user_contact(
+                            user,
+                            location_id=resolved_location,
+                            tags=['otp'],
+                            custom_fields={
+                                'otp_code': otp,  # Store the OTP code
+                                'last_login_at': timezone.now().isoformat(),
+                            },
+                        )
+                        logger.info("Successfully synced user %s to GHL location %s", user.phone, resolved_location)
+                        
+                        # Optionally also queue async task for redundancy
+                        # if CELERY_AVAILABLE and sync_user_contact_task:
+                        #     sync_user_contact_task.delay(
+                        #         user.id,
+                        #         location_id=resolved_location,
+                        #         tags=['otp'],
+                        #         custom_fields={
+                        #             'otp_code': otp,
+                        #             'last_login_at': timezone.now().isoformat(),
+                        #         },
+                        #     )
+                    except Exception as exc:
+                        logger.error("Failed to sync GHL for OTP login %s (location: %s): %s", 
+                                   user.phone, resolved_location, exc, exc_info=True)
+                        # Don't fail the login if GHL sync fails
                 
                 return Response({
                     'token': token.key,
@@ -96,8 +196,11 @@ def verify_otp(request):
             return Response({
                 'error': 'User not found'
             }, status=status.HTTP_404_NOT_FOUND)
+    else:
+        logger.error("❌ Serializer IS INVALID")
+        logger.error("Serializer errors: %s", serializer.errors)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
-    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 @api_view(['POST'])
 @permission_classes([AllowAny])

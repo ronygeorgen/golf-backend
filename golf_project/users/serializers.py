@@ -8,8 +8,31 @@ from .models import User, StaffAvailability
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
-        fields = ('id', 'username', 'email', 'phone', 'role', 'first_name', 'last_name', 'email_verified', 'phone_verified', 'is_superuser', 'is_staff')
-        read_only_fields = ('id', 'email_verified', 'phone_verified', 'is_superuser', 'is_staff', 'username')
+        fields = (
+            'id',
+            'username',
+            'email',
+            'phone',
+            'role',
+            'first_name',
+            'last_name',
+            'email_verified',
+            'phone_verified',
+            'is_superuser',
+            'is_staff',
+            'ghl_location_id',
+            'ghl_contact_id',
+        )
+        read_only_fields = (
+            'id',
+            'email_verified',
+            'phone_verified',
+            'is_superuser',
+            'is_staff',
+            'username',
+            'ghl_location_id',
+            'ghl_contact_id',
+        )
 
 class StaffSerializer(serializers.ModelSerializer):
     """Serializer for creating/updating staff members by admin - auto-generates username"""
@@ -151,6 +174,7 @@ class PhoneLoginSerializer(serializers.Serializer):
 class VerifyOTPSerializer(serializers.Serializer):
     phone = serializers.CharField()
     otp = serializers.CharField()
+    location_id = serializers.CharField(required=False, allow_blank=True)
 
 class StaffAvailabilitySerializer(serializers.ModelSerializer):
     start_time = serializers.TimeField()

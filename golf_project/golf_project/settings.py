@@ -14,6 +14,11 @@ from pathlib import Path
 from datetime import timedelta
 from decouple import config, Csv
 
+try:
+    from celery.schedules import crontab
+except ImportError:
+    crontab = None
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -41,6 +46,7 @@ INSTALLED_APPS = [
     'coaching',
     'simulators',
     'admin_panel',
+    'ghl',
 ]
 
 MIDDLEWARE = [
@@ -183,3 +189,38 @@ STATIC_URL = 'static/'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# GHL Integration
+GHL_CLIENT_ID = config("GHL_CLIENT_ID")
+GHL_CLIENT_SECRET = config("GHL_CLIENT_SECRET")
+GHL_REDIRECTED_URI = config("GHL_REDIRECTED_URI")
+GHL_SCOPE = config("GHL_SCOPE", default="contacts.readonly contacts.write locations.readonly tags.read tags.write customValues.read customValues.write")
+GHL_BASE_URL = "https://services.leadconnectorhq.com"
+GHL_AUTH_URL = "https://marketplace.leadconnectorhq.com/oauth/chooselocation"
+GHL_API_VERSION = config('GHL_API_VERSION', default='2021-07-28')
+GHL_DEFAULT_LOCATION = config('GHL_DEFAULT_LOCATION', default='')
+
+# Celery Configuration
+CELERY_BROKER_URL = config('CELERY_BROKER_URL', default='redis://localhost:6379/0')
+CELERY_RESULT_BACKEND = config('CELERY_RESULT_BACKEND', default='redis://localhost:6379/0')
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_TASK_TRACK_STARTED = True
+CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes
+CELERY_TASK_SOFT_TIME_LIMIT = 25 * 60  # 25 minutes
+
+# Celery Beat Schedule (for periodic tasks)
+if crontab:
+    CELERY_BEAT_SCHEDULE = {
+        'refresh-ghl-tokens': {
+            'task': 'ghl.tasks.refresh_ghl_tokens_task',
+            'schedule': crontab(minute=0),  # Run every hour at minute 0
+            # Alternative schedules:
+            # 'schedule': crontab(minute='*/30'),  # Every 30 minutes
+            # 'schedule': crontab(hour=0, minute=0),  # Daily at midnight
+        },
+    }
+else:
+    CELERY_BEAT_SCHEDULE = {}

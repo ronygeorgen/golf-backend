@@ -14,6 +14,8 @@ class User(AbstractUser):
     phone_verified = models.BooleanField(default=False)
     otp_code = models.CharField(max_length=6, blank=True, null=True)
     otp_created_at = models.DateTimeField(null=True, blank=True)
+    ghl_location_id = models.CharField(max_length=100, blank=True, null=True)
+    ghl_contact_id = models.CharField(max_length=100, blank=True, null=True)
     
     def __str__(self):
         return f"{self.username} ({self.role})"
