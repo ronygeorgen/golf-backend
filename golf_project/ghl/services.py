@@ -98,9 +98,11 @@ def get_contact_custom_field_mapping(location_id):
     if cached_mapping:
         return cached_mapping
     
+    # Update these field names to match EXACTLY what's in your GHL dashboard
     required_fields = [
-        {"name": "OTP Code", "type": "TEXT", "key": "otp_code"},
-        {"name": "Last Login At", "type": "TEXT", "key": "last_login_at"}
+        {"name": "Login Otp", "type": "TEXT", "key": "otp_code"},  # Changed to match your GHL
+        {"name": "Last Login At", "type": "TEXT", "key": "last_login_at"},
+        {"name": "Purchase Amount", "type": "TEXT", "key": "purchase_amount"}
     ]
     
     field_mapping = {}
@@ -164,10 +166,9 @@ def list_contact_custom_fields(location_id):
         print(f"Error: {e}")
         return None
 
-
 def set_contact_custom_values(contact_id, location_id, custom_fields_dict):
     """
-    Set custom field values for a specific contact using Custom Values endpoints.
+    Set custom field values for a specific contact using Contact update endpoint.
     """
     from .models import GHLLocation
     import requests
@@ -179,7 +180,7 @@ def set_contact_custom_values(contact_id, location_id, custom_fields_dict):
         logger.error(f"Location {location_id} not found")
         return False
 
-    base_url = f"https://services.leadconnectorhq.com/locations/{location_id}/customValues"
+    url = f"https://services.leadconnectorhq.com/contacts/{contact_id}"
     headers = {
         'Authorization': f'Bearer {access_token}',
         'Version': '2021-07-28',
@@ -188,52 +189,71 @@ def set_contact_custom_values(contact_id, location_id, custom_fields_dict):
     }
     
     try:
-        # First, get existing custom values to see what we have
-        response = requests.get(base_url, headers=headers, timeout=30)
-        existing_values = {}
+        # First, get the current contact to preserve existing data
+        get_response = requests.get(url, headers=headers, timeout=30)
+        if get_response.status_code != 200:
+            logger.error(f"Failed to get contact {contact_id}: {get_response.text}")
+            return False
         
-        if response.status_code == 200:
-            custom_values = response.json().get('customValues', [])
-            for value in custom_values:
-                existing_values[value.get('name')] = value.get('id')
+        contact_data = get_response.json().get('contact', {})
         
-        success_count = 0
+        # Prepare customFields payload
+        custom_fields_payload = []
         
-        # Set each custom value
+        # Get existing custom fields to preserve them
+        existing_custom_fields = contact_data.get('customFields', [])
+        
+        # Get field name to ID mapping
+        field_mapping = get_contact_custom_field_mapping(location_id)
+        
+        # Build the custom fields array for update
         for field_name, field_value in custom_fields_dict.items():
-            value_id = existing_values.get(field_name)
+            # Find the field ID for this field name
+            field_id = None
+            for key, f_id in field_mapping.items():
+                # Map back from our internal key to field name
+                field_name_mapping = {
+                    'otp_code': 'Login Otp',
+                    'last_login_at': 'Last Login At', 
+                    'purchase_amount': 'Purchase Amount'
+                }
+                if field_name_mapping.get(key) == field_name:
+                    field_id = f_id
+                    break
             
-            if value_id:
-                # Update existing custom value
-                update_url = f"{base_url}/{value_id}"
-                update_payload = {
-                    "name": field_name,
+            if field_id:
+                custom_fields_payload.append({
+                    "id": field_id,
                     "value": str(field_value)
-                }
-                update_response = requests.put(update_url, json=update_payload, headers=headers, timeout=30)
-                if update_response.status_code == 200:
-                    success_count += 1
-                    logger.debug(f"Updated custom value '{field_name}' for contact {contact_id}")
-                else:
-                    logger.error(f"Failed to update custom value '{field_name}': {update_response.text}")
+                })
+                logger.info(f"🔄 Setting custom field: {field_name} = {field_value} (Field ID: {field_id})")
             else:
-                # Create new custom value
-                create_payload = {
-                    "name": field_name,
-                    "value": str(field_value)
-                }
-                create_response = requests.post(base_url, json=create_payload, headers=headers, timeout=30)
-                if create_response.status_code == 200:
-                    success_count += 1
-                    logger.debug(f"Created custom value '{field_name}' for contact {contact_id}")
-                else:
-                    logger.error(f"Failed to create custom value '{field_name}': {create_response.text}")
+                logger.error(f"❌ Field ID not found for field name: {field_name}")
+                # Try to get field mapping again
+                field_mapping = get_contact_custom_field_mapping(location_id)
+                logger.info(f"🔍 Current field mapping: {field_mapping}")
         
-        logger.info(f"Set {success_count}/{len(custom_fields_dict)} custom values for contact {contact_id}")
-        return success_count > 0
+        # Update the contact with custom fields
+        update_payload = {
+            "customFields": custom_fields_payload
+        }
+        
+        logger.info(f"📤 Sending update payload: {update_payload}")
+        
+        update_response = requests.put(url, json=update_payload, headers=headers, timeout=30)
+        if update_response.status_code == 200:
+            logger.info(f"✅ Successfully updated custom fields for contact {contact_id}")
+            
+            # Debug: Verify the update worked
+            debug_contact_custom_fields(contact_id, location_id)
+            
+            return True
+        else:
+            logger.error(f"❌ Failed to update contact custom fields: {update_response.status_code} - {update_response.text}")
+            return False
         
     except Exception as e:
-        logger.error(f"Error setting custom values for contact {contact_id}: {e}")
+        logger.error(f"❌ Error setting custom values for contact {contact_id}: {e}")
         return False
 
 class GHLClient:
@@ -426,8 +446,8 @@ class GHLClient:
             payload["lastName"] = last_name
         if first_name and last_name:
             payload["name"] = f"{first_name} {last_name}".strip()
-        if tags:
-            payload["tags"] = tags
+        
+        # REMOVED: if tags: payload["tags"] = tags
 
         endpoint = f"{self.base_url}/contacts/"
         
@@ -442,10 +462,13 @@ class GHLClient:
             if response.status_code == 200:
                 contact_data = response.json()
                 contact_id = contact_data.get('contact', {}).get('id') or contact_data.get('id')
-                logger.info(f"Successfully synced contact {phone} with GHL")
+                logger.info(f"Successfully synced contact {phone} with GHL (contact_id: {contact_id})")
                 
-                # Now set custom values separately using Custom Values endpoint
+                # Ensure custom fields exist before setting values
                 if custom_fields and contact_id:
+                    # Get/create custom field mappings (this ensures fields exist)
+                    get_contact_custom_field_mapping(location_id)
+                    # Now set custom values separately using Contact update endpoint
                     set_contact_custom_values(contact_id, location_id, custom_fields)
                 
                 return contact_data
@@ -464,10 +487,13 @@ class GHLClient:
                     
                     update_response = requests.put(update_endpoint, json=update_payload, headers=headers, timeout=30)
                     if update_response.status_code == 200:
-                        logger.info(f"✅ Successfully updated contact {phone}")
+                        logger.info(f"✅ Successfully updated contact {phone} (contact_id: {contact_id})")
                         
-                        # Set custom values for existing contact
-                        if custom_fields:
+                        # Ensure custom fields exist before setting values
+                        if custom_fields and contact_id:
+                            # Get/create custom field mappings (this ensures fields exist)
+                            get_contact_custom_field_mapping(location_id)
+                            # Set custom values for existing contact
                             set_contact_custom_values(contact_id, location_id, custom_fields)
                         
                         return update_response.json()
@@ -488,40 +514,14 @@ class GHLClient:
             logger.error(f"Failed to sync contact {phone}: {exc}")
             return None
 
-    def add_tags(self, contact_id: str, tags: List[str], location_id: Optional[str] = None):
-        """Add tags to a contact"""
-        if not contact_id or not tags:
-            return
-
-        endpoint = f"{self.base_url}/contacts/{contact_id}/tags"
-        payload = {"tags": tags}
-        try:
-            data = self._post(endpoint, payload, self._headers(location_id))
-            logger.info("Applied tags %s to contact %s", tags, contact_id)
-            return data
-        except (requests.RequestException, urllib_error.URLError, urllib_error.HTTPError) as exc:
-            logger.error("Failed to add tags to contact %s: %s", contact_id, exc, exc_info=True)
-            raise
-
-
-def build_purchase_tags(amount):
-    """
-    Helper to produce a deterministic tag format for purchase amounts.
-    """
-    try:
-        value = float(amount)
-        normalized = int(value)
-    except (TypeError, ValueError):
-        normalized = 0
-    tag_value = f"amount_{normalized}"
-    return ["purchase", tag_value]
-
 
 def purchase_custom_fields(purchase_name, amount):
+    """
+    Build custom fields dict for purchase sync.
+    Uses the same field names as defined in get_contact_custom_field_mapping.
+    """
     return {
-        "last_purchase_name": purchase_name,
-        "last_purchase_amount": str(amount),
-        "last_purchase_at": timezone.now().isoformat(),
+        "Purchase Amount": str(amount),  # This will be created/updated as custom field
     }
 
 
@@ -529,6 +529,7 @@ def sync_user_contact(user, *, location_id: Optional[str] = None,
                       tags: Optional[List[str]] = None, custom_fields: Optional[dict] = None):
     """
     Production-ready contact sync with custom fields.
+    Follows the same pattern as login: create/update contact, then set custom field values.
     """
     if not user or not getattr(user, 'phone', None):
         logger.warning("Cannot sync user to GHL: user or phone missing")
@@ -542,21 +543,37 @@ def sync_user_contact(user, *, location_id: Optional[str] = None,
     try:
         client = GHLClient(location_id=resolved_location)
         
-        # Enhanced tags as fallback
-        enhanced_tags = tags or []
+        # Map custom_fields keys to field names if needed
+        mapped_custom_fields = {}
         if custom_fields:
-            otp_code = custom_fields.get('otp_code')
-            if otp_code:
-                enhanced_tags.append(f"otp_{otp_code}")
-
+            # Field name mapping: key -> field name
+            field_name_mapping = {
+                'otp_code': 'Login Otp',
+                'last_login_at': 'Last Login At',
+                'purchase_amount': 'Purchase Amount',
+            }
+            
+            for key, value in custom_fields.items():
+                # If key is already a field name (contains space or title case), use it directly
+                if ' ' in key or key[0].isupper():
+                    mapped_custom_fields[key] = value
+                # Otherwise, map the key to field name
+                elif key in field_name_mapping:
+                    mapped_custom_fields[field_name_mapping[key]] = value
+                else:
+                    # Use key as-is (might be a field name already)
+                    mapped_custom_fields[key] = value
+        
+        # REMOVED: All tag creation logic
+        
         response = client.upsert_contact(
             phone=user.phone,
             email=getattr(user, 'email', None),
             first_name=getattr(user, 'first_name', None),
             last_name=getattr(user, 'last_name', None),
             location_id=resolved_location,
-            tags=enhanced_tags,
-            custom_fields=custom_fields,  # Now custom fields should work
+            tags=None,  # REMOVED: tags parameter
+            custom_fields=mapped_custom_fields,
         )
         
         contact_id = None
@@ -575,3 +592,83 @@ def sync_user_contact(user, *, location_id: Optional[str] = None,
         logger.error("GHL sync failed for user %s (location: %s): %s", 
                    user.id, resolved_location, exc, exc_info=True)
         return None, None
+
+
+def debug_contact_custom_fields(contact_id, location_id):
+    """
+    Debug function to check current custom field values for a contact.
+    """
+    from .models import GHLLocation
+    import requests
+    
+    try:
+        location = GHLLocation.objects.get(location_id=location_id)
+        access_token = location.access_token
+    except GHLLocation.DoesNotExist:
+        print("❌ Location not found")
+        return None
+
+    url = f"https://services.leadconnectorhq.com/contacts/{contact_id}"
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Version': '2021-07-28',
+        'Accept': 'application/json'
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=30)
+        if response.status_code == 200:
+            contact_data = response.json().get('contact', {})
+            custom_fields = contact_data.get('customFields', [])
+            
+            print(f"\n🔍 === CUSTOM FIELDS FOR CONTACT {contact_id} ===")
+            print(f"📱 Phone: {contact_data.get('phone')}")
+            print(f"👤 Name: {contact_data.get('name')}")
+            print(f"🏢 Location: {location_id}")
+            
+            # Get field mapping to map IDs to names
+            field_mapping = get_contact_custom_field_mapping(location_id)
+            # Reverse the mapping to get ID -> name
+            id_to_name = {v: k for k, v in field_mapping.items()}
+            # Map our internal keys to display names
+            display_names = {
+                'otp_code': 'Login OTP',
+                'last_login_at': 'Last Login At',
+                'purchase_amount': 'Purchase Amount'
+            }
+            
+            if custom_fields:
+                for field in custom_fields:
+                    field_id = field.get('id')
+                    field_name = field.get('name')
+                    field_value = field.get('value')
+                    
+                    # If field name is None, try to get it from our mapping
+                    if not field_name and field_id:
+                        internal_key = id_to_name.get(field_id)
+                        if internal_key:
+                            field_name = display_names.get(internal_key, internal_key)
+                    
+                    print(f"---")
+                    print(f"Field ID: {field_id}")
+                    print(f"Field Name: {field_name or '❌ Unknown'}")
+                    print(f"Field Value: {field_value}")
+                    
+                    # Show which field this corresponds to
+                    if field_id == field_mapping.get('otp_code'):
+                        print(f"🔐 This is the Login OTP field")
+                    elif field_id == field_mapping.get('purchase_amount'):
+                        print(f"💰 This is the Purchase Amount field")
+                    elif field_id == field_mapping.get('last_login_at'):
+                        print(f"⏰ This is the Last Login At field")
+            else:
+                print("❌ No custom fields found")
+                
+            print("=" * 50)
+            return custom_fields
+        else:
+            print(f"❌ Error getting contact: {response.status_code} - {response.text}")
+            return None
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return None

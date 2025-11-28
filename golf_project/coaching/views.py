@@ -11,7 +11,6 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from ghl.services import (
-    build_purchase_tags,
     purchase_custom_fields,
 )
 
@@ -127,14 +126,21 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
         user = self.request.user
         base_qs = CoachingPackagePurchase.objects.select_related(
             'client', 'package', 'original_owner'
-        ).prefetch_related('package__staff_members')
+        ).prefetch_related('package__staff_members', 'organization_members')
         
         if user.role in ['admin', 'staff']:
             return base_qs
         
-        # Clients see their own purchases and gifts received
+        # Clients see their own purchases, gifts received, and organization packages where they are members
+        from coaching.models import OrganizationPackageMember
+        org_purchase_ids = OrganizationPackageMember.objects.filter(
+            phone=user.phone
+        ).values_list('package_purchase_id', flat=True)
+        
         return base_qs.filter(
-            Q(client=user) | Q(recipient_phone=user.phone, gift_status='accepted')
+            Q(client=user) | 
+            Q(recipient_phone=user.phone, gift_status='accepted') |
+            Q(id__in=org_purchase_ids)
         )
     
     def perform_create(self, serializer):
@@ -153,6 +159,9 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
                 purchase = serializer.save(client=recipient, original_owner=self.request.user)
             except User.DoesNotExist:
                 raise serializers.ValidationError("Recipient not found.")
+        elif purchase_type == 'organization':
+            # For organization purchases, client is the purchaser
+            purchase = serializer.save(client=self.request.user)
         else:
             purchase = serializer.save(client=self.request.user)
 
@@ -164,10 +173,11 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
     
     @action(detail=False, methods=['get'])
     def my(self, request):
+        # Get personal/gifted purchases (exclude organization packages)
         purchases = self.get_queryset().filter(
             Q(client=request.user) | 
             Q(recipient_phone=request.user.phone, gift_status='accepted')
-        )
+        ).exclude(purchase_type='organization')
         serializer = self.get_serializer(purchases, many=True)
         return Response(serializer.data)
     
@@ -180,6 +190,21 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
             gift_expires_at__gt=timezone.now()
         )
         serializer = self.get_serializer(pending_gifts, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=False, methods=['get'])
+    def organization_packages(self, request):
+        """Get organization packages where user is a member"""
+        from coaching.models import OrganizationPackageMember
+        
+        org_purchases = CoachingPackagePurchase.objects.filter(
+            purchase_type='organization',
+            package_status='active',
+            sessions_remaining__gt=0,
+            organization_members__phone=request.user.phone
+        ).distinct().select_related('package', 'client').prefetch_related('organization_members')
+        
+        serializer = self.get_serializer(org_purchases, many=True)
         return Response(serializer.data)
 
     def _sync_purchase_with_ghl(self, purchase):
@@ -204,14 +229,16 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
                 sync_purchase_with_ghl_task.delay(purchase.id)
             else:
                 # Fallback to synchronous call if Celery not available
-                from ghl.services import sync_user_contact
+                # Use the same pattern as async task
+                from ghl.services import sync_user_contact, purchase_custom_fields
                 amount = getattr(purchase.package, 'price', 0)
                 purchase_name = purchase.purchase_name or (purchase.package.title if purchase.package else 'Unknown')
+                custom_fields = purchase_custom_fields(purchase_name, amount)
                 sync_user_contact(
                     contact_owner,
                     location_id=location_id,
-                    tags=build_purchase_tags(amount),
-                    custom_fields=purchase_custom_fields(purchase_name, amount),
+                    tags=None,
+                    custom_fields=custom_fields,
                 )
         except Exception as exc:
             logger.warning("Failed to sync GHL for purchase %s: %s", purchase.id, exc)

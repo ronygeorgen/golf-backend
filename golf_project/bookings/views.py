@@ -13,7 +13,7 @@ from .models import Booking
 from .serializers import BookingSerializer, BookingCreateSerializer
 from users.models import User
 from simulators.models import Simulator, SimulatorCredit
-from coaching.models import CoachingPackagePurchase
+from coaching.models import CoachingPackagePurchase, OrganizationPackageMember
 
 class TenPerPagePagination(PageNumberPagination):
     page_size = 10
@@ -125,23 +125,58 @@ class BookingViewSet(viewsets.ModelViewSet):
         
         return best_choice[-1] if best_choice else None
     
-    def _consume_package_session(self, package):
-        # Find an active package purchase for the user
-        # Include normal purchases and accepted gifts
-        purchase = CoachingPackagePurchase.objects.select_for_update().filter(
-            client=self.request.user,
-            package=package,
-            sessions_remaining__gt=0,
-            package_status='active'
-        ).exclude(
-            # Exclude pending gifts
-            gift_status='pending'
-        ).order_by('purchased_at').first()
+    def _consume_package_session(self, package, use_organization=False):
+        """
+        Consume a session from a package purchase.
         
-        if not purchase:
-            raise serializers.ValidationError(
-                "You do not have any remaining sessions for the selected package."
-            )
+        Args:
+            package: The CoachingPackage to consume from
+            use_organization: If True, use organization packages; if False, use personal/gifted packages
+        """
+        if use_organization:
+            # Find organization packages where user is a member
+            # First get the IDs to avoid DISTINCT with FOR UPDATE issue
+            member_purchase_ids = CoachingPackagePurchase.objects.filter(
+                package=package,
+                purchase_type='organization',
+                sessions_remaining__gt=0,
+                package_status='active',
+                organization_members__phone=self.request.user.phone
+            ).distinct().values_list('id', flat=True)
+            
+            if not member_purchase_ids:
+                raise serializers.ValidationError(
+                    "You do not have access to any organization packages for the selected package."
+                )
+            
+            # Now use select_for_update on the specific IDs (first-come-first-served)
+            purchase = CoachingPackagePurchase.objects.select_for_update().filter(
+                id__in=member_purchase_ids
+            ).order_by('purchased_at').first()
+            
+            if not purchase:
+                raise serializers.ValidationError(
+                    "No available organization packages found."
+                )
+        else:
+            # Find an active package purchase for the user
+            # Include normal purchases and accepted gifts
+            purchase = CoachingPackagePurchase.objects.select_for_update().filter(
+                client=self.request.user,
+                package=package,
+                sessions_remaining__gt=0,
+                package_status='active'
+            ).exclude(
+                # Exclude pending gifts and organization packages
+                gift_status='pending'
+            ).exclude(
+                purchase_type='organization'
+            ).order_by('purchased_at').first()
+            
+            if not purchase:
+                raise serializers.ValidationError(
+                    "You do not have any remaining sessions for the selected package."
+                )
         
         # Use the consume_session method which handles status updates
         purchase.consume_session(1)
@@ -191,7 +226,8 @@ class BookingViewSet(viewsets.ModelViewSet):
                 if not package:
                     raise serializers.ValidationError("A coaching package is required for coaching bookings.")
                 
-                purchase = self._consume_package_session(package)
+                use_organization = booking_data.pop('use_organization_package', False)
+                purchase = self._consume_package_session(package, use_organization=use_organization)
                 serializer.save(
                     client=self.request.user,
                     package_purchase=purchase,

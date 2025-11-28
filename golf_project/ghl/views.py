@@ -17,7 +17,7 @@ from rest_framework.views import APIView
 
 from .models import GHLLocation
 from .serializers import GHLLocationSerializer, GHLOnboardSerializer
-from .services import GHLClient
+from .services import GHLClient, debug_contact_custom_fields, set_contact_custom_values
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny
 
@@ -257,4 +257,164 @@ class GHLOnboardView(APIView):
         )
         
         return redirect(auth_redirect_url)
+
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def test_contact_custom_fields(request):
+    """
+    Test endpoint to check custom fields for the current user's contact
+    GET /api/ghlpage/test-custom-fields/
+    """
+    user = request.user
+    location_id = user.ghl_location_id or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+    
+    if not location_id:
+        return Response({"error": "No location ID found"}, status=400)
+    
+    if not user.ghl_contact_id:
+        return Response({"error": "No GHL contact ID found for user"}, status=400)
+    
+    custom_fields = debug_contact_custom_fields(user.ghl_contact_id, location_id)
+    
+    return Response({
+        "user_phone": user.phone,
+        "location_id": location_id,
+        "contact_id": user.ghl_contact_id,
+        "custom_fields": custom_fields
+    })
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def test_all_custom_fields(request):
+    """
+    Test endpoint to list all custom fields for a location
+    GET /api/ghlpage/test-all-fields/?location_id=xxx
+    """
+    location_id = request.GET.get('location_id') or request.user.ghl_location_id
+    
+    if not location_id:
+        return Response({"error": "location_id is required"}, status=400)
+    
+    from .services import list_contact_custom_fields
+    custom_fields = list_contact_custom_fields(location_id)
+    
+    return Response({
+        "location_id": location_id,
+        "custom_fields": custom_fields
+    })
+
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def test_otp_custom_field(request):
+    """
+    Test OTP custom field storage
+    POST /api/ghlpage/test-otp-field/
+    {
+        "phone": "1234567890",
+        "location_id": "IAUlKWcfkG3E0IihzMFj"
+    }
+    """
+    phone = request.data.get('phone')
+    location_id = request.data.get('location_id')
+    
+    if not phone or not location_id:
+        return Response({"error": "phone and location_id are required"}, status=400)
+    
+    from users.models import User
+    from ghl.services import sync_user_contact, debug_contact_custom_fields
+    
+    try:
+        user = User.objects.get(phone=phone)
+    except User.DoesNotExist:
+        return Response({"error": "User not found"}, status=404)
+    
+    # Generate test OTP
+    import random
+    test_otp = str(random.randint(100000, 999999))
+    
+    print(f"\n🔐 TEST: Setting OTP {test_otp} for {phone}")
+    
+    # Sync with GHL
+    result, contact_id = sync_user_contact(
+        user,
+        location_id=location_id,
+        custom_fields={
+            'otp_code': test_otp,
+        },
+    )
+    
+    if contact_id:
+        # Check the custom fields after sync
+        print(f"🔍 Checking custom fields after OTP sync...")
+        custom_fields = debug_contact_custom_fields(contact_id, location_id)
+        
+        return Response({
+            "message": "OTP test completed",
+            "phone": phone,
+            "contact_id": contact_id,
+            "test_otp": test_otp,
+            "custom_fields": custom_fields
+        })
+    else:
+        return Response({"error": "Failed to sync with GHL"}, status=500)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def test_purchase_custom_field(request):
+    """
+    Test purchase amount custom field storage
+    POST /api/ghlpage/test-purchase-field/
+    {
+        "phone": "1234567890",
+        "location_id": "IAUlKWcfkG3E0IihzMFj",
+        "amount": 99.99
+    }
+    """
+    phone = request.data.get('phone')
+    location_id = request.data.get('location_id')
+    amount = request.data.get('amount', 99.99)
+    
+    if not phone or not location_id:
+        return Response({"error": "phone and location_id are required"}, status=400)
+    
+    from users.models import User
+    from ghl.services import sync_user_contact, debug_contact_custom_fields
+    
+    try:
+        user = User.objects.get(phone=phone)
+    except User.DoesNotExist:
+        return Response({"error": "User not found"}, status=404)
+    
+    print(f"\n💰 TEST: Setting purchase amount ${amount} for {phone}")
+    
+    # Sync with GHL
+    result, contact_id = sync_user_contact(
+        user,
+        location_id=location_id,
+        custom_fields={
+            'purchase_amount': amount,
+        },
+    )
+    
+    if contact_id:
+        # Check the custom fields after sync
+        print(f"🔍 Checking custom fields after purchase sync...")
+        custom_fields = debug_contact_custom_fields(contact_id, location_id)
+        
+        return Response({
+            "message": "Purchase test completed",
+            "phone": phone,
+            "contact_id": contact_id,
+            "test_amount": amount,
+            "custom_fields": custom_fields
+        })
+    else:
+        return Response({"error": "Failed to sync with GHL"}, status=500)
+
+
 

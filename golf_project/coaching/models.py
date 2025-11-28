@@ -21,6 +21,7 @@ class CoachingPackagePurchase(models.Model):
     PURCHASE_TYPE_CHOICES = (
         ('normal', 'Normal'),
         ('gift', 'Gift'),
+        ('organization', 'Organization'),
     )
     
     GIFT_STATUS_CHOICES = (
@@ -57,7 +58,7 @@ class CoachingPackagePurchase(models.Model):
     notes = models.CharField(max_length=255, blank=True)
     
     # Gifting fields
-    purchase_type = models.CharField(max_length=10, choices=PURCHASE_TYPE_CHOICES, default='normal')
+    purchase_type = models.CharField(max_length=15, choices=PURCHASE_TYPE_CHOICES, default='normal')
     recipient_phone = models.CharField(max_length=15, blank=True, null=True, help_text="Phone number of gift recipient")
     gift_status = models.CharField(max_length=10, choices=GIFT_STATUS_CHOICES, blank=True, null=True)
     gift_token = models.CharField(max_length=64, unique=True, blank=True, null=True, help_text="Unique token for gift claim")
@@ -172,3 +173,35 @@ class SessionTransfer(models.Model):
         while SessionTransfer.objects.filter(transfer_token=token).exists():
             token = ''.join(secrets.choice(alphabet) for _ in range(32))
         return token
+
+
+class OrganizationPackageMember(models.Model):
+    """
+    Members of an organization package purchase.
+    All members (including the purchaser) can use sessions from the package.
+    """
+    package_purchase = models.ForeignKey(
+        CoachingPackagePurchase,
+        on_delete=models.CASCADE,
+        related_name='organization_members',
+        help_text="The organization package purchase this member belongs to"
+    )
+    phone = models.CharField(max_length=15, help_text="Phone number of the member")
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='organization_package_memberships',
+        help_text="User account if member has one (set when validated)"
+    )
+    added_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        unique_together = [['package_purchase', 'phone']]
+        ordering = ['added_at']
+        verbose_name = 'Organization Package Member'
+        verbose_name_plural = 'Organization Package Members'
+    
+    def __str__(self):
+        return f"{self.phone} - {self.package_purchase.purchase_name}"
