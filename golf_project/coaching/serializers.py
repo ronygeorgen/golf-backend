@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from django.utils import timezone
 from datetime import timedelta
-from .models import CoachingPackage, CoachingPackagePurchase, SessionTransfer
+from .models import CoachingPackage, CoachingPackagePurchase, SessionTransfer, OrganizationPackageMember
 from users.serializers import UserSerializer
 from users.models import User
 
@@ -54,11 +54,27 @@ class CoachingPackageSerializer(serializers.ModelSerializer):
         return instance
 
 
+class OrganizationPackageMemberSerializer(serializers.ModelSerializer):
+    user_details = UserSerializer(source='user', read_only=True)
+    
+    class Meta:
+        model = OrganizationPackageMember
+        fields = ['id', 'phone', 'user', 'user_details', 'added_at']
+        read_only_fields = ['user', 'added_at']
+
+
 class CoachingPackagePurchaseSerializer(serializers.ModelSerializer):
     package_details = CoachingPackageSerializer(source='package', read_only=True)
     client_details = UserSerializer(source='client', read_only=True)
     original_owner_details = UserSerializer(source='original_owner', read_only=True)
     recipient_name = serializers.SerializerMethodField()
+    organization_members = OrganizationPackageMemberSerializer(many=True, read_only=True)
+    member_phones = serializers.ListField(
+        child=serializers.CharField(),
+        write_only=True,
+        required=False,
+        help_text="List of phone numbers for organization package members"
+    )
     
     class Meta:
         model = CoachingPackagePurchase
@@ -83,6 +99,8 @@ class CoachingPackagePurchaseSerializer(serializers.ModelSerializer):
             'purchased_at',
             'updated_at',
             'gift_expires_at',
+            'organization_members',
+            'member_phones',
         ]
         read_only_fields = [
             'client', 'sessions_remaining', 'purchased_at', 'updated_at',
@@ -142,6 +160,31 @@ class CoachingPackagePurchaseSerializer(serializers.ModelSerializer):
                     'recipient_phone': 'Recipient with this phone number does not exist in the system.'
                 })
         
+        # Validate organization purchase
+        if purchase_type == 'organization':
+            member_phones = attrs.get('member_phones', [])
+            if not member_phones or len(member_phones) == 0:
+                raise serializers.ValidationError({
+                    'member_phones': 'At least one member phone number is required for organization purchases.'
+                })
+            
+            # Validate all phone numbers exist
+            validated_phones = []
+            for phone in member_phones:
+                phone = phone.strip()
+                if not phone:
+                    continue
+                try:
+                    User.objects.get(phone=phone)
+                    validated_phones.append(phone)
+                except User.DoesNotExist:
+                    raise serializers.ValidationError({
+                        'member_phones': f'User with phone number {phone} does not exist in the system.'
+                    })
+            
+            # Store validated phones for later use in create()
+            attrs['_validated_member_phones'] = validated_phones
+        
         # Clients cannot override sessions_total. Admins may optionally set one.
         if not sessions_total or (request and getattr(request.user, 'role', None) == 'client'):
             attrs['sessions_total'] = package.session_count
@@ -168,6 +211,8 @@ class CoachingPackagePurchaseSerializer(serializers.ModelSerializer):
         # Handle extra kwargs from serializer.save() calls (like client=recipient)
         # This is needed because DRF passes extra kwargs to create()
         purchase_type = validated_data.get('purchase_type', 'normal')
+        member_phones = validated_data.pop('member_phones', [])
+        validated_member_phones = validated_data.pop('_validated_member_phones', [])
         
         # Generate gift token if it's a gift purchase
         if purchase_type == 'gift':
@@ -176,7 +221,36 @@ class CoachingPackagePurchaseSerializer(serializers.ModelSerializer):
             instance.save()
             return instance
         
-        return super().create(validated_data)
+        # Handle organization purchase - create members
+        instance = super().create(validated_data)
+        
+        if purchase_type == 'organization':
+            # Add purchaser as a member
+            purchaser_phone = instance.client.phone
+            OrganizationPackageMember.objects.get_or_create(
+                package_purchase=instance,
+                phone=purchaser_phone,
+                defaults={'user': instance.client}
+            )
+            
+            # Add other members
+            for phone in validated_member_phones:
+                if phone != purchaser_phone:  # Don't duplicate purchaser
+                    try:
+                        member_user = User.objects.get(phone=phone)
+                        OrganizationPackageMember.objects.get_or_create(
+                            package_purchase=instance,
+                            phone=phone,
+                            defaults={'user': member_user}
+                        )
+                    except User.DoesNotExist:
+                        # Should not happen due to validation, but handle gracefully
+                        OrganizationPackageMember.objects.get_or_create(
+                            package_purchase=instance,
+                            phone=phone
+                        )
+        
+        return instance
 
 
 class SessionTransferSerializer(serializers.ModelSerializer):

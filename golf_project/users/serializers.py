@@ -170,6 +170,7 @@ class LoginSerializer(serializers.Serializer):
     
 class PhoneLoginSerializer(serializers.Serializer):
     phone = serializers.CharField()
+    location_id = serializers.CharField(required=False, allow_blank=True)
     
 class VerifyOTPSerializer(serializers.Serializer):
     phone = serializers.CharField()

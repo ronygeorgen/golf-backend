@@ -3,17 +3,18 @@ from rest_framework import serializers
 from .models import Booking
 from users.serializers import UserSerializer
 from simulators.serializers import SimulatorSerializer, SimulatorCreditSerializer
-from coaching.serializers import CoachingPackageSerializer
+from coaching.serializers import CoachingPackageSerializer, CoachingPackagePurchaseSerializer
 
 class BookingCreateSerializer(serializers.ModelSerializer):
     use_simulator_credit = serializers.BooleanField(write_only=True, required=False, default=False)
+    use_organization_package = serializers.BooleanField(write_only=True, required=False, default=False)
     
     class Meta:
         model = Booking
         fields = [
             'booking_type', 'simulator', 'duration_minutes', 
             'coaching_package', 'coach', 'start_time', 'end_time', 'total_price',
-            'use_simulator_credit'
+            'use_simulator_credit', 'use_organization_package'
         ]
     
     def __init__(self, *args, **kwargs):
@@ -96,9 +97,11 @@ class BookingSerializer(serializers.ModelSerializer):
     simulator_details = SimulatorSerializer(source='simulator', read_only=True)
     coach_details = UserSerializer(source='coach', read_only=True)
     package_details = CoachingPackageSerializer(source='coaching_package', read_only=True)
+    package_purchase_details = CoachingPackagePurchaseSerializer(source='package_purchase', read_only=True)
     simulator_credit_details = SimulatorCreditSerializer(source='simulator_credit_redemption', read_only=True)
     uses_simulator_credit = serializers.SerializerMethodField()
     coaching_session_price = serializers.SerializerMethodField()
+    purchase_type_label = serializers.SerializerMethodField()
     
     class Meta:
         model = Booking
@@ -121,3 +124,28 @@ class BookingSerializer(serializers.ModelSerializer):
             )
             return value
         return Decimal(package.price).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP) if package else None
+    
+    def get_purchase_type_label(self, obj):
+        """Get human-readable label for purchase type"""
+        if not obj.package_purchase or obj.booking_type != 'coaching':
+            return None
+        
+        purchase_type = obj.package_purchase.purchase_type
+        if purchase_type == 'gift':
+            return 'Gifted'
+        elif purchase_type == 'organization':
+            return 'Organization'
+        elif purchase_type == 'normal':
+            # Check if it's from a transfer - look for accepted transfers for this user and package
+            from coaching.models import SessionTransfer
+            if obj.coaching_package:
+                transfer = SessionTransfer.objects.filter(
+                    to_user=obj.client,
+                    package_purchase__package=obj.coaching_package,
+                    transfer_status='accepted'
+                ).first()
+                if transfer:
+                    return 'Transferred'
+            return 'Personal'
+        
+        return 'Personal'

@@ -18,7 +18,6 @@ from django.conf import settings
 
 from .services import (
     sync_user_contact,
-    build_purchase_tags,
     purchase_custom_fields,
 )
 
@@ -48,7 +47,7 @@ def sync_user_contact_task(self, user_id, location_id=None, tags=None, custom_fi
         result = sync_user_contact(
             user,
             location_id=location_id,
-            tags=tags,
+            tags=None,
             custom_fields=custom_fields,
         )
         
@@ -64,9 +63,6 @@ def sync_user_contact_task(self, user_id, location_id=None, tags=None, custom_fi
 def sync_purchase_with_ghl_task(self, purchase_id):
     """
     Async task to sync package purchase with GHL.
-    
-    Args:
-        purchase_id: ID of the CoachingPackagePurchase to sync
     """
     try:
         from coaching.models import CoachingPackagePurchase
@@ -84,18 +80,20 @@ def sync_purchase_with_ghl_task(self, purchase_id):
             logger.warning("No GHL location for purchase %s", purchase_id)
             return None
         
-        # Build tags and custom fields
+        # ✅ THIS LINE SHOULD BE ADDED - Define package_price
         package_price = purchase.package.price if purchase.package else 0
-        tags = build_purchase_tags(package_price)
+        
+        # Build custom fields dict - this will create/update custom field values
         custom_fields = purchase_custom_fields(
-            purchase.purchase_name or purchase.package.title if purchase.package else 'Unknown',
-            package_price
+            purchase.purchase_name or (purchase.package.title if purchase.package else 'Unknown'),
+            package_price  # Now package_price is defined
         )
         
+        # Sync contact using the same function as login
         result = sync_user_contact(
             user,
             location_id=location_id,
-            tags=tags,
+            tags=None,
             custom_fields=custom_fields,
         )
         
@@ -103,7 +101,6 @@ def sync_purchase_with_ghl_task(self, purchase_id):
         return result
     except Exception as exc:
         logger.error("Failed to sync purchase %s with GHL: %s", purchase_id, exc, exc_info=True)
-        # Retry the task
         raise self.retry(exc=exc)
 
 
