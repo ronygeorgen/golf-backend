@@ -386,6 +386,41 @@ def signup(request):
         else:
             logger.info(f"No pending recipients found for new user {user.phone}")
         
+        # Sync user to GHL (create contact if doesn't exist)
+        try:
+            # Get location_id from user or default
+            resolved_location = getattr(user, 'ghl_location_id', None) or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            
+            if resolved_location:
+                if CELERY_AVAILABLE and sync_user_contact_task:
+                    # Queue async task to sync with GHL
+                    sync_user_contact_task.delay(
+                        user.id,
+                        location_id=resolved_location,
+                        tags=None,
+                        custom_fields={
+                            'otp_code': otp,  # Store the OTP code in GHL
+                        },
+                    )
+                    logger.info("Queued GHL sync task for user %s (signup)", user.id)
+                else:
+                    # Fallback to synchronous call if Celery not available
+                    from ghl.services import sync_user_contact
+                    sync_user_contact(
+                        user,
+                        location_id=resolved_location,
+                        tags=None,
+                        custom_fields={
+                            'otp_code': otp,
+                        },
+                    )
+                    logger.info("Successfully synced user %s to GHL location %s during signup", user.phone, resolved_location)
+            else:
+                logger.warning("No GHL location available for user %s during signup", user.id)
+        except Exception as exc:
+            logger.warning("Failed to sync GHL for signup %s: %s", user.phone, exc)
+            # Don't fail signup if GHL sync fails
+        
         # Create authentication token
         token, created = Token.objects.get_or_create(user=user)
         
