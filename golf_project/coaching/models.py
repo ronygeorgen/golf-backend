@@ -2,6 +2,7 @@ from django.conf import settings
 from django.db import models
 import secrets
 import string
+import uuid
 
 
 class CoachingPackage(models.Model):
@@ -11,6 +12,7 @@ class CoachingPackage(models.Model):
     staff_members = models.ManyToManyField('users.User', limit_choices_to={'role': 'staff'})
     session_count = models.PositiveIntegerField(default=1, help_text="How many coaching sessions are included.")
     session_duration_minutes = models.PositiveIntegerField(default=60, help_text="Duration of a single session in minutes.")
+    redirect_url = models.URLField(max_length=500, blank=True, null=True, help_text="URL to redirect to after package purchase")
     is_active = models.BooleanField(default=True)
     
     def __str__(self):
@@ -205,3 +207,109 @@ class OrganizationPackageMember(models.Model):
     
     def __str__(self):
         return f"{self.phone} - {self.package_purchase.purchase_name}"
+
+
+class TempPurchase(models.Model):
+    """
+    Temporary purchase record created before payment processing.
+    Stores purchase details until webhook confirms payment.
+    """
+    PURCHASE_TYPE_CHOICES = (
+        ('normal', 'Normal'),
+        ('gift', 'Gift'),
+        ('organization', 'Organization'),
+    )
+    
+    temp_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    package = models.ForeignKey(
+        CoachingPackage,
+        on_delete=models.CASCADE,
+        related_name='temp_purchases'
+    )
+    buyer_phone = models.CharField(max_length=15)
+    purchase_type = models.CharField(max_length=20, choices=PURCHASE_TYPE_CHOICES, default='normal')
+    recipients = models.JSONField(
+        default=list,
+        help_text="List of recipient phone numbers (for gift/organization purchases)"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Expiration time for temp purchase (default 24 hours)"
+    )
+    
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'Temporary Purchase'
+        verbose_name_plural = 'Temporary Purchases'
+    
+    def __str__(self):
+        return f"TempPurchase {self.temp_id} - {self.buyer_phone} - {self.purchase_type}"
+    
+    def save(self, *args, **kwargs):
+        from django.utils import timezone
+        from datetime import timedelta
+        if not self.expires_at:
+            self.expires_at = timezone.now() + timedelta(hours=24)
+        super().save(*args, **kwargs)
+    
+    @property
+    def is_expired(self):
+        from django.utils import timezone
+        if self.expires_at:
+            return timezone.now() > self.expires_at
+        return False
+
+
+class PendingRecipient(models.Model):
+    """
+    Stores recipients who don't exist in the system yet.
+    When they sign up, these records are converted to actual purchases.
+    """
+    PURCHASE_TYPE_CHOICES = (
+        ('gift', 'Gift'),
+        ('organization', 'Organization'),
+    )
+    
+    STATUS_CHOICES = (
+        ('pending', 'Pending'),     # waiting for recipient signup
+        ('converted', 'Converted'), # after converting to real purchase
+    )
+    
+    package = models.ForeignKey(
+        CoachingPackage,
+        on_delete=models.CASCADE,
+        related_name="pending_recipients"
+    )
+    buyer = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='initiated_pending_recipients'
+    )
+    recipient_phone = models.CharField(max_length=15)
+    purchase_type = models.CharField(max_length=20, choices=PURCHASE_TYPE_CHOICES)
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default='pending'
+    )
+    temp_purchase = models.ForeignKey(
+        TempPurchase,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='pending_recipients',
+        help_text="Reference to the temp purchase that created this pending recipient"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'Pending Recipient'
+        verbose_name_plural = 'Pending Recipients'
+        unique_together = [['package', 'buyer', 'recipient_phone', 'purchase_type']]
+    
+    def __str__(self):
+        return f"Pending {self.purchase_type} - {self.recipient_phone} - Status: {self.status}"

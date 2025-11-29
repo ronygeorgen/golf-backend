@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from django.utils import timezone
 from datetime import timedelta
-from .models import CoachingPackage, CoachingPackagePurchase, SessionTransfer, OrganizationPackageMember
+from .models import CoachingPackage, CoachingPackagePurchase, SessionTransfer, OrganizationPackageMember, TempPurchase, PendingRecipient
 from users.serializers import UserSerializer
 from users.models import User
 
@@ -350,4 +350,74 @@ class SessionTransferSerializer(serializers.ModelSerializer):
         instance.transfer_token = instance.generate_transfer_token()
         instance.save()
         return instance
+
+
+class TempPurchaseSerializer(serializers.ModelSerializer):
+    package_details = CoachingPackageSerializer(source='package', read_only=True)
+    
+    class Meta:
+        model = TempPurchase
+        fields = [
+            'temp_id',
+            'package',
+            'package_details',
+            'buyer_phone',
+            'purchase_type',
+            'recipients',
+            'created_at',
+            'expires_at',
+        ]
+        read_only_fields = ['temp_id', 'created_at', 'expires_at']
+    
+    def validate_recipients(self, value):
+        """Validate recipients list"""
+        if not isinstance(value, list):
+            raise serializers.ValidationError("Recipients must be a list of phone numbers.")
+        # Remove duplicates and empty strings
+        cleaned = list(set([phone.strip() for phone in value if phone and phone.strip()]))
+        return cleaned
+    
+    def validate(self, attrs):
+        purchase_type = attrs.get('purchase_type', 'normal')
+        recipients = attrs.get('recipients', [])
+        
+        if purchase_type == 'gift':
+            if not recipients or len(recipients) != 1:
+                raise serializers.ValidationError({
+                    'recipients': 'Gift purchases require exactly one recipient phone number.'
+                })
+        elif purchase_type == 'organization':
+            if not recipients or len(recipients) == 0:
+                raise serializers.ValidationError({
+                    'recipients': 'Organization purchases require at least one member phone number.'
+                })
+        elif purchase_type == 'normal':
+            if recipients:
+                raise serializers.ValidationError({
+                    'recipients': 'Normal purchases should not have recipients.'
+                })
+        
+        return attrs
+
+
+class PendingRecipientSerializer(serializers.ModelSerializer):
+    package_details = CoachingPackageSerializer(source='package', read_only=True)
+    buyer_details = UserSerializer(source='buyer', read_only=True)
+    
+    class Meta:
+        model = PendingRecipient
+        fields = [
+            'id',
+            'package',
+            'package_details',
+            'buyer',
+            'buyer_details',
+            'recipient_phone',
+            'purchase_type',
+            'status',
+            'temp_purchase',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['status', 'created_at', 'updated_at']
 

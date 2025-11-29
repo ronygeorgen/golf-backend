@@ -241,6 +241,121 @@ def verify_otp(request):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
     
 
+def convert_pending_recipients(user):
+    """
+    Convert PendingRecipient records to actual purchases when user signs up.
+    Called after user creation.
+    """
+    try:
+        from coaching.models import PendingRecipient, CoachingPackagePurchase, OrganizationPackageMember
+        from datetime import timedelta
+        
+        pending_recipients = PendingRecipient.objects.filter(
+            recipient_phone=user.phone,
+            status='pending'
+        )
+        
+        if not pending_recipients.exists():
+            return []
+        
+        converted_purchases = []
+        
+        for pending in pending_recipients:
+            try:
+                if pending.purchase_type == 'gift':
+                    # Check if purchase already exists
+                    existing_purchase = CoachingPackagePurchase.objects.filter(
+                        client=user,
+                        package=pending.package,
+                        purchase_type='gift',
+                        original_owner=pending.buyer,
+                        recipient_phone=user.phone
+                    ).first()
+                    
+                    if existing_purchase:
+                        logger.warning(f"Gift purchase already exists for {user.phone}, skipping conversion")
+                        pending.status = 'converted'
+                        pending.save()
+                        continue
+                    
+                    # Create gift purchase
+                    purchase = CoachingPackagePurchase.objects.create(
+                        client=user,
+                        package=pending.package,
+                        purchase_type='gift',
+                        purchase_name=pending.package.title,
+                        sessions_total=pending.package.session_count,
+                        sessions_remaining=pending.package.session_count,
+                        package_status='gifted',
+                        gift_status='pending',
+                        original_owner=pending.buyer,
+                        recipient_phone=user.phone,
+                        gift_token=CoachingPackagePurchase().generate_gift_token(),
+                        gift_expires_at=timezone.now() + timedelta(days=30)
+                    )
+                    converted_purchases.append(purchase)
+                    logger.info(f"Converted pending gift to purchase: User {user.phone}, Purchase ID {purchase.id}")
+                
+                elif pending.purchase_type == 'organization':
+                    # Find or create organization purchase
+                    org_purchase = CoachingPackagePurchase.objects.filter(
+                        client=pending.buyer,
+                        package=pending.package,
+                        purchase_type='organization'
+                    ).first()
+                    
+                    if not org_purchase:
+                        # Create organization purchase if it doesn't exist
+                        org_purchase = CoachingPackagePurchase.objects.create(
+                            client=pending.buyer,
+                            package=pending.package,
+                            purchase_type='organization',
+                            purchase_name=pending.package.title,
+                            sessions_total=pending.package.session_count,
+                            sessions_remaining=pending.package.session_count,
+                            package_status='active',
+                            gift_status=None
+                        )
+                        
+                        # Add buyer as member
+                        OrganizationPackageMember.objects.get_or_create(
+                            package_purchase=org_purchase,
+                            phone=pending.buyer.phone,
+                            defaults={'user': pending.buyer}
+                        )
+                        logger.info(f"Created organization purchase: Buyer {pending.buyer.phone}, Package {pending.package.id}, Purchase ID {org_purchase.id}")
+                    
+                    # Add this user as a member (or update if exists)
+                    member, created = OrganizationPackageMember.objects.get_or_create(
+                        package_purchase=org_purchase,
+                        phone=user.phone,
+                        defaults={'user': user}
+                    )
+                    # Update user field if member already existed but user was None
+                    if not created:
+                        if not member.user or member.user != user:
+                            member.user = user
+                            member.save()
+                            logger.info(f"Updated member user field: Member ID {member.id}, User {user.phone}")
+                    
+                    converted_purchases.append(org_purchase)
+                    logger.info(f"Added user to organization package: User {user.phone}, Purchase ID {org_purchase.id}, Member ID {member.id}, Created: {created}")
+                
+                # Mark pending recipient as converted
+                pending.status = 'converted'
+                pending.save()
+                
+            except Exception as e:
+                logger.error(f"Error converting pending recipient {pending.id} for user {user.phone}: {e}")
+                continue
+        
+        return converted_purchases
+        
+    except Exception as e:
+        logger.error(f"Error in convert_pending_recipients for user {user.phone}: {e}")
+        return []
+
+
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def signup(request):
@@ -264,13 +379,21 @@ def signup(request):
         print(f"⏰ Generated at: {timezone.now()}")
         print("="*50 + "\n")
         
+        # Convert pending recipients to actual purchases
+        converted_purchases = convert_pending_recipients(user)
+        if converted_purchases:
+            logger.info(f"Converted {len(converted_purchases)} pending recipients for new user {user.phone}")
+        else:
+            logger.info(f"No pending recipients found for new user {user.phone}")
+        
         # Create authentication token
         token, created = Token.objects.get_or_create(user=user)
         
         return Response({
             'message': 'User created successfully',
             'token': token.key,
-            'user': UserSerializer(user).data
+            'user': UserSerializer(user).data,
+            'converted_purchases_count': len(converted_purchases)
         }, status=status.HTTP_201_CREATED)
     
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)

@@ -6,7 +6,11 @@ from .views import (
     CoachingPackagePurchaseViewSet,
     GiftClaimView,
     SessionTransferViewSet,
-    UserPhoneCheckView
+    UserPhoneCheckView,
+    PackagePurchaseWebhookView,
+    CreateTempPurchaseView,
+    ListTempPurchasesView,
+    ListPendingRecipientsView
 )
 
 router = DefaultRouter()
@@ -18,6 +22,10 @@ urlpatterns = [
     path('', include(router.urls)),
     path('gifts/claim/<str:token>/', GiftClaimView.as_view(), name='gift-claim'),
     path('users/check-phone/', UserPhoneCheckView.as_view(), name='check-phone'),
+    path('temp-purchase/', CreateTempPurchaseView.as_view(), name='create-temp-purchase'),
+    path('temp-purchases/', ListTempPurchasesView.as_view(), name='list-temp-purchases'),
+    path('pending-recipients/', ListPendingRecipientsView.as_view(), name='list-pending-recipients'),
+    path('webhook/purchase/', PackagePurchaseWebhookView.as_view(), name='package-purchase-webhook'),
 ]
 
 
