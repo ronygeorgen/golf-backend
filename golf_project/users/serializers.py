@@ -20,6 +20,7 @@ class UserSerializer(serializers.ModelSerializer):
             'phone_verified',
             'is_superuser',
             'is_staff',
+            'is_paused',
             'ghl_location_id',
             'ghl_contact_id',
         )
@@ -164,6 +165,9 @@ class LoginSerializer(serializers.Serializer):
         
         if not user.is_active:
             raise serializers.ValidationError("User account is disabled.")
+        
+        if user.is_paused:
+            raise serializers.ValidationError("Your account has been paused. Please contact support.")
         
         attrs['user'] = user
         return attrs

@@ -54,6 +54,18 @@ def request_otp(request):
                 'error': 'User not found. Please sign up first.'
             }, status=status.HTTP_404_NOT_FOUND)
         
+        # Check if user account is paused
+        if user.is_paused:
+            return Response({
+                'error': 'Your account has been paused. Please contact support.'
+            }, status=status.HTTP_403_FORBIDDEN)
+        
+        # Check if user account is active
+        if not user.is_active:
+            return Response({
+                'error': 'User account is disabled.'
+            }, status=status.HTTP_403_FORBIDDEN)
+        
         # Update OTP for existing user
         user.otp_code = otp
         user.otp_created_at = timezone.now()
@@ -120,6 +132,18 @@ def verify_otp(request):
         
         try:
             user = User.objects.get(phone=phone)
+            
+            # Check if user account is paused
+            if user.is_paused:
+                return Response({
+                    'error': 'Your account has been paused. Please contact support.'
+                }, status=status.HTTP_403_FORBIDDEN)
+            
+            # Check if user account is active
+            if not user.is_active:
+                return Response({
+                    'error': 'User account is disabled.'
+                }, status=status.HTTP_403_FORBIDDEN)
             
             # Check if OTP is valid and not expired (5 minutes)
             if (user.otp_code == otp and 
@@ -487,6 +511,11 @@ def auto_login(request):
         if not user.is_active:
             return Response({
                 'error': 'User account is disabled'
+            }, status=status.HTTP_403_FORBIDDEN)
+        
+        if user.is_paused:
+            return Response({
+                'error': 'Your account has been paused. Please contact support.'
             }, status=status.HTTP_403_FORBIDDEN)
         
         # Get or create authentication token

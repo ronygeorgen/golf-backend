@@ -3,6 +3,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import PermissionDenied
+from rest_framework.pagination import PageNumberPagination
 from django.db.models import Count, Sum, Q, F
 from django.utils import timezone
 from datetime import datetime, timedelta
@@ -207,3 +208,89 @@ class AdminOverrideViewSet(viewsets.ViewSet):
             'message': f'{token_count} simulator credit(s) granted.',
             'credits': credit_data
         }, status=status.HTTP_201_CREATED)
+
+
+class UserPagination(PageNumberPagination):
+    page_size = 20
+    page_size_query_param = 'page_size'
+    max_page_size = 100
+
+
+class UserViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    ViewSet for listing all users with pagination.
+    Only accessible by admin users.
+    """
+    queryset = User.objects.all().order_by('-date_joined')
+    serializer_class = UserSerializer
+    permission_classes = [IsAuthenticated]
+    pagination_class = UserPagination
+    
+    def get_queryset(self):
+        """Filter users based on query parameters"""
+        queryset = User.objects.all().order_by('-date_joined')
+        
+        # Filter by role
+        role = self.request.query_params.get('role', None)
+        if role:
+            queryset = queryset.filter(role=role)
+        
+        # Filter by paused status
+        is_paused = self.request.query_params.get('is_paused', None)
+        if is_paused is not None:
+            is_paused_bool = is_paused.lower() == 'true'
+            queryset = queryset.filter(is_paused=is_paused_bool)
+        
+        # Search by name, email, or phone
+        search = self.request.query_params.get('search', None)
+        if search:
+            queryset = queryset.filter(
+                Q(first_name__icontains=search) |
+                Q(last_name__icontains=search) |
+                Q(email__icontains=search) |
+                Q(phone__icontains=search) |
+                Q(username__icontains=search)
+            )
+        
+        return queryset
+    
+    def list(self, request, *args, **kwargs):
+        """List all users with pagination"""
+        # Check if user is admin
+        if not (request.user.role == 'admin' or request.user.is_superuser):
+            raise PermissionDenied("Administrator privileges are required.")
+        
+        return super().list(request, *args, **kwargs)
+    
+    @action(detail=True, methods=['post'], url_path='toggle-pause')
+    def toggle_pause(self, request, pk=None):
+        """Pause or unpause a user"""
+        # Check if user is admin
+        if not (request.user.role == 'admin' or request.user.is_superuser):
+            raise PermissionDenied("Administrator privileges are required.")
+        
+        user = self.get_object()
+        
+        # Prevent pausing yourself
+        if user.id == request.user.id:
+            return Response(
+                {'error': 'You cannot pause your own account.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Prevent pausing other admins (unless superuser)
+        if user.role == 'admin' and not request.user.is_superuser:
+            return Response(
+                {'error': 'You cannot pause other admin accounts.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Toggle pause status
+        user.is_paused = not user.is_paused
+        user.save(update_fields=['is_paused'])
+        
+        action = 'paused' if user.is_paused else 'unpaused'
+        return Response({
+            'message': f'User {user.email} has been {action}.',
+            'is_paused': user.is_paused
+        })

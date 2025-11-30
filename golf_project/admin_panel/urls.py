@@ -8,6 +8,7 @@ from bookings.views import BookingViewSet
 router = DefaultRouter()
 router.register(r'dashboard', views.AdminDashboardViewSet, basename='admin-dashboard')
 router.register(r'staff', views.StaffViewSet, basename='admin-staff')
+router.register(r'users', views.UserViewSet, basename='admin-users')
 router.register(r'simulators', SimulatorViewSet, basename='admin-simulators')
 router.register(r'duration-prices', DurationPriceViewSet, basename='admin-duration-prices')
 router.register(r'packages', CoachingPackageViewSet, basename='admin-packages')

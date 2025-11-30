@@ -16,6 +16,7 @@ class User(AbstractUser):
     otp_created_at = models.DateTimeField(null=True, blank=True)
     ghl_location_id = models.CharField(max_length=100, blank=True, null=True)
     ghl_contact_id = models.CharField(max_length=100, blank=True, null=True)
+    is_paused = models.BooleanField(default=False, help_text="If True, user cannot login or access the system")
     
     def __str__(self):
         return f"{self.username} ({self.role})"
