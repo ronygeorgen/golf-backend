@@ -7,6 +7,7 @@ from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -33,6 +34,22 @@ from .serializers import (
 from django.db import transaction
 
 logger = logging.getLogger(__name__)
+
+class TenPerPagePagination(PageNumberPagination):
+    page_size = 10
+    page_size_query_param = 'page_size'
+    max_page_size = 100
+    
+    def get_paginated_response(self, data):
+        return Response({
+            'count': self.page.paginator.count,
+            'total_pages': self.page.paginator.num_pages,
+            'current_page': self.page.number,
+            'page_size': self.page_size,
+            'next': self.get_next_link(),
+            'previous': self.get_previous_link(),
+            'results': data
+        })
 
 class CoachingPackageViewSet(viewsets.ModelViewSet):
     queryset = CoachingPackage.objects.all().order_by('-id')
@@ -186,7 +203,15 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
         purchases = self.get_queryset().filter(
             Q(client=request.user) | 
             Q(recipient_phone=request.user.phone, gift_status='accepted')
-        ).exclude(purchase_type='organization')
+        ).exclude(purchase_type='organization').order_by('-purchased_at')
+        
+        # Apply pagination
+        paginator = TenPerPagePagination()
+        page = paginator.paginate_queryset(purchases, request)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return paginator.get_paginated_response(serializer.data)
+        
         serializer = self.get_serializer(purchases, many=True)
         return Response(serializer.data)
     
@@ -215,6 +240,215 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
         
         serializer = self.get_serializer(org_purchases, many=True)
         return Response(serializer.data)
+    
+    @action(detail=False, methods=['get'])
+    def my_organization_purchases(self, request):
+        """Get organization purchases where user is the purchaser (client)"""
+        org_purchases = CoachingPackagePurchase.objects.filter(
+            purchase_type='organization',
+            client=request.user
+        ).select_related('package', 'client').prefetch_related('organization_members').order_by('-purchased_at')
+        
+        # Apply pagination
+        paginator = TenPerPagePagination()
+        page = paginator.paginate_queryset(org_purchases, request)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return paginator.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(org_purchases, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=False, methods=['get'])
+    def transferable_purchases(self, request):
+        """Get purchases available for transfer (excludes organization packages)"""
+        purchases = self.get_queryset().filter(
+            client=request.user,
+            sessions_remaining__gt=0,
+            package_status='active',
+            gift_status__isnull=True  # Exclude pending gifts
+        ).exclude(purchase_type='organization').order_by('-purchased_at')
+        
+        # Apply pagination
+        paginator = TenPerPagePagination()
+        page = paginator.paginate_queryset(purchases, request)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return paginator.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(purchases, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['post'])
+    def add_member(self, request, pk=None):
+        """Add a member to an organization purchase"""
+        from .models import OrganizationPackageMember, PendingRecipient
+        
+        purchase = self.get_object()
+        
+        # Validate purchase type
+        if purchase.purchase_type != 'organization':
+            return Response(
+                {'error': 'This endpoint is only for organization purchases.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Validate user is the purchaser
+        if purchase.client != request.user:
+            return Response(
+                {'error': 'Only the purchaser can manage members.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Validate purchase is active
+        if purchase.package_status != 'active':
+            return Response(
+                {'error': 'Cannot add members to inactive purchases.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        phone = request.data.get('phone')
+        if not phone:
+            return Response(
+                {'error': 'Phone number is required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        phone = phone.strip()
+        
+        # Validate phone format
+        if len(phone) < 10 or len(phone) > 15:
+            return Response(
+                {'error': 'Invalid phone number format. Phone must be 10-15 digits.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Check if already a member
+        if OrganizationPackageMember.objects.filter(
+            package_purchase=purchase,
+            phone=phone
+        ).exists():
+            return Response(
+                {'error': 'This phone number is already a member of this organization purchase.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Check if trying to add purchaser (they're already added)
+        if phone == purchase.client.phone:
+            return Response(
+                {'error': 'The purchaser is already a member.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Try to get user, create member accordingly
+        try:
+            member_user = User.objects.get(phone=phone)
+            # User exists - create member with user reference
+            member, created = OrganizationPackageMember.objects.get_or_create(
+                package_purchase=purchase,
+                phone=phone,
+                defaults={'user': member_user}
+            )
+            if not created:
+                # Update user field if member existed without user
+                member.user = member_user
+                member.save()
+        except User.DoesNotExist:
+            # User doesn't exist - create member without user and create PendingRecipient
+            member, created = OrganizationPackageMember.objects.get_or_create(
+                package_purchase=purchase,
+                phone=phone
+            )
+            # Create PendingRecipient for signup conversion
+            PendingRecipient.objects.get_or_create(
+                package=purchase.package,
+                buyer=purchase.client,
+                recipient_phone=phone,
+                purchase_type='organization',
+                defaults={'status': 'pending'}
+            )
+        
+        # Refresh purchase to get updated members
+        purchase.refresh_from_db()
+        serializer = self.get_serializer(purchase)
+        return Response({
+            'message': 'Member added successfully.',
+            'purchase': serializer.data
+        }, status=status.HTTP_200_OK)
+    
+    @action(detail=True, methods=['post'])
+    def remove_member(self, request, pk=None):
+        """Remove a member from an organization purchase"""
+        from .models import OrganizationPackageMember, PendingRecipient
+        
+        purchase = self.get_object()
+        
+        # Validate purchase type
+        if purchase.purchase_type != 'organization':
+            return Response(
+                {'error': 'This endpoint is only for organization purchases.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Validate user is the purchaser
+        if purchase.client != request.user:
+            return Response(
+                {'error': 'Only the purchaser can manage members.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Validate purchase is active
+        if purchase.package_status != 'active':
+            return Response(
+                {'error': 'Cannot remove members from inactive purchases.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        phone = request.data.get('phone')
+        if not phone:
+            return Response(
+                {'error': 'Phone number is required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        phone = phone.strip()
+        
+        # Prevent removing purchaser
+        if phone == purchase.client.phone:
+            return Response(
+                {'error': 'Cannot remove the purchaser from the organization purchase.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Try to remove member
+        try:
+            member = OrganizationPackageMember.objects.get(
+                package_purchase=purchase,
+                phone=phone
+            )
+            member.delete()
+            
+            # Also delete related PendingRecipient if exists
+            PendingRecipient.objects.filter(
+                package=purchase.package,
+                buyer=purchase.client,
+                recipient_phone=phone,
+                purchase_type='organization',
+                status='pending'
+            ).delete()
+            
+            # Refresh purchase to get updated members
+            purchase.refresh_from_db()
+            serializer = self.get_serializer(purchase)
+            return Response({
+                'message': 'Member removed successfully.',
+                'purchase': serializer.data
+            }, status=status.HTTP_200_OK)
+        except OrganizationPackageMember.DoesNotExist:
+            return Response(
+                {'error': 'Member not found in this organization purchase.'},
+                status=status.HTTP_404_NOT_FOUND
+            )
 
     def _sync_purchase_with_ghl(self, purchase):
         """
@@ -609,22 +843,7 @@ class PackagePurchaseWebhookView(APIView):
         
         # Handle normal purchase
         if purchase_type == 'normal':
-            # Check if purchase already exists
-            existing_purchase = CoachingPackagePurchase.objects.filter(
-                client=buyer,
-                package=package,
-                purchase_type='normal'
-            ).first()
-            
-            if existing_purchase:
-                logger.warning(f"Purchase already exists for user {buyer.phone} and package {package.id}")
-                return Response({
-                    'message': 'Purchase already exists.',
-                    'purchase_id': existing_purchase.id,
-                    'purchase': CoachingPackagePurchaseSerializer(existing_purchase).data
-                }, status=status.HTTP_200_OK)
-            
-            # Create the purchase
+            # Create the purchase (always create new purchase)
             try:
                 purchase = CoachingPackagePurchase.objects.create(
                     client=buyer,
@@ -679,24 +898,7 @@ class PackagePurchaseWebhookView(APIView):
                         status=status.HTTP_400_BAD_REQUEST
                     )
                 
-                # Check if purchase already exists
-                existing_purchase = CoachingPackagePurchase.objects.filter(
-                    client=recipient,
-                    package=package,
-                    purchase_type='gift',
-                    original_owner=buyer,
-                    recipient_phone=recipient_phone
-                ).first()
-                
-                if existing_purchase:
-                    logger.warning(f"Gift purchase already exists for recipient {recipient_phone} and package {package.id}")
-                    return Response({
-                        'message': 'Gift purchase already exists.',
-                        'purchase_id': existing_purchase.id,
-                        'purchase': CoachingPackagePurchaseSerializer(existing_purchase).data
-                    }, status=status.HTTP_200_OK)
-                
-                # Create gift purchase
+                # Create gift purchase (always create new purchase)
                 purchase = CoachingPackagePurchase.objects.create(
                     client=recipient,
                     package=package,
@@ -753,64 +955,23 @@ class PackagePurchaseWebhookView(APIView):
                     status=status.HTTP_400_BAD_REQUEST
                 )
             
-            # Separate existing users and non-existing users
+            # Filter out buyer's phone from recipients - only process other numbers
+            other_recipients = [phone for phone in recipients if phone != buyer.phone]
+            
+            # Separate existing users and non-existing users (only from other recipients)
             existing_members = []
             pending_recipients_created = []
             
-            for recipient_phone in recipients:
+            for recipient_phone in other_recipients:
                 try:
                     member_user = User.objects.get(phone=recipient_phone)
                     existing_members.append(member_user)
                 except User.DoesNotExist:
-                    # Create PendingRecipient for non-existing users
-                    pending_recipient, created = PendingRecipient.objects.get_or_create(
-                        package=package,
-                        buyer=buyer,
-                        recipient_phone=recipient_phone,
-                        purchase_type='organization',
-                        defaults={
-                            'status': 'pending',
-                            'temp_purchase': temp_purchase
-                        }
-                    )
-                    if created:
-                        pending_recipients_created.append(recipient_phone)
-                    logger.info(f"PendingRecipient created for organization: Buyer {buyer.phone}, Member {recipient_phone}, Package {package.id}")
+                    # Non-existing users will be handled after purchase creation
+                    pending_recipients_created.append(recipient_phone)
+                    logger.info(f"Non-existing user for organization: Buyer {buyer.phone}, Member {recipient_phone}, Package {package.id}")
             
-            # If no existing members, return pending status
-            if not existing_members:
-                return Response({
-                    'message': 'Organization purchase pending. All members will receive package when they sign up.',
-                    'pending_recipients': pending_recipients_created,
-                    'status': 'pending_signup'
-                }, status=status.HTTP_201_CREATED)
-            
-            # Check if purchase already exists
-            existing_purchase = CoachingPackagePurchase.objects.filter(
-                client=buyer,
-                package=package,
-                purchase_type='organization'
-            ).first()
-            
-            if existing_purchase:
-                # Add existing members to the organization package
-                from coaching.models import OrganizationPackageMember
-                for member_user in existing_members:
-                    OrganizationPackageMember.objects.get_or_create(
-                        package_purchase=existing_purchase,
-                        phone=member_user.phone,
-                        defaults={'user': member_user}
-                    )
-                
-                logger.warning(f"Organization purchase already exists, added members: User {buyer.phone}, Package {package.id}")
-                return Response({
-                    'message': 'Organization purchase already exists. Members added.',
-                    'purchase_id': existing_purchase.id,
-                    'purchase': CoachingPackagePurchaseSerializer(existing_purchase).data,
-                    'pending_recipients': pending_recipients_created
-                }, status=status.HTTP_200_OK)
-            
-            # Create organization purchase with existing members
+            # Create organization purchase (always create new purchase)
             try:
                 from coaching.models import OrganizationPackageMember
                 
@@ -825,30 +986,54 @@ class PackagePurchaseWebhookView(APIView):
                     gift_status=None
                 )
                 
-                # Add purchaser as a member
+                # Always add buyer as a member
                 OrganizationPackageMember.objects.get_or_create(
                     package_purchase=purchase,
                     phone=buyer.phone,
                     defaults={'user': buyer}
                 )
                 
-                # Add existing members
+                # Add existing members (only other recipients, buyer already added)
                 for member_user in existing_members:
-                    if member_user.phone != buyer.phone:  # Don't duplicate purchaser
-                        OrganizationPackageMember.objects.get_or_create(
-                            package_purchase=purchase,
-                            phone=member_user.phone,
-                            defaults={'user': member_user}
-                        )
+                    OrganizationPackageMember.objects.get_or_create(
+                        package_purchase=purchase,
+                        phone=member_user.phone,
+                        defaults={'user': member_user}
+                    )
                 
-                logger.info(f"Organization purchase created via webhook: Buyer {buyer.phone}, Package {package.id}, Purchase ID {purchase.id}, Members: {len(existing_members)}, Pending: {len(pending_recipients_created)}")
+                # Add non-existing users as members (without user reference) and create PendingRecipient
+                # This matches the behavior of the add_member endpoint
+                for recipient_phone in pending_recipients_created:
+                    # Create OrganizationPackageMember without user (user will be set when they sign up)
+                    OrganizationPackageMember.objects.get_or_create(
+                        package_purchase=purchase,
+                        phone=recipient_phone
+                    )
+                    # Create PendingRecipient for signup conversion with direct link to purchase
+                    PendingRecipient.objects.get_or_create(
+                        package=package,
+                        buyer=buyer,
+                        recipient_phone=recipient_phone,
+                        purchase_type='organization',
+                        defaults={
+                            'status': 'pending',
+                            'temp_purchase': temp_purchase,
+                            'package_purchase': purchase  # Direct link to the purchase
+                        }
+                    )
+                    logger.info(f"OrganizationPackageMember and PendingRecipient created for organization: Buyer {buyer.phone}, Member {recipient_phone}, Package {package.id}")
+                
+                # Total members = buyer + existing members + non-existing members
+                total_members = 1 + len(existing_members) + len(pending_recipients_created)
+                
+                logger.info(f"Organization purchase created via webhook: Buyer {buyer.phone}, Package {package.id}, Purchase ID {purchase.id}, Members: {total_members} (buyer + {len(existing_members)} others), Pending: {len(pending_recipients_created)}")
                 
                 return Response({
                     'message': 'Organization purchase created successfully.',
                     'purchase_id': purchase.id,
                     'purchase': CoachingPackagePurchaseSerializer(purchase).data,
                     'pending_recipients': pending_recipients_created,
-                    'members_added': len(existing_members)
+                    'members_added': total_members
                 }, status=status.HTTP_201_CREATED)
                 
             except Exception as e:

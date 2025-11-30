@@ -302,6 +302,14 @@ class PendingRecipient(models.Model):
         related_name='pending_recipients',
         help_text="Reference to the temp purchase that created this pending recipient"
     )
+    package_purchase = models.ForeignKey(
+        CoachingPackagePurchase,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='pending_recipients_from_purchase',
+        help_text="Direct link to the purchase this pending recipient belongs to. Set for organization purchases, None for gift purchases until recipient signs up."
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     

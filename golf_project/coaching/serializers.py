@@ -168,22 +168,29 @@ class CoachingPackagePurchaseSerializer(serializers.ModelSerializer):
                     'member_phones': 'At least one member phone number is required for organization purchases.'
                 })
             
-            # Validate all phone numbers exist
+            # Validate phone format and store (allow non-existing users)
             validated_phones = []
+            existing_user_phones = []
             for phone in member_phones:
                 phone = phone.strip()
                 if not phone:
                     continue
+                # Basic phone validation (non-empty, reasonable length)
+                if len(phone) < 10 or len(phone) > 15:
+                    raise serializers.ValidationError({
+                        'member_phones': f'Invalid phone number format: {phone}. Phone must be 10-15 digits.'
+                    })
+                validated_phones.append(phone)
+                # Check if user exists (optional - for setting user field)
                 try:
                     User.objects.get(phone=phone)
-                    validated_phones.append(phone)
+                    existing_user_phones.append(phone)
                 except User.DoesNotExist:
-                    raise serializers.ValidationError({
-                        'member_phones': f'User with phone number {phone} does not exist in the system.'
-                    })
+                    pass  # Non-existing users are allowed
             
             # Store validated phones for later use in create()
             attrs['_validated_member_phones'] = validated_phones
+            attrs['_existing_user_phones'] = existing_user_phones
         
         # Clients cannot override sessions_total. Admins may optionally set one.
         if not sessions_total or (request and getattr(request.user, 'role', None) == 'client'):
@@ -213,6 +220,7 @@ class CoachingPackagePurchaseSerializer(serializers.ModelSerializer):
         purchase_type = validated_data.get('purchase_type', 'normal')
         member_phones = validated_data.pop('member_phones', [])
         validated_member_phones = validated_data.pop('_validated_member_phones', [])
+        existing_user_phones = validated_data.pop('_existing_user_phones', [])
         
         # Generate gift token if it's a gift purchase
         if purchase_type == 'gift':
@@ -225,6 +233,8 @@ class CoachingPackagePurchaseSerializer(serializers.ModelSerializer):
         instance = super().create(validated_data)
         
         if purchase_type == 'organization':
+            from .models import PendingRecipient
+            
             # Add purchaser as a member
             purchaser_phone = instance.client.phone
             OrganizationPackageMember.objects.get_or_create(
@@ -238,16 +248,25 @@ class CoachingPackagePurchaseSerializer(serializers.ModelSerializer):
                 if phone != purchaser_phone:  # Don't duplicate purchaser
                     try:
                         member_user = User.objects.get(phone=phone)
+                        # User exists - create member with user reference
                         OrganizationPackageMember.objects.get_or_create(
                             package_purchase=instance,
                             phone=phone,
                             defaults={'user': member_user}
                         )
                     except User.DoesNotExist:
-                        # Should not happen due to validation, but handle gracefully
+                        # User doesn't exist - create member without user and create PendingRecipient
                         OrganizationPackageMember.objects.get_or_create(
                             package_purchase=instance,
                             phone=phone
+                        )
+                        # Create PendingRecipient for signup conversion
+                        PendingRecipient.objects.get_or_create(
+                            package=instance.package,
+                            buyer=instance.client,
+                            recipient_phone=phone,
+                            purchase_type='organization',
+                            defaults={'status': 'pending'}
                         )
         
         return instance

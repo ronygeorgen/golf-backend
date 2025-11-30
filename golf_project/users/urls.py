@@ -10,6 +10,7 @@ urlpatterns = [
     path('login/', views.login, name='login'),
     path('logout/', views.logout, name='logout'),
     path('profile/', views.profile, name='profile'),
+    path('auto-login/', views.auto_login, name='auto_login'),
     
     # OTP authentication endpoints
     path('request-otp/', views.request_otp, name='request_otp'),

@@ -293,37 +293,46 @@ def convert_pending_recipients(user):
                         gift_token=CoachingPackagePurchase().generate_gift_token(),
                         gift_expires_at=timezone.now() + timedelta(days=30)
                     )
+                    # Optionally link the purchase to PendingRecipient for reference
+                    if not pending.package_purchase:
+                        pending.package_purchase = purchase
+                        pending.save()
                     converted_purchases.append(purchase)
                     logger.info(f"Converted pending gift to purchase: User {user.phone}, Purchase ID {purchase.id}")
                 
                 elif pending.purchase_type == 'organization':
-                    # Find or create organization purchase
-                    org_purchase = CoachingPackagePurchase.objects.filter(
-                        client=pending.buyer,
-                        package=pending.package,
-                        purchase_type='organization'
-                    ).first()
-                    
-                    if not org_purchase:
-                        # Create organization purchase if it doesn't exist
-                        org_purchase = CoachingPackagePurchase.objects.create(
+                    # Use direct link to purchase if available (from webhook)
+                    if pending.package_purchase:
+                        org_purchase = pending.package_purchase
+                        logger.info(f"Using direct purchase link: Purchase ID {org_purchase.id} for user {user.phone}")
+                    else:
+                        # Fallback: Find purchase (for backward compatibility with old records)
+                        org_purchase = CoachingPackagePurchase.objects.filter(
                             client=pending.buyer,
                             package=pending.package,
-                            purchase_type='organization',
-                            purchase_name=pending.package.title,
-                            sessions_total=pending.package.session_count,
-                            sessions_remaining=pending.package.session_count,
-                            package_status='active',
-                            gift_status=None
-                        )
+                            purchase_type='organization'
+                        ).first()
                         
-                        # Add buyer as member
-                        OrganizationPackageMember.objects.get_or_create(
-                            package_purchase=org_purchase,
-                            phone=pending.buyer.phone,
-                            defaults={'user': pending.buyer}
-                        )
-                        logger.info(f"Created organization purchase: Buyer {pending.buyer.phone}, Package {pending.package.id}, Purchase ID {org_purchase.id}")
+                        if not org_purchase:
+                            # Create organization purchase if it doesn't exist (shouldn't happen with new webhook)
+                            org_purchase = CoachingPackagePurchase.objects.create(
+                                client=pending.buyer,
+                                package=pending.package,
+                                purchase_type='organization',
+                                purchase_name=pending.package.title,
+                                sessions_total=pending.package.session_count,
+                                sessions_remaining=pending.package.session_count,
+                                package_status='active',
+                                gift_status=None
+                            )
+                            
+                            # Add buyer as member
+                            OrganizationPackageMember.objects.get_or_create(
+                                package_purchase=org_purchase,
+                                phone=pending.buyer.phone,
+                                defaults={'user': pending.buyer}
+                            )
+                            logger.info(f"Created organization purchase: Buyer {pending.buyer.phone}, Package {pending.package.id}, Purchase ID {org_purchase.id}")
                     
                     # Add this user as a member (or update if exists)
                     member, created = OrganizationPackageMember.objects.get_or_create(
@@ -347,6 +356,27 @@ def convert_pending_recipients(user):
                 
             except Exception as e:
                 logger.error(f"Error converting pending recipient {pending.id} for user {user.phone}: {e}")
+                continue
+        
+        # Also check for OrganizationPackageMember records with user=None that match this user's phone
+        from coaching.models import OrganizationPackageMember
+        org_members_without_user = OrganizationPackageMember.objects.filter(
+            phone=user.phone,
+            user__isnull=True
+        ).select_related('package_purchase', 'package_purchase__package')
+        
+        for member in org_members_without_user:
+            try:
+                # Update the member record to link the user
+                member.user = user
+                member.save()
+                logger.info(f"Updated OrganizationPackageMember: Member ID {member.id}, User {user.phone}, Purchase ID {member.package_purchase.id}")
+                
+                # If purchase not already in converted_purchases, add it
+                if member.package_purchase not in converted_purchases:
+                    converted_purchases.append(member.package_purchase)
+            except Exception as e:
+                logger.error(f"Error updating OrganizationPackageMember {member.id} for user {user.phone}: {e}")
                 continue
         
         return converted_purchases
@@ -471,3 +501,49 @@ def profile(request):
     """Get current user profile"""
     serializer = UserSerializer(request.user)
     return Response(serializer.data, status=status.HTTP_200_OK)
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def auto_login(request):
+    """Auto-login endpoint for admin users via email query parameter"""
+    email = request.query_params.get('email')
+    
+    if not email:
+        return Response({
+            'error': 'Email parameter is required'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    try:
+        user = User.objects.get(email=email)
+        
+        # Check if user is admin (role='admin' or is_superuser=True)
+        is_admin = user.role == 'admin' or user.is_superuser == True
+        
+        if not is_admin:
+            return Response({
+                'error': 'Auto-login is only available for admin users'
+            }, status=status.HTTP_403_FORBIDDEN)
+        
+        if not user.is_active:
+            return Response({
+                'error': 'User account is disabled'
+            }, status=status.HTTP_403_FORBIDDEN)
+        
+        # Get or create authentication token
+        token, created = Token.objects.get_or_create(user=user)
+        
+        return Response({
+            'message': 'Auto-login successful',
+            'token': token.key,
+            'user': UserSerializer(user).data
+        }, status=status.HTTP_200_OK)
+        
+    except User.DoesNotExist:
+        return Response({
+            'error': 'User not found with this email'
+        }, status=status.HTTP_404_NOT_FOUND)
+    except Exception as e:
+        logger.error(f"Error in auto_login: {e}")
+        return Response({
+            'error': 'An error occurred during auto-login'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
