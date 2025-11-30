@@ -100,7 +100,7 @@ def get_contact_custom_field_mapping(location_id):
     
     # Update these field names to match EXACTLY what's in your GHL dashboard
     required_fields = [
-        {"name": "Login Otp", "type": "TEXT", "key": "otp_code"},  # Changed to match your GHL
+        {"name": "Login Otp", "type": "TEXT", "key": "login_otp"},  # Changed to match your GHL
         {"name": "Last Login At", "type": "TEXT", "key": "last_login_at"},
         {"name": "Purchase Amount", "type": "TEXT", "key": "purchase_amount"}
     ]
@@ -213,7 +213,7 @@ def set_contact_custom_values(contact_id, location_id, custom_fields_dict):
             for key, f_id in field_mapping.items():
                 # Map back from our internal key to field name
                 field_name_mapping = {
-                    'otp_code': 'Login Otp',
+                    'login_otp': 'Login Otp',
                     'last_login_at': 'Last Login At', 
                     'purchase_amount': 'Purchase Amount'
                 }
@@ -548,7 +548,7 @@ def sync_user_contact(user, *, location_id: Optional[str] = None,
         if custom_fields:
             # Field name mapping: key -> field name
             field_name_mapping = {
-                'otp_code': 'Login Otp',
+                'login_otp': 'Login Otp',
                 'last_login_at': 'Last Login At',
                 'purchase_amount': 'Purchase Amount',
             }
@@ -632,7 +632,7 @@ def debug_contact_custom_fields(contact_id, location_id):
             id_to_name = {v: k for k, v in field_mapping.items()}
             # Map our internal keys to display names
             display_names = {
-                'otp_code': 'Login OTP',
+                'login_otp': 'Login OTP',
                 'last_login_at': 'Last Login At',
                 'purchase_amount': 'Purchase Amount'
             }
@@ -655,7 +655,7 @@ def debug_contact_custom_fields(contact_id, location_id):
                     print(f"Field Value: {field_value}")
                     
                     # Show which field this corresponds to
-                    if field_id == field_mapping.get('otp_code'):
+                    if field_id == field_mapping.get('login_otp'):
                         print(f"🔐 This is the Login OTP field")
                     elif field_id == field_mapping.get('purchase_amount'):
                         print(f"💰 This is the Purchase Amount field")

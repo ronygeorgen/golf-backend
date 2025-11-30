@@ -75,7 +75,7 @@ def request_otp(request):
                         location_id=resolved_location,
                         tags=None,  # REMOVED: tags
                         custom_fields={
-                            'otp_code': otp,  # Store the OTP code in GHL
+                            'login_otp': otp,  # Store the OTP code in GHL
                         },
                     )
                     logger.info("Queued GHL sync task for user %s (OTP request)", user.id)
@@ -87,7 +87,7 @@ def request_otp(request):
                         location_id=resolved_location,
                         tags=None,  # REMOVED: tags
                         custom_fields={
-                            'otp_code': otp,
+                            'login_otp': otp,
                         },
                     )
                     logger.info("Successfully synced user %s to GHL location %s during OTP request", user.phone, resolved_location)
@@ -389,7 +389,7 @@ def signup(request):
                         location_id=resolved_location,
                         tags=None,
                         custom_fields={
-                            'otp_code': otp,  # Store the OTP code in GHL
+                            'login_otp': otp,  # Store the OTP code in GHL
                         },
                     )
                     logger.info("Queued GHL sync task for user %s (signup)", user.id)
@@ -401,7 +401,7 @@ def signup(request):
                         location_id=resolved_location,
                         tags=None,
                         custom_fields={
-                            'otp_code': otp,
+                            'login_otp': otp,
                         },
                     )
                     logger.info("Successfully synced user %s to GHL location %s during signup", user.phone, resolved_location)

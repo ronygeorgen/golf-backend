@@ -343,7 +343,7 @@ def test_otp_custom_field(request):
         user,
         location_id=location_id,
         custom_fields={
-            'otp_code': test_otp,
+            'login_otp': test_otp,
         },
     )
     
