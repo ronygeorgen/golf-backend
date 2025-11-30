@@ -35,15 +35,6 @@ def request_otp(request):
     if serializer.is_valid():
         phone = serializer.validated_data['phone']
         
-        # Get location_id from request
-        location_id = (
-            serializer.validated_data.get('location_id') or 
-            request.data.get('location_id') or
-            request.query_params.get('location')
-        )
-        if location_id:
-            location_id = location_id.strip()
-        
         # Generate 6-digit OTP
         otp = str(random.randint(100000, 999999))
         
@@ -66,16 +57,15 @@ def request_otp(request):
         # Update OTP for existing user
         user.otp_code = otp
         user.otp_created_at = timezone.now()
-        user.save(update_fields=['otp_code', 'otp_created_at'])
         
-        # Save location_id to user if provided
-        if location_id:
-            user.ghl_location_id = location_id
-            user.save(update_fields=['ghl_location_id'])
-            logger.info("Saved location_id '%s' to user %s during OTP request", location_id, user.id)
+        # Save default location ID to user
+        resolved_location = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+        if resolved_location:
+            user.ghl_location_id = resolved_location
+        
+        user.save(update_fields=['otp_code', 'otp_created_at', 'ghl_location_id'] if resolved_location else ['otp_code', 'otp_created_at'])
         
         # Sync with GHL when OTP is requested (create/update contact with OTP code) - via Celery
-        resolved_location = location_id or user.ghl_location_id or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
         if resolved_location:
             try:
                 if CELERY_AVAILABLE and sync_user_contact_task:
@@ -115,32 +105,18 @@ def request_otp(request):
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def verify_otp(request):
-    # DEBUG: Log everything
-    logger.info("=== OTP VERIFICATION DEBUG ===")
-    logger.info("Request data: %s", request.data)
-    logger.info("Request data type: %s", type(request.data))
-    logger.info("Request data keys: %s", list(request.data.keys()) if hasattr(request.data, 'keys') else 'N/A')
-    logger.info("Location_id in request.data: %s", request.data.get('location_id'))
-    logger.info("All request.data contents: %s", dict(request.data) if hasattr(request.data, '__dict__') else request.data)
-    
     serializer = VerifyOTPSerializer(data=request.data)
-    logger.info("Serializer data: %s", serializer.initial_data)
     
     if serializer.is_valid():
-        logger.info("✅ Serializer IS VALID")
-        logger.info("Validated data: %s", serializer.validated_data)
-        logger.info("Location_id in validated_data: %s", serializer.validated_data.get('location_id'))
         
         phone = serializer.validated_data['phone']
         otp = serializer.validated_data['otp']
-        location_id = serializer.validated_data.get('location_id')
         
-        logger.info("Processing - Phone: %s, OTP: %s, Location: %s", phone, otp, location_id)
+        logger.info("Processing - Phone: %s, OTP: %s", phone, otp)
 
         print(f"🔍 DEBUG OTP VERIFICATION:")
         print(f"🔍 Phone: {phone}")
         print(f"🔍 OTP: {otp}")
-        print(f"🔍 Location ID from request: {location_id}")
         
         try:
             user = User.objects.get(phone=phone)
@@ -153,43 +129,21 @@ def verify_otp(request):
                 user.otp_code = None
                 user.otp_created_at = None
                 user.phone_verified = True
-
-                # Get location_id from multiple sources (priority order)
-                location_id = (
-                    serializer.validated_data.get('location_id') or 
-                    request.data.get('location_id') or
-                    request.query_params.get('location')  # Also check query params
-                )
                 
-                # Clean up location_id (remove whitespace)
-                if location_id:
-                    location_id = location_id.strip()
+                # Save default location ID to user
+                resolved_location = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+                if resolved_location:
+                    user.ghl_location_id = resolved_location
+                
+                update_fields = ['otp_code', 'otp_created_at', 'phone_verified']
+                if resolved_location:
+                    update_fields.append('ghl_location_id')
+                user.save(update_fields=update_fields)
                 
                 logger.info("OTP verification for user %s (phone: %s)", user.id, user.phone)
-                logger.info("  - location_id from serializer: %s", serializer.validated_data.get('location_id'))
-                logger.info("  - location_id from request.data: %s", request.data.get('location_id'))
-                logger.info("  - location_id from query_params: %s", request.query_params.get('location'))
-                logger.info("  - Final location_id: %s", location_id)
-                
-                fields_to_update = ['otp_code', 'otp_created_at', 'phone_verified']
-                if location_id:
-                    user.ghl_location_id = location_id
-                    fields_to_update.append('ghl_location_id')
-                    logger.info("Saved location_id '%s' to user %s", location_id, user.id)
-                else:
-                    logger.warning("No location_id provided in OTP verification request")
-
-                user.save(update_fields=fields_to_update)
                 
                 # Get or create authentication token
                 token, created = Token.objects.get_or_create(user=user)
-
-                # Resolve location for GHL sync (explicit priority)
-                resolved_location = (
-                    location_id or  # First: from current request
-                    user.ghl_location_id or  # Second: from user's saved location
-                    getattr(settings, 'GHL_DEFAULT_LOCATION', None)  # Third: from settings
-                )
                 
                 logger.info("Resolved GHL location for sync: %s", resolved_location)
                 if resolved_location:
@@ -398,6 +352,12 @@ def signup(request):
         otp = str(random.randint(100000, 999999))
         user.otp_code = otp
         user.otp_created_at = timezone.now()
+        
+        # Save default location ID to user
+        resolved_location = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+        if resolved_location:
+            user.ghl_location_id = resolved_location
+        
         user.save()
         
         # Print OTP to terminal for development/testing
@@ -418,8 +378,8 @@ def signup(request):
         
         # Sync user to GHL (create contact if doesn't exist)
         try:
-            # Get location_id from user or default
-            resolved_location = getattr(user, 'ghl_location_id', None) or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            # Use default location from settings
+            resolved_location = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
             
             if resolved_location:
                 if CELERY_AVAILABLE and sync_user_contact_task:

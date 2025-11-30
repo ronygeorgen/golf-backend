@@ -268,7 +268,7 @@ def test_contact_custom_fields(request):
     GET /api/ghlpage/test-custom-fields/
     """
     user = request.user
-    location_id = user.ghl_location_id or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+    location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
     
     if not location_id:
         return Response({"error": "No location ID found"}, status=400)
@@ -290,9 +290,9 @@ def test_contact_custom_fields(request):
 def test_all_custom_fields(request):
     """
     Test endpoint to list all custom fields for a location
-    GET /api/ghlpage/test-all-fields/?location_id=xxx
+    GET /api/ghlpage/test-all-fields/
     """
-    location_id = request.GET.get('location_id') or request.user.ghl_location_id
+    location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
     
     if not location_id:
         return Response({"error": "location_id is required"}, status=400)

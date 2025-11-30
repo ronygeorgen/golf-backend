@@ -535,7 +535,7 @@ def sync_user_contact(user, *, location_id: Optional[str] = None,
         logger.warning("Cannot sync user to GHL: user or phone missing")
         return None, None
 
-    resolved_location = location_id or getattr(user, 'ghl_location_id', None) or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+    resolved_location = location_id or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
     if not resolved_location:
         logger.warning("No GHL location available for user %s", user.id)
         return None, None

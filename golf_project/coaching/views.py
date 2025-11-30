@@ -172,7 +172,6 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         package = serializer.validated_data.get('package')
         purchase_type = serializer.validated_data.get('purchase_type', 'normal')
-        location_id = self.request.data.get('location_id')
         
         if not package or not package.is_active:
             raise serializers.ValidationError("Selected package is not available.")
@@ -190,10 +189,6 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
             purchase = serializer.save(client=self.request.user)
         else:
             purchase = serializer.save(client=self.request.user)
-
-        if location_id and self.request.user.ghl_location_id != location_id:
-            self.request.user.ghl_location_id = location_id
-            self.request.user.save(update_fields=['ghl_location_id'])
 
         self._sync_purchase_with_ghl(purchase)
     
@@ -462,7 +457,7 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
         if not contact_owner:
             return
 
-        location_id = contact_owner.ghl_location_id or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+        location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
         if not location_id:
             return
 
