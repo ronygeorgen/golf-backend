@@ -6,3 +6,4 @@ class GhlConfig(AppConfig):
     name = 'ghl'
     verbose_name = 'GHL Integration'
 
+
