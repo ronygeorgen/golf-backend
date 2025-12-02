@@ -264,6 +264,8 @@ def convert_pending_recipients(user):
                         purchase_name=pending.package.title,
                         sessions_total=pending.package.session_count,
                         sessions_remaining=pending.package.session_count,
+                        simulator_hours_total=pending.package.simulator_hours or 0,
+                        simulator_hours_remaining=pending.package.simulator_hours or 0,
                         package_status='gifted',
                         gift_status='pending',
                         original_owner=pending.buyer,

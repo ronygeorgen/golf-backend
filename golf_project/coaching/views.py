@@ -1,5 +1,6 @@
 import logging
 from datetime import timedelta
+from decimal import Decimal
 
 from django.conf import settings
 from django.db.models import Q
@@ -273,6 +274,104 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
         
         serializer = self.get_serializer(purchases, many=True)
         return Response(serializer.data)
+    
+    @action(detail=True, methods=['get'])
+    def usage_details(self, request, pk=None):
+        """Get usage details for a package purchase - who used sessions and simulator hours"""
+        from bookings.models import Booking
+        
+        purchase = self.get_object()
+        
+        # Verify user has permission to view this purchase
+        if purchase.purchase_type != 'organization':
+            return Response(
+                {'error': 'This endpoint is only for organization purchases.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Only the purchaser can view usage details
+        if purchase.client != request.user and request.user.role not in ['admin', 'staff']:
+            return Response(
+                {'error': 'Permission denied'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        # Get all bookings that used this package purchase
+        bookings = Booking.objects.filter(
+            package_purchase=purchase
+        ).select_related('client', 'coach', 'simulator', 'coaching_package').order_by('-start_time')
+        
+        # Separate coaching and simulator bookings
+        coaching_bookings = bookings.filter(booking_type='coaching')
+        simulator_bookings = bookings.filter(booking_type='simulator')
+        
+        # Aggregate usage by user for coaching sessions
+        coaching_usage = {}
+        for booking in coaching_bookings:
+            user_id = booking.client.id
+            user_name = f"{booking.client.first_name} {booking.client.last_name}"
+            user_email = booking.client.email
+            
+            if user_id not in coaching_usage:
+                coaching_usage[user_id] = {
+                    'user_id': user_id,
+                    'user_name': user_name,
+                    'user_email': user_email,
+                    'sessions_used': 0,
+                    'bookings': []
+                }
+            
+            coaching_usage[user_id]['sessions_used'] += 1
+            coaching_usage[user_id]['bookings'].append({
+                'id': booking.id,
+                'date': booking.start_time.isoformat(),
+                'coach': f"{booking.coach.first_name} {booking.coach.last_name}" if booking.coach else None,
+                'status': booking.status
+            })
+        
+        # Aggregate usage by user for simulator hours
+        simulator_usage = {}
+        for booking in simulator_bookings:
+            user_id = booking.client.id
+            user_name = f"{booking.client.first_name} {booking.client.last_name}"
+            user_email = booking.client.email
+            hours_used = Decimal(str(booking.duration_minutes)) / Decimal('60')
+            
+            if user_id not in simulator_usage:
+                simulator_usage[user_id] = {
+                    'user_id': user_id,
+                    'user_name': user_name,
+                    'user_email': user_email,
+                    'hours_used': Decimal('0'),
+                    'bookings': []
+                }
+            
+            simulator_usage[user_id]['hours_used'] += hours_used
+            simulator_usage[user_id]['bookings'].append({
+                'id': booking.id,
+                'date': booking.start_time.isoformat(),
+                'duration_minutes': booking.duration_minutes,
+                'simulator': booking.simulator.name if booking.simulator else None,
+                'status': booking.status
+            })
+        
+        # Convert Decimal to string for JSON serialization
+        for user_id in simulator_usage:
+            simulator_usage[user_id]['hours_used'] = float(simulator_usage[user_id]['hours_used'])
+        
+        return Response({
+            'purchase_id': purchase.id,
+            'purchase_name': purchase.purchase_name,
+            'package_title': purchase.package.title,
+            'sessions_total': purchase.sessions_total,
+            'sessions_remaining': purchase.sessions_remaining,
+            'sessions_used': purchase.sessions_total - purchase.sessions_remaining,
+            'simulator_hours_total': float(purchase.simulator_hours_total),
+            'simulator_hours_remaining': float(purchase.simulator_hours_remaining),
+            'simulator_hours_used': float(purchase.simulator_hours_total - purchase.simulator_hours_remaining),
+            'coaching_usage': list(coaching_usage.values()),
+            'simulator_usage': list(simulator_usage.values()),
+        })
     
     @action(detail=True, methods=['post'])
     def add_member(self, request, pk=None):
@@ -840,6 +939,7 @@ class PackagePurchaseWebhookView(APIView):
         if purchase_type == 'normal':
             # Create the purchase (always create new purchase)
             try:
+                simulator_hours = Decimal(str(package.simulator_hours)) if package.simulator_hours else Decimal('0')
                 purchase = CoachingPackagePurchase.objects.create(
                     client=buyer,
                     package=package,
@@ -847,6 +947,8 @@ class PackagePurchaseWebhookView(APIView):
                     purchase_name=package.title,
                     sessions_total=package.session_count,
                     sessions_remaining=package.session_count,
+                    simulator_hours_total=simulator_hours,
+                    simulator_hours_remaining=simulator_hours,
                     package_status='active',
                     gift_status=None
                 )
@@ -894,6 +996,7 @@ class PackagePurchaseWebhookView(APIView):
                     )
                 
                 # Create gift purchase (always create new purchase)
+                simulator_hours = Decimal(str(package.simulator_hours)) if package.simulator_hours else Decimal('0')
                 purchase = CoachingPackagePurchase.objects.create(
                     client=recipient,
                     package=package,
@@ -901,6 +1004,8 @@ class PackagePurchaseWebhookView(APIView):
                     purchase_name=package.title,
                     sessions_total=package.session_count,
                     sessions_remaining=package.session_count,
+                    simulator_hours_total=simulator_hours,
+                    simulator_hours_remaining=simulator_hours,
                     package_status='gifted',
                     gift_status='pending',
                     original_owner=buyer,
@@ -970,6 +1075,7 @@ class PackagePurchaseWebhookView(APIView):
             try:
                 from coaching.models import OrganizationPackageMember
                 
+                simulator_hours = Decimal(str(package.simulator_hours)) if package.simulator_hours else Decimal('0')
                 purchase = CoachingPackagePurchase.objects.create(
                     client=buyer,
                     package=package,
@@ -977,6 +1083,8 @@ class PackagePurchaseWebhookView(APIView):
                     purchase_name=package.title,
                     sessions_total=package.session_count,
                     sessions_remaining=package.session_count,
+                    simulator_hours_total=simulator_hours,
+                    simulator_hours_remaining=simulator_hours,
                     package_status='active',
                     gift_status=None
                 )

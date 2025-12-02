@@ -67,6 +67,18 @@ class SimulatorCredit(models.Model):
     )
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.AVAILABLE)
     reason = models.CharField(max_length=20, choices=Reason.choices, default=Reason.CANCELLATION)
+    hours = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        default=0,
+        help_text="Total hours in this credit"
+    )
+    hours_remaining = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        default=0,
+        help_text="Remaining hours available in this credit"
+    )
     issued_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -92,6 +104,33 @@ class SimulatorCredit(models.Model):
         if booking:
             booking.simulator_credit_redemption = self
             booking.save(update_fields=['simulator_credit_redemption'])
+    
+    def consume_hours(self, hours_to_consume):
+        """
+        Consume hours from this credit.
+        
+        Args:
+            hours_to_consume: Decimal or float representing hours to consume
+            
+        Returns:
+            bool: True if credit is fully consumed and should be marked as redeemed
+        """
+        from decimal import Decimal
+        hours_to_consume = Decimal(str(hours_to_consume))
+        if hours_to_consume <= 0:
+            raise ValueError("hours_to_consume must be greater than 0")
+        if self.hours_remaining < hours_to_consume:
+            raise ValueError("Not enough hours remaining in this credit")
+        
+        self.hours_remaining -= hours_to_consume
+        if self.hours_remaining <= 0:
+            self.status = SimulatorCredit.Status.REDEEMED
+            self.redeemed_at = timezone.now()
+            self.save(update_fields=['hours_remaining', 'status', 'redeemed_at'])
+            return True
+        else:
+            self.save(update_fields=['hours_remaining'])
+            return False
 
     def __str__(self):
-        return f"{self.client} - {self.get_status_display()} ({self.reason})"
+        return f"{self.client} - {self.get_status_display()} ({self.reason}) - {self.hours_remaining}/{self.hours} hrs"

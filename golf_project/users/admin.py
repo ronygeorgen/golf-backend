@@ -1,6 +1,6 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
-from .models import User, StaffAvailability
+from .models import User, StaffAvailability, StaffDayAvailability
 
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):
@@ -23,3 +23,9 @@ class UserAdmin(BaseUserAdmin):
 class StaffAvailabilityAdmin(admin.ModelAdmin):
     list_display = ('staff', 'day_of_week', 'start_time', 'end_time')
     list_filter = ('day_of_week', 'staff')
+
+@admin.register(StaffDayAvailability)
+class StaffDayAvailabilityAdmin(admin.ModelAdmin):
+    list_display = ('staff', 'date', 'start_time', 'end_time')
+    list_filter = ('date', 'staff')
+    date_hierarchy = 'date'

@@ -7,10 +7,10 @@ from rest_framework.pagination import PageNumberPagination
 from django.db.models import Count, Sum, Q, F
 from django.utils import timezone
 from datetime import datetime, timedelta
-from users.models import User, StaffAvailability
+from users.models import User, StaffAvailability, StaffDayAvailability
 from simulators.models import Simulator, SimulatorCredit
 from bookings.models import Booking
-from users.serializers import UserSerializer, StaffSerializer, StaffAvailabilitySerializer
+from users.serializers import UserSerializer, StaffSerializer, StaffAvailabilitySerializer, StaffDayAvailabilitySerializer
 from bookings.serializers import BookingSerializer
 from .serializers import CoachingSessionAdjustmentSerializer, SimulatorCreditGrantSerializer
 from simulators.serializers import SimulatorCreditSerializer
@@ -149,6 +149,104 @@ class StaffViewSet(viewsets.ModelViewSet):
             # Return updated availability list
             serializer = StaffAvailabilitySerializer(updated_availability, many=True)
             return Response(serializer.data)
+    
+    @action(detail=True, methods=['get', 'put'], url_path='day-availability')
+    def day_availability(self, request, pk=None):
+        """
+        Handle day-specific (non-recurring) availability for staff.
+        GET: Returns all day-specific availability entries
+        PUT: Updates day-specific availability (replaces all entries with provided list)
+        """
+        staff = self.get_object()
+        
+        if request.method == 'GET':
+            # Get all day-specific availability, ordered by date
+            day_availability = StaffDayAvailability.objects.filter(staff=staff).order_by('date', 'start_time')
+            serializer = StaffDayAvailabilitySerializer(day_availability, many=True)
+            return Response(serializer.data)
+        
+        elif request.method == 'PUT':
+            # Update day-specific availability data
+            availability_data = request.data
+            
+            # Ensure availability_data is a list
+            if not isinstance(availability_data, list):
+                return Response(
+                    {'error': 'Availability data must be a list'}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Get all existing day-specific availability entries for this staff
+            existing_entries = StaffDayAvailability.objects.filter(staff=staff)
+            
+            # Get IDs of entries to keep (from the request)
+            entries_to_keep = set()
+            for avail_data in availability_data:
+                date = avail_data.get('date')
+                start_time_str = avail_data.get('start_time')
+                if date and start_time_str:
+                    # Normalize time format (remove seconds if present)
+                    if ':' in start_time_str and start_time_str.count(':') > 1:
+                        start_time_str = start_time_str[:5]
+                    entries_to_keep.add((str(date), start_time_str))
+            
+            # Delete entries not in the keep list
+            to_delete_ids = []
+            for entry in existing_entries:
+                entry_key = (str(entry.date), str(entry.start_time)[:5])
+                if entry_key not in entries_to_keep:
+                    to_delete_ids.append(entry.id)
+            
+            if to_delete_ids:
+                deleted_count = StaffDayAvailability.objects.filter(id__in=to_delete_ids).delete()
+                print(f"Deleted {deleted_count[0]} day-specific availability entries for staff {staff.id}")
+            
+            # Update or create each day-specific availability entry
+            updated_availability = []
+            for avail_data in availability_data:
+                date = avail_data.get('date')
+                if date:
+                    try:
+                        # Use serializer to handle timezone conversion
+                        serializer_data = {**avail_data, 'staff': staff.id, 'date': date}
+                        serializer = StaffDayAvailabilitySerializer(data=serializer_data)
+                        if serializer.is_valid():
+                            availability, created = StaffDayAvailability.objects.update_or_create(
+                                staff=staff,
+                                date=date,
+                                start_time=serializer.validated_data.get('start_time'),
+                                defaults={
+                                    'end_time': serializer.validated_data.get('end_time'),
+                                }
+                            )
+                            updated_availability.append(availability)
+                        else:
+                            # Fallback to direct assignment if serializer fails
+                            print(f"Serializer validation failed: {serializer.errors}")
+                            try:
+                                from datetime import date as date_obj
+                                date_obj_parsed = date_obj.fromisoformat(date) if isinstance(date, str) else date
+                                start_time_obj = datetime.strptime(avail_data.get('start_time', '09:00'), '%H:%M').time()
+                                end_time_obj = datetime.strptime(avail_data.get('end_time', '17:00'), '%H:%M').time()
+                                availability, created = StaffDayAvailability.objects.update_or_create(
+                                    staff=staff,
+                                    date=date_obj_parsed,
+                                    start_time=start_time_obj,
+                                    defaults={
+                                        'end_time': end_time_obj,
+                                    }
+                                )
+                                updated_availability.append(availability)
+                            except (ValueError, TypeError) as e:
+                                print(f"Error creating day availability: {e}")
+                                pass
+                    except (ValueError, TypeError) as e:
+                        print(f"Error processing day availability: {e}")
+                        pass
+            
+            # Return updated availability list
+            serializer = StaffDayAvailabilitySerializer(updated_availability, many=True)
+            return Response(serializer.data)
 
 
 class AdminOverrideViewSet(viewsets.ViewSet):
@@ -161,26 +259,68 @@ class AdminOverrideViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['post'], url_path='coaching-sessions')
     def coaching_sessions(self, request):
         self._ensure_admin(request)
+        from decimal import Decimal
+        from simulators.models import SimulatorCredit
+        
         serializer = CoachingSessionAdjustmentSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         purchase = serializer.validated_data['purchase']
         session_count = serializer.validated_data['session_count']
+        simulator_hours = serializer.validated_data.get('simulator_hours', Decimal('0'))
         note = serializer.validated_data.get('note')
         
+        # Add sessions back
         purchase.sessions_remaining = F('sessions_remaining') + session_count
         purchase.save(update_fields=['sessions_remaining', 'updated_at'])
+        
+        # Handle simulator hours
+        credit_created = None
+        if simulator_hours and simulator_hours > 0:
+            # Check if the package has simulator hours (combo package)
+            if purchase.package.simulator_hours and purchase.package.simulator_hours > 0:
+                # Add hours back to the same package
+                purchase.simulator_hours_remaining = F('simulator_hours_remaining') + simulator_hours
+                purchase.save(update_fields=['simulator_hours_remaining', 'updated_at'])
+            else:
+                # Package doesn't have simulator hours, create a credit instead
+                credit_created = SimulatorCredit.objects.create(
+                    client=purchase.client,
+                    issued_by=request.user,
+                    reason=SimulatorCredit.Reason.MANUAL,
+                    hours=simulator_hours,
+                    hours_remaining=simulator_hours,
+                    notes=note[:255] if note else f"Simulator hours added via coaching session restore on {timezone.now().date()}"
+                )
+        
         if note:
             updated_note = f"{purchase.notes}\n{note}".strip() if purchase.notes else note
             purchase.notes = updated_note[:255]
             purchase.save(update_fields=['notes'])
-        purchase.refresh_from_db(fields=['sessions_remaining', 'notes', 'updated_at'])
         
-        return Response({
-            'message': f'{session_count} session(s) added back to the package.',
+        purchase.refresh_from_db(fields=['sessions_remaining', 'simulator_hours_remaining', 'notes', 'updated_at'])
+        
+        message = f'{session_count} session(s) added back to the package.'
+        if simulator_hours and simulator_hours > 0:
+            if purchase.package.simulator_hours and purchase.package.simulator_hours > 0:
+                message += f' {simulator_hours} simulator hour(s) added back to the package.'
+            else:
+                message += f' {simulator_hours} simulator hour(s) added as credit.'
+        
+        response_data = {
+            'message': message,
             'purchase_id': purchase.id,
             'sessions_remaining': purchase.sessions_remaining,
             'notes': purchase.notes
-        })
+        }
+        
+        if simulator_hours and simulator_hours > 0:
+            if purchase.package.simulator_hours and purchase.package.simulator_hours > 0:
+                response_data['simulator_hours_remaining'] = float(purchase.simulator_hours_remaining)
+            else:
+                from simulators.serializers import SimulatorCreditSerializer
+                response_data['simulator_credit'] = SimulatorCreditSerializer(credit_created).data
+        
+        return Response(response_data)
     
     @action(detail=False, methods=['post'], url_path='simulator-credits')
     def simulator_credits(self, request):
@@ -188,25 +328,27 @@ class AdminOverrideViewSet(viewsets.ViewSet):
         serializer = SimulatorCreditGrantSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         
+        from decimal import Decimal
+        
         client = serializer.validated_data['client']
-        token_count = serializer.validated_data['token_count']
+        hours = Decimal(str(serializer.validated_data['hours']))
         reason = serializer.validated_data['reason']
         note = serializer.validated_data.get('note') or ''
         
-        credits = []
-        for _ in range(token_count):
-            credit = SimulatorCredit.objects.create(
-                client=client,
-                issued_by=request.user,
-                reason=reason,
-                notes=note[:255] if note else f"Manual credit issued on {timezone.now().date()}"
-            )
-            credits.append(credit)
+        # Create a single credit with the specified hours
+        credit = SimulatorCredit.objects.create(
+            client=client,
+            issued_by=request.user,
+            reason=reason,
+            hours=hours,
+            hours_remaining=hours,
+            notes=note[:255] if note else f"Manual credit issued on {timezone.now().date()} ({hours} hours)"
+        )
         
-        credit_data = SimulatorCreditSerializer(credits, many=True).data
+        credit_data = SimulatorCreditSerializer(credit).data
         return Response({
-            'message': f'{token_count} simulator credit(s) granted.',
-            'credits': credit_data
+            'message': f'{hours} simulator credit hour(s) granted.',
+            'credit': credit_data
         }, status=status.HTTP_201_CREATED)
 
 

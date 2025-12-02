@@ -91,6 +91,12 @@ class BookingCreateSerializer(serializers.ModelSerializer):
             data['use_simulator_credit'] = False
         
         return data
+    
+    def create(self, validated_data):
+        # Remove write-only fields that are not part of the Booking model
+        validated_data.pop('use_simulator_credit', None)
+        validated_data.pop('use_organization_package', None)
+        return super().create(validated_data)
 
 class BookingSerializer(serializers.ModelSerializer):
     client_details = UserSerializer(source='client', read_only=True)

@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from decimal import Decimal
 from coaching.models import CoachingPackagePurchase
 from simulators.models import SimulatorCredit
 from users.models import User
@@ -29,6 +30,7 @@ class CoachingSessionAdjustmentSerializer(serializers.Serializer, ClientLookupMi
     package_purchase_id = serializers.IntegerField(required=False)
     package_id = serializers.IntegerField(required=False)
     session_count = serializers.IntegerField(min_value=1, default=1)
+    simulator_hours = serializers.DecimalField(max_digits=6, decimal_places=2, min_value=Decimal('0'), required=False, default=Decimal('0'))
     note = serializers.CharField(required=False, allow_blank=True)
     
     def validate(self, attrs):
@@ -63,11 +65,18 @@ class CoachingSessionAdjustmentSerializer(serializers.Serializer, ClientLookupMi
 class SimulatorCreditGrantSerializer(serializers.Serializer, ClientLookupMixin):
     client_id = serializers.IntegerField(required=False)
     client_identifier = serializers.CharField(required=False, allow_blank=True)
-    token_count = serializers.IntegerField(min_value=1, default=1)
+    hours = serializers.DecimalField(max_digits=6, decimal_places=2, min_value=Decimal('0.01'), required=False)
+    token_count = serializers.IntegerField(min_value=1, required=False)  # Deprecated, kept for backward compatibility
     reason = serializers.ChoiceField(choices=SimulatorCredit.Reason.choices, default=SimulatorCredit.Reason.MANUAL)
     note = serializers.CharField(required=False, allow_blank=True)
     
     def validate(self, attrs):
         attrs = self._resolve_client(attrs)
+        # If hours not provided, use token_count (backward compatibility) or default to 1 hour
+        if 'hours' not in attrs or attrs['hours'] is None:
+            if 'token_count' in attrs and attrs['token_count'] is not None:
+                attrs['hours'] = float(attrs['token_count'])  # Convert count to hours for backward compatibility
+            else:
+                attrs['hours'] = 1.0  # Default to 1 hour
         return attrs
 

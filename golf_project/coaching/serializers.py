@@ -87,6 +87,8 @@ class CoachingPackagePurchaseSerializer(serializers.ModelSerializer):
             'purchase_name',
             'sessions_total',
             'sessions_remaining',
+            'simulator_hours_total',
+            'simulator_hours_remaining',
             'notes',
             'purchase_type',
             'recipient_phone',
@@ -103,7 +105,7 @@ class CoachingPackagePurchaseSerializer(serializers.ModelSerializer):
             'member_phones',
         ]
         read_only_fields = [
-            'client', 'sessions_remaining', 'purchased_at', 'updated_at',
+            'client', 'sessions_remaining', 'simulator_hours_remaining', 'purchased_at', 'updated_at',
             'gift_token', 'original_owner', 'package_status'
         ]
     
@@ -201,6 +203,17 @@ class CoachingPackagePurchaseSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("sessions_total must be at least 1.")
         
         attrs['sessions_remaining'] = attrs['sessions_total']
+        
+        # Set simulator hours from package
+        simulator_hours_total = attrs.get('simulator_hours_total')
+        if simulator_hours_total is None or (request and getattr(request.user, 'role', None) == 'client'):
+            attrs['simulator_hours_total'] = package.simulator_hours or 0
+            simulator_hours_total = attrs['simulator_hours_total']
+        
+        if simulator_hours_total < 0:
+            raise serializers.ValidationError("simulator_hours_total cannot be negative.")
+        
+        attrs['simulator_hours_remaining'] = simulator_hours_total
         
         # Set gift-related fields
         if purchase_type == 'gift':

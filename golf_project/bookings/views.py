@@ -182,10 +182,64 @@ class BookingViewSet(viewsets.ModelViewSet):
         purchase.consume_session(1)
         return purchase
     
+    def _consume_package_simulator_hours(self, duration_minutes, use_organization=False):
+        """
+        Consume simulator hours from a package purchase.
+        Checks for any active package purchase with remaining simulator hours.
+        
+        Args:
+            duration_minutes: Duration of the booking in minutes
+            use_organization: If True, also check organization packages where user is a member
+            
+        Returns:
+            CoachingPackagePurchase if hours were consumed, None otherwise
+        """
+        from decimal import Decimal
+        from coaching.models import OrganizationPackageMember
+        hours_needed = Decimal(str(duration_minutes)) / Decimal('60')
+        
+        # Base query for personal purchases and accepted gifts
+        base_qs = CoachingPackagePurchase.objects.select_for_update().filter(
+            simulator_hours_remaining__gt=0,
+            package_status='active'
+        ).exclude(
+            gift_status='pending'
+        )
+        
+        if use_organization:
+            # Include organization packages where user is a member
+            org_purchase_ids = OrganizationPackageMember.objects.filter(
+                Q(phone=self.request.user.phone) | Q(user=self.request.user)
+            ).values_list('package_purchase_id', flat=True)
+            
+            purchase = base_qs.filter(
+                Q(client=self.request.user) | 
+                Q(id__in=org_purchase_ids, purchase_type='organization')
+            ).order_by('purchased_at').first()
+        else:
+            # Exclude organization packages
+            purchase = base_qs.filter(
+                client=self.request.user
+            ).exclude(
+                purchase_type='organization'
+            ).order_by('purchased_at').first()
+        
+        if not purchase:
+            return None
+        
+        # Check if purchase has enough hours
+        if purchase.simulator_hours_remaining < hours_needed:
+            return None
+        
+        # Consume the hours
+        purchase.consume_simulator_hours(hours_needed)
+        return purchase
+    
     def perform_create(self, serializer):
         booking_data = serializer.validated_data
         booking_type = booking_data.get('booking_type')
         use_simulator_credit = booking_data.pop('use_simulator_credit', False)
+        use_organization_package = booking_data.pop('use_organization_package', False)
         redeemed_credit = None
         
         with transaction.atomic():
@@ -198,23 +252,47 @@ class BookingViewSet(viewsets.ModelViewSet):
                     if not assigned_simulator:
                         raise serializers.ValidationError("No simulators available for this time slot")
                     
+                    # Priority: 1. Simulator credit hours, 2. Package hours, 3. Charge price
+                    from decimal import Decimal
+                    duration_minutes = booking_data.get('duration_minutes', 0)
+                    hours_needed = Decimal(str(duration_minutes)) / Decimal('60')
+                    
+                    package_purchase = None
+                    redeemed_credit = None
+                    
                     if use_simulator_credit:
-                        redeemed_credit = self._reserve_simulator_credit()
+                        # User explicitly wants to use credit
+                        redeemed_credit = self._reserve_simulator_credit(hours_needed)
+                    else:
+                        # Try credit hours first, then package hours, then charge
+                        try:
+                            redeemed_credit = self._reserve_simulator_credit(hours_needed)
+                        except serializers.ValidationError:
+                            # No credits available, try package hours
+                            # For simulator bookings, automatically check organization packages if user is a member
+                            package_purchase = self._consume_package_simulator_hours(duration_minutes, use_organization=True)
+                            if not package_purchase:
+                                # No package hours available, will charge normal price
+                                package_purchase = None
                     
                     booking = serializer.save(
                         client=self.request.user,
                         simulator=assigned_simulator,
-                        total_price=Decimal('0.00')
+                        total_price=Decimal('0.00'),
+                        package_purchase=package_purchase
                     )
                     
                     if redeemed_credit:
-                        redeemed_credit.status = SimulatorCredit.Status.REDEEMED
-                        redeemed_credit.redeemed_at = timezone.now()
-                        redeemed_credit.save(update_fields=['status', 'redeemed_at'])
+                        # Credit hours were used (already consumed in _reserve_simulator_credit)
                         booking.simulator_credit_redemption = redeemed_credit
                         booking.total_price = 0
                         booking.save(update_fields=['simulator_credit_redemption', 'total_price', 'updated_at'])
+                    elif package_purchase:
+                        # Hours were consumed from package, no charge
+                        booking.total_price = 0
+                        booking.save(update_fields=['total_price', 'package_purchase', 'updated_at'])
                     else:
+                        # Charge the normal price
                         booking.total_price = self._calculate_simulator_price(
                             assigned_simulator,
                             booking.duration_minutes
@@ -226,8 +304,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                 if not package:
                     raise serializers.ValidationError("A coaching package is required for coaching bookings.")
                 
-                use_organization = booking_data.pop('use_organization_package', False)
-                purchase = self._consume_package_session(package, use_organization=use_organization)
+                purchase = self._consume_package_session(package, use_organization=use_organization_package)
                 serializer.save(
                     client=self.request.user,
                     package_purchase=purchase,
@@ -275,6 +352,46 @@ class BookingViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(today_bookings, many=True)
         return Response(serializer.data)
     
+    @action(detail=False, methods=['get'])
+    def coaching_sessions_by_coach(self, request):
+        """Get coaching sessions where a specific coach is assigned"""
+        coach_id = request.query_params.get('coach_id')
+        
+        # If coach_id is provided, use it; otherwise use the current user (for staff viewing their own sessions)
+        if coach_id:
+            # Admin can view any coach's sessions
+            if request.user.role not in ['admin', 'staff']:
+                return Response(
+                    {'error': 'Permission denied'}, 
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            target_coach_id = coach_id
+        else:
+            # Staff viewing their own sessions
+            if request.user.role not in ['admin', 'staff']:
+                return Response(
+                    {'error': 'Permission denied'}, 
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            target_coach_id = request.user.id
+        
+        # Get upcoming coaching sessions where this coach is assigned
+        upcoming_sessions = Booking.objects.filter(
+            booking_type='coaching',
+            coach_id=target_coach_id,
+            start_time__gte=timezone.now()
+        ).exclude(status='cancelled').order_by('start_time')
+        
+        # Use 5 per page pagination
+        paginator = FivePerPagePagination()
+        page = paginator.paginate_queryset(upcoming_sessions, request)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return paginator.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(upcoming_sessions, many=True)
+        return Response(serializer.data)
+    
     def _is_admin(self, user):
         return getattr(user, 'role', None) == 'admin' or getattr(user, 'is_superuser', False)
     
@@ -286,13 +403,45 @@ class BookingViewSet(viewsets.ModelViewSet):
             return True
         return booking.client_id == user.id
     
-    def _reserve_simulator_credit(self):
-        credit = SimulatorCredit.objects.select_for_update().filter(
+    def _reserve_simulator_credit(self, hours_needed):
+        """
+        Reserve and consume hours from available simulator credits.
+        
+        Args:
+            hours_needed: Decimal or float representing hours needed
+            
+        Returns:
+            SimulatorCredit: The credit that was used (may be partially consumed)
+        """
+        from decimal import Decimal
+        hours_needed = Decimal(str(hours_needed))
+        
+        # Find credits with available hours, ordered by oldest first
+        credits = SimulatorCredit.objects.select_for_update().filter(
             status=SimulatorCredit.Status.AVAILABLE,
-            client=self.request.user
-        ).order_by('issued_at').first()
-        if not credit:
-            raise serializers.ValidationError("No simulator credits available to redeem.")
+            client=self.request.user,
+            hours_remaining__gt=0
+        ).order_by('issued_at')
+        
+        if not credits.exists():
+            raise serializers.ValidationError("No simulator credit hours available to redeem.")
+        
+        # Try to find a credit with enough hours
+        for credit in credits:
+            if credit.hours_remaining >= hours_needed:
+                # This credit has enough hours
+                credit.consume_hours(hours_needed)
+                return credit
+        
+        # No single credit has enough, use the first one (will be partially consumed)
+        # In the future, we could implement logic to combine multiple credits
+        credit = credits.first()
+        if credit.hours_remaining < hours_needed:
+            raise serializers.ValidationError(
+                f"Insufficient credit hours. Available: {credit.hours_remaining}, Needed: {hours_needed}"
+            )
+        
+        credit.consume_hours(hours_needed)
         return credit
 
     def _calculate_simulator_price(self, simulator, duration_minutes):
@@ -321,12 +470,28 @@ class BookingViewSet(viewsets.ModelViewSet):
         return purchase.sessions_remaining
     
     def _issue_simulator_credit(self, booking, issued_by=None, reason=SimulatorCredit.Reason.CANCELLATION):
+        """
+        Issue a simulator credit with hours equal to the cancelled booking duration.
+        
+        Args:
+            booking: The cancelled booking
+            issued_by: User who issued the credit (for admin overrides)
+            reason: Reason for issuing the credit
+            
+        Returns:
+            SimulatorCredit: The created credit
+        """
+        from decimal import Decimal
+        hours = Decimal(str(booking.duration_minutes)) / Decimal('60')
+        
         credit = SimulatorCredit.objects.create(
             client=booking.client,
             reason=reason,
+            hours=hours,
+            hours_remaining=hours,
             issued_by=issued_by if issued_by and self._is_admin(issued_by) else None,
             source_booking=booking,
-            notes=f"Credit issued for booking #{booking.id}"
+            notes=f"Credit issued for booking #{booking.id} ({hours} hours)"
         )
         return credit
     
@@ -427,11 +592,33 @@ class BookingViewSet(viewsets.ModelViewSet):
                 remaining = self._restore_coaching_session(booking)
                 restitution['sessions_remaining'] = remaining
             elif booking.booking_type == 'simulator':
-                credit = self._issue_simulator_credit(
-                    booking,
-                    issued_by=request.user if force_override and self._is_admin(request.user) else None
-                )
-                restitution['simulator_credit_id'] = credit.id
+                from decimal import Decimal
+                hours_to_restore = Decimal(str(booking.duration_minutes)) / Decimal('60')
+                
+                # Case 1: Booking used combo package hours -> restore to same package
+                if booking.package_purchase and not booking.simulator_credit_redemption:
+                    purchase = booking.package_purchase
+                    purchase.simulator_hours_remaining = F('simulator_hours_remaining') + hours_to_restore
+                    purchase.save(update_fields=['simulator_hours_remaining', 'updated_at'])
+                    purchase.refresh_from_db(fields=['simulator_hours_remaining'])
+                    restitution['simulator_hours_restored'] = float(purchase.simulator_hours_remaining)
+                # Case 2: Booking used credit hours -> restore to credit
+                elif booking.simulator_credit_redemption:
+                    credit = booking.simulator_credit_redemption
+                    credit.hours_remaining = F('hours_remaining') + hours_to_restore
+                    credit.status = SimulatorCredit.Status.AVAILABLE
+                    credit.redeemed_at = None
+                    credit.save(update_fields=['hours_remaining', 'status', 'redeemed_at', 'updated_at'])
+                    credit.refresh_from_db(fields=['hours_remaining', 'status'])
+                    restitution['simulator_credit_hours_restored'] = float(credit.hours_remaining)
+                # Case 3: Booking was paid (no package, no credit) -> issue credit with exact hours
+                else:
+                    credit = self._issue_simulator_credit(
+                        booking,
+                        issued_by=request.user if force_override and self._is_admin(request.user) else None
+                    )
+                    restitution['simulator_credit_id'] = credit.id
+                    restitution['simulator_credit_hours'] = float(credit.hours)
         
         serializer = self.get_serializer(booking)
         return Response({
@@ -565,6 +752,9 @@ class BookingViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
+        # Get coach_id filter if provided
+        coach_id = request.query_params.get('coach_id')
+        
         # For clients, only show their bookings
         if request.user.role == 'client':
             bookings = Booking.objects.filter(
@@ -587,6 +777,15 @@ class BookingViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
             bookings = bookings.filter(booking_type=booking_type)
+        
+        # Filter by coach_id if provided (for viewing specific coach's sessions)
+        if coach_id:
+            if request.user.role == 'client':
+                return Response(
+                    {'error': 'Permission denied'}, 
+                    status=status.HTTP_403_FORBIDDEN
+                )
+            bookings = bookings.filter(coach_id=coach_id)
         
         serializer = self.get_serializer(bookings, many=True)
         return Response(serializer.data)
@@ -796,7 +995,7 @@ class BookingViewSet(viewsets.ModelViewSet):
             )
         
         from coaching.models import CoachingPackage
-        from users.models import StaffAvailability
+        from users.models import StaffAvailability, StaffDayAvailability
         
         # Get coaching bay (bay 6)
         coaching_bay = Simulator.objects.filter(is_coaching_bay=True, is_active=True).first()
@@ -853,15 +1052,47 @@ class BookingViewSet(viewsets.ModelViewSet):
         slot_interval = 30  # 30-minute intervals for slot generation
         available_slots_map = {}
         
-        # Get staff availability entries for the requested day, scoped to selected coaches
+        # Get weekly recurring staff availability entries for the requested day, scoped to selected coaches
         staff_availabilities = StaffAvailability.objects.filter(
             day_of_week=day_of_week,
             staff__in=coaches
         ).select_related('staff')
         
+        # Get day-specific availability entries for the requested date, scoped to selected coaches
+        day_specific_availabilities = StaffDayAvailability.objects.filter(
+            date=booking_date,
+            staff__in=coaches
+        ).select_related('staff')
+        
         availability_by_staff = {}
+        
+        # First, get staff IDs that have day-specific availability for this date
+        # Day-specific availability takes precedence over weekly recurring
+        staff_with_day_specific = set(day_specific_availabilities.values_list('staff_id', flat=True))
+        
+        # Process day-specific availability first (takes precedence)
+        for day_avail in day_specific_availabilities:
+            staff_id = day_avail.staff_id
+            if staff_id not in availability_by_staff:
+                availability_by_staff[staff_id] = []
+            availability_by_staff[staff_id].append({
+                'type': 'day_specific',
+                'start_time': day_avail.start_time,
+                'end_time': day_avail.end_time,
+                'staff': day_avail.staff
+            })
+        
+        # Process weekly recurring availability only for staff without day-specific availability
         for availability in staff_availabilities:
-            availability_by_staff.setdefault(availability.staff_id, []).append(availability)
+            staff_id = availability.staff_id
+            # Only add weekly availability if this staff doesn't have day-specific availability
+            if staff_id not in staff_with_day_specific:
+                availability_by_staff.setdefault(staff_id, []).append({
+                    'type': 'weekly',
+                    'start_time': availability.start_time,
+                    'end_time': availability.end_time,
+                    'staff': availability.staff
+                })
         
         for coach in coaches:
             coach_availabilities = availability_by_staff.get(coach.id, [])
@@ -870,12 +1101,13 @@ class BookingViewSet(viewsets.ModelViewSet):
             
             coach_name = f"{coach.first_name} {coach.last_name}".strip() or coach.username
             
-            for staff_avail in coach_availabilities:
-                avail_start = datetime.combine(booking_date, staff_avail.start_time)
-                avail_end = datetime.combine(booking_date, staff_avail.end_time)
+            # Process all availability entries (both weekly and day-specific)
+            for avail_entry in coach_availabilities:
+                avail_start = datetime.combine(booking_date, avail_entry['start_time'])
+                avail_end = datetime.combine(booking_date, avail_entry['end_time'])
                 
                 if avail_end <= avail_start:
-                    if staff_avail.end_time < staff_avail.start_time:
+                    if avail_entry['end_time'] < avail_entry['start_time']:
                         avail_end = avail_end + timedelta(days=1)
                     else:
                         continue

@@ -39,3 +39,22 @@ class StaffAvailability(models.Model):
     
     class Meta:
         unique_together = ['staff', 'day_of_week', 'start_time']  # One availability entry per staff per day per start_time
+
+
+class StaffDayAvailability(models.Model):
+    """
+    Day-specific availability for staff members (non-recurring).
+    For example: Available on December 5, 2025 from 9 AM to 5 PM.
+    """
+    staff = models.ForeignKey(User, on_delete=models.CASCADE, limit_choices_to={'role': 'staff'}, related_name='day_availabilities')
+    date = models.DateField()  # Specific date (e.g., 2025-12-05)
+    start_time = models.TimeField()
+    end_time = models.TimeField()
+    
+    class Meta:
+        unique_together = ['staff', 'date', 'start_time']  # One availability entry per staff per date per start_time
+        verbose_name_plural = 'Staff Day Availabilities'
+        ordering = ['date', 'start_time']
+    
+    def __str__(self):
+        return f"{self.staff.username} - {self.date} ({self.start_time} - {self.end_time})"

@@ -88,6 +88,8 @@ class SimulatorCreditSerializer(serializers.ModelSerializer):
             'client_details',
             'status',
             'reason',
+            'hours',
+            'hours_remaining',
             'issued_by',
             'issued_at',
             'redeemed_at',
