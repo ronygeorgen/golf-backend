@@ -24,13 +24,19 @@ except ImportError:
     CELERY_AVAILABLE = False
     sync_purchase_with_ghl_task = None
 from users.models import User
-from .models import CoachingPackage, CoachingPackagePurchase, SessionTransfer, TempPurchase, PendingRecipient
+from .models import (
+    CoachingPackage, CoachingPackagePurchase, SessionTransfer, TempPurchase, PendingRecipient,
+    SimulatorPackage, SimulatorPackagePurchase, SimulatorHoursTransfer
+)
 from .serializers import (
     CoachingPackageSerializer,
     CoachingPackagePurchaseSerializer,
     SessionTransferSerializer,
     TempPurchaseSerializer,
     PendingRecipientSerializer,
+    SimulatorPackageSerializer,
+    SimulatorPackagePurchaseSerializer,
+    SimulatorHoursTransferSerializer,
 )
 from django.db import transaction
 
@@ -752,6 +758,117 @@ class SessionTransferViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
 
+class SimulatorHoursTransferViewSet(viewsets.ModelViewSet):
+    serializer_class = SimulatorHoursTransferSerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        user = self.request.user
+        base_qs = SimulatorHoursTransfer.objects.select_related(
+            'from_user', 'to_user', 'package_purchase'
+        )
+        
+        if user.role in ['admin', 'staff']:
+            return base_qs
+        
+        # Users see transfers they sent or received
+        return base_qs.filter(
+            Q(from_user=user) | 
+            Q(to_user_phone=user.phone) |
+            Q(to_user=user)
+        )
+    
+    def perform_create(self, serializer):
+        serializer.save(from_user=self.request.user)
+    
+    @action(detail=True, methods=['post'])
+    def claim(self, request, pk=None):
+        """Claim a simulator hours transfer"""
+        transfer = self.get_object()
+        
+        # Verify recipient
+        if transfer.to_user_phone != request.user.phone:
+            return Response(
+                {'error': 'You are not authorized to claim this transfer.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        if transfer.transfer_status != 'pending':
+            return Response(
+                {'error': f'This transfer is already {transfer.transfer_status}.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Check expiration
+        if transfer.expires_at and transfer.expires_at < timezone.now():
+            transfer.transfer_status = 'expired'
+            transfer.save()
+            return Response(
+                {'error': 'This transfer has expired.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        action = request.data.get('action', 'accept')
+        
+        if action == 'accept':
+            with transaction.atomic():
+                # Check if package still has enough hours
+                if transfer.package_purchase.hours_remaining < transfer.hours:
+                    return Response(
+                        {'error': 'Package no longer has enough hours for this transfer.'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                
+                # Consume hours from source package
+                transfer.package_purchase.consume_hours(transfer.hours)
+                
+                # Create or update recipient's simulator credit
+                from simulators.models import SimulatorCredit
+                SimulatorCredit.objects.create(
+                    client=request.user,
+                    hours=transfer.hours,
+                    status=SimulatorCredit.Status.AVAILABLE,
+                    notes=f"Transferred from {transfer.from_user.get_full_name() or transfer.from_user.username}"
+                )
+                
+                # Update transfer status
+                transfer.to_user = request.user
+                transfer.transfer_status = 'accepted'
+                transfer.save()
+            
+            serializer = self.get_serializer(transfer)
+            return Response({
+                'message': 'Transfer accepted successfully.',
+                'transfer': serializer.data
+            }, status=status.HTTP_200_OK)
+        
+        elif action == 'reject':
+            transfer.transfer_status = 'rejected'
+            transfer.save()
+            serializer = self.get_serializer(transfer)
+            return Response({
+                'message': 'Transfer rejected.',
+                'transfer': serializer.data
+            }, status=status.HTTP_200_OK)
+        
+        else:
+            return Response(
+                {'error': 'Invalid action. Use "accept" or "reject".'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+    
+    @action(detail=False, methods=['get'])
+    def pending(self, request):
+        """Get pending simulator hours transfers for current user"""
+        pending_transfers = SimulatorHoursTransfer.objects.filter(
+            to_user_phone=request.user.phone,
+            transfer_status='pending',
+            expires_at__gt=timezone.now()
+        )
+        serializer = self.get_serializer(pending_transfers, many=True)
+        return Response(serializer.data)
+
+
 class UserPhoneCheckView(APIView):
     """Check if user exists by phone number"""
     permission_classes = [IsAuthenticated]
@@ -814,17 +931,30 @@ class CreateTempPurchaseView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Validate package exists and is active
+        # Validate package exists and is active - check both CoachingPackage and SimulatorPackage
+        package = None
+        simulator_package = None
+        
         try:
-            package = CoachingPackage.objects.get(id=package_id, is_active=True)
-        except CoachingPackage.DoesNotExist:
-            return Response(
-                {'error': f'Package with ID {package_id} not found or is inactive.'},
-                status=status.HTTP_404_NOT_FOUND
-            )
+            # First check if it's a simulator package
+            simulator_package = SimulatorPackage.objects.get(id=package_id, is_active=True)
+            package_type = 'simulator'
+        except SimulatorPackage.DoesNotExist:
+            try:
+                # If not simulator, check coaching package
+                package = CoachingPackage.objects.get(id=package_id, is_active=True)
+                package_type = 'coaching'
+            except CoachingPackage.DoesNotExist:
+                return Response(
+                    {'error': f'Package with ID {package_id} not found or is inactive.'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+        
+        # Get the appropriate package object for redirect_url check
+        active_package = simulator_package if simulator_package else package
         
         # Validate package has redirect_url
-        if not package.redirect_url or not package.redirect_url.strip():
+        if not active_package.redirect_url or not active_package.redirect_url.strip():
             return Response(
                 {'error': 'Package does not have a redirect URL configured.'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -848,23 +978,42 @@ class CreateTempPurchaseView(APIView):
         
         # Create temp purchase
         try:
-            temp_purchase = TempPurchase.objects.create(
-                package=package,
-                buyer_phone=buyer_phone,
-                purchase_type=purchase_type,
-                recipients=recipients
-            )
+            if package_type == 'simulator':
+                temp_purchase = TempPurchase(
+                    simulator_package=simulator_package,
+                    buyer_phone=buyer_phone,
+                    purchase_type=purchase_type,
+                    recipients=recipients
+                )
+            else:
+                temp_purchase = TempPurchase(
+                    package=package,
+                    buyer_phone=buyer_phone,
+                    purchase_type=purchase_type,
+                    recipients=recipients
+                )
             
-            logger.info(f"Temp purchase created: temp_id={temp_purchase.temp_id}, buyer={buyer_phone}, type={purchase_type}")
+            # Validate before saving
+            temp_purchase.full_clean()
+            temp_purchase.save()
             
+            logger.info(f"Temp purchase created successfully: temp_id={temp_purchase.temp_id}, buyer={buyer_phone}, type={purchase_type}, created_at={temp_purchase.created_at}")
+            
+            # Verify it was saved
+            verify_purchase = TempPurchase.objects.get(temp_id=temp_purchase.temp_id)
+            logger.info(f"Verified temp purchase exists in DB: temp_id={verify_purchase.temp_id}")
+            
+            redirect_url = simulator_package.redirect_url if simulator_package else package.redirect_url
             return Response({
                 'temp_id': str(temp_purchase.temp_id),
-                'redirect_url': package.redirect_url,
+                'redirect_url': redirect_url,
                 'message': 'Temporary purchase created successfully.'
             }, status=status.HTTP_201_CREATED)
             
         except Exception as e:
-            logger.error(f"Error creating temp purchase: {e}")
+            logger.error(f"Error creating temp purchase: {e}", exc_info=True)
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return Response(
                 {'error': f'Failed to create temporary purchase: {str(e)}'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
@@ -900,18 +1049,65 @@ class PackagePurchaseWebhookView(APIView):
         # Parse and validate temp_id
         try:
             temp_id = uuid.UUID(temp_id_str)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as e:
+            logger.error(f"Invalid temp_id format in webhook: {temp_id_str}, error: {e}")
             return Response(
                 {'error': 'Invalid recipient_phone (temp_id) format. Must be a valid UUID.'},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
+        # Log webhook attempt
+        logger.info(f"Webhook called for temp_id: {temp_id_str}, phone: {request.data.get('phone')}")
+        
         # Get temp purchase
         try:
             temp_purchase = TempPurchase.objects.get(temp_id=temp_id)
+            logger.info(f"Temp purchase found: temp_id={temp_id}, buyer={temp_purchase.buyer_phone}, created_at={temp_purchase.created_at}, expired={temp_purchase.is_expired}")
         except TempPurchase.DoesNotExist:
+            # Log additional debugging info
+            recent_temp_purchases = TempPurchase.objects.order_by('-created_at')[:5]
+            logger.error(
+                f"Temp purchase not found: temp_id={temp_id_str}. "
+                f"Recent temp purchases (last 5): {[(str(tp.temp_id), tp.buyer_phone, tp.created_at) for tp in recent_temp_purchases]}"
+            )
+            
+            # Check if there are any temp purchases at all
+            total_count = TempPurchase.objects.count()
+            logger.error(f"Total temp purchases in database: {total_count}")
+            
+            # Try to find by string representation (case-insensitive)
+            try:
+                temp_purchase_by_str = TempPurchase.objects.filter(temp_id__iexact=temp_id_str).first()
+                if temp_purchase_by_str:
+                    logger.warning(f"Found temp purchase by case-insensitive search: {temp_purchase_by_str.temp_id}")
+            except Exception as e:
+                logger.error(f"Error searching by string: {e}")
+            
+            # Check if phone matches any recent temp purchases
+            phone_from_request = request.data.get('phone')
+            if phone_from_request:
+                temp_by_phone = TempPurchase.objects.filter(buyer_phone=phone_from_request).order_by('-created_at').first()
+                if temp_by_phone:
+                    logger.warning(f"Found temp purchase for phone {phone_from_request}: temp_id={temp_by_phone.temp_id}, created_at={temp_by_phone.created_at}")
+            
             return Response(
-                {'error': f'Temporary purchase with recipient_phone (temp_id) {temp_id_str} not found.'},
+                {
+                    'error': f'Temporary purchase with recipient_phone (temp_id) {temp_id_str} not found.',
+                    'debug_info': {
+                        'temp_id_received': temp_id_str,
+                        'phone_received': phone_from_request,
+                        'total_temp_purchases': total_count,
+                        'recent_temp_purchases': [
+                            {
+                                'temp_id': str(tp.temp_id),
+                                'buyer_phone': tp.buyer_phone,
+                                'created_at': tp.created_at.isoformat() if tp.created_at else None,
+                                'expired': tp.is_expired
+                            }
+                            for tp in recent_temp_purchases
+                        ]
+                    }
+                },
                 status=status.HTTP_404_NOT_FOUND
             )
         
@@ -931,7 +1127,12 @@ class PackagePurchaseWebhookView(APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
         
+        # Determine package type
         package = temp_purchase.package
+        simulator_package = temp_purchase.simulator_package
+        package_type = 'simulator' if simulator_package else 'coaching'
+        active_package = simulator_package if simulator_package else package
+        
         purchase_type = temp_purchase.purchase_type
         recipients = temp_purchase.recipients or []
         
@@ -939,34 +1140,56 @@ class PackagePurchaseWebhookView(APIView):
         if purchase_type == 'normal':
             # Create the purchase (always create new purchase)
             try:
-                simulator_hours = Decimal(str(package.simulator_hours)) if package.simulator_hours else Decimal('0')
-                purchase = CoachingPackagePurchase.objects.create(
-                    client=buyer,
-                    package=package,
-                    purchase_type='normal',
-                    purchase_name=package.title,
-                    sessions_total=package.session_count,
-                    sessions_remaining=package.session_count,
-                    simulator_hours_total=simulator_hours,
-                    simulator_hours_remaining=simulator_hours,
-                    package_status='active',
-                    gift_status=None
-                )
-                
-                # Sync with GHL if available
-                if CELERY_AVAILABLE and sync_purchase_with_ghl_task:
-                    try:
-                        sync_purchase_with_ghl_task.delay(purchase.id)
-                    except Exception as e:
-                        logger.error(f"Failed to queue GHL sync for purchase {purchase.id}: {e}")
-                
-                logger.info(f"Package purchase created via webhook: User {buyer.phone}, Package {package.id}, Purchase ID {purchase.id}")
-                
-                return Response({
-                    'message': 'Package purchase created successfully.',
-                    'purchase_id': purchase.id,
-                    'purchase': CoachingPackagePurchaseSerializer(purchase).data
-                }, status=status.HTTP_201_CREATED)
+                if package_type == 'simulator':
+                    # Create simulator package purchase
+                    purchase = SimulatorPackagePurchase.objects.create(
+                        client=buyer,
+                        package=simulator_package,
+                        purchase_type='normal',
+                        purchase_name=simulator_package.title,
+                        hours_total=simulator_package.hours,
+                        hours_remaining=simulator_package.hours,
+                        package_status='active',
+                        gift_status=None
+                    )
+                    
+                    logger.info(f"Simulator package purchase created via webhook: User {buyer.phone}, Package {simulator_package.id}, Purchase ID {purchase.id}")
+                    
+                    return Response({
+                        'message': 'Simulator package purchase created successfully.',
+                        'purchase_id': purchase.id,
+                        'purchase': SimulatorPackagePurchaseSerializer(purchase).data
+                    }, status=status.HTTP_201_CREATED)
+                else:
+                    # Create coaching package purchase
+                    simulator_hours = Decimal(str(package.simulator_hours)) if package.simulator_hours else Decimal('0')
+                    purchase = CoachingPackagePurchase.objects.create(
+                        client=buyer,
+                        package=package,
+                        purchase_type='normal',
+                        purchase_name=package.title,
+                        sessions_total=package.session_count,
+                        sessions_remaining=package.session_count,
+                        simulator_hours_total=simulator_hours,
+                        simulator_hours_remaining=simulator_hours,
+                        package_status='active',
+                        gift_status=None
+                    )
+                    
+                    # Sync with GHL if available
+                    if CELERY_AVAILABLE and sync_purchase_with_ghl_task:
+                        try:
+                            sync_purchase_with_ghl_task.delay(purchase.id)
+                        except Exception as e:
+                            logger.error(f"Failed to queue GHL sync for purchase {purchase.id}: {e}")
+                    
+                    logger.info(f"Package purchase created via webhook: User {buyer.phone}, Package {package.id}, Purchase ID {purchase.id}")
+                    
+                    return Response({
+                        'message': 'Package purchase created successfully.',
+                        'purchase_id': purchase.id,
+                        'purchase': CoachingPackagePurchaseSerializer(purchase).data
+                    }, status=status.HTTP_201_CREATED)
                 
             except Exception as e:
                 logger.error(f"Error creating package purchase via webhook: {e}")
@@ -996,34 +1219,61 @@ class PackagePurchaseWebhookView(APIView):
                     )
                 
                 # Create gift purchase (always create new purchase)
-                simulator_hours = Decimal(str(package.simulator_hours)) if package.simulator_hours else Decimal('0')
-                purchase = CoachingPackagePurchase.objects.create(
-                    client=recipient,
-                    package=package,
-                    purchase_type='gift',
-                    purchase_name=package.title,
-                    sessions_total=package.session_count,
-                    sessions_remaining=package.session_count,
-                    simulator_hours_total=simulator_hours,
-                    simulator_hours_remaining=simulator_hours,
-                    package_status='gifted',
-                    gift_status='pending',
-                    original_owner=buyer,
-                    recipient_phone=recipient_phone,
-                    gift_token=CoachingPackagePurchase().generate_gift_token(),
-                    gift_expires_at=timezone.now() + timedelta(days=30)
-                )
+                if package_type == 'simulator':
+                    purchase = SimulatorPackagePurchase.objects.create(
+                        client=recipient,
+                        package=simulator_package,
+                        purchase_type='gift',
+                        purchase_name=simulator_package.title,
+                        hours_total=simulator_package.hours,
+                        hours_remaining=simulator_package.hours,
+                        package_status='gifted',
+                        gift_status='pending',
+                        original_owner=buyer,
+                        recipient_phone=recipient_phone,
+                        gift_token=SimulatorPackagePurchase().generate_gift_token(),
+                        gift_expires_at=timezone.now() + timedelta(days=30)
+                    )
+                else:
+                    simulator_hours = Decimal(str(package.simulator_hours)) if package.simulator_hours else Decimal('0')
+                    purchase = CoachingPackagePurchase.objects.create(
+                        client=recipient,
+                        package=package,
+                        purchase_type='gift',
+                        purchase_name=package.title,
+                        sessions_total=package.session_count,
+                        sessions_remaining=package.session_count,
+                        simulator_hours_total=simulator_hours,
+                        simulator_hours_remaining=simulator_hours,
+                        package_status='gifted',
+                        gift_status='pending',
+                        original_owner=buyer,
+                        recipient_phone=recipient_phone,
+                        gift_token=CoachingPackagePurchase().generate_gift_token(),
+                        gift_expires_at=timezone.now() + timedelta(days=30)
+                    )
                 
-                logger.info(f"Gift purchase created via webhook: Buyer {buyer.phone}, Recipient {recipient_phone}, Package {package.id}, Purchase ID {purchase.id}")
+                package_id = simulator_package.id if package_type == 'simulator' else package.id
+                logger.info(f"Gift purchase created via webhook: Buyer {buyer.phone}, Recipient {recipient_phone}, Package {package_id}, Purchase ID {purchase.id}")
+                
+                purchase_data = SimulatorPackagePurchaseSerializer(purchase).data if package_type == 'simulator' else CoachingPackagePurchaseSerializer(purchase).data
                 
                 return Response({
                     'message': 'Gift purchase created successfully.',
                     'purchase_id': purchase.id,
-                    'purchase': CoachingPackagePurchaseSerializer(purchase).data
+                    'purchase': purchase_data
                 }, status=status.HTTP_201_CREATED)
                 
             except User.DoesNotExist:
                 # Recipient doesn't exist - create PendingRecipient
+                # Note: PendingRecipient only supports CoachingPackage, not SimulatorPackage
+                # For simulator packages, we'll need to handle this differently or skip pending recipient
+                if package_type == 'simulator':
+                    return Response(
+                        {'error': 'Recipient must have an account to receive simulator package gifts.'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                
                 pending_recipient, created = PendingRecipient.objects.get_or_create(
                     package=package,
                     buyer=buyer,
@@ -1049,6 +1299,13 @@ class PackagePurchaseWebhookView(APIView):
         
         # Handle organization purchase
         elif purchase_type == 'organization':
+            # Simulator packages don't support organization purchases
+            if package_type == 'simulator':
+                return Response(
+                    {'error': 'Simulator packages do not support organization purchases.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
             if not recipients or len(recipients) == 0:
                 return Response(
                     {'error': 'Organization purchase requires at least one member.'},
@@ -1069,7 +1326,7 @@ class PackagePurchaseWebhookView(APIView):
                 except User.DoesNotExist:
                     # Non-existing users will be handled after purchase creation
                     pending_recipients_created.append(recipient_phone)
-                    logger.info(f"Non-existing user for organization: Buyer {buyer.phone}, Member {recipient_phone}, Package {package.id}")
+                    logger.info(f"Non-existing user for organization: Buyer {buyer.phone}, Member {recipient_phone}, Package {active_package.id}")
             
             # Create organization purchase (always create new purchase)
             try:
@@ -1225,3 +1482,110 @@ class ListPendingRecipientsView(APIView):
             'count': queryset.count(),
             'results': serializer.data
         }, status=status.HTTP_200_OK)
+
+
+class SimulatorPackageViewSet(viewsets.ModelViewSet):
+    queryset = SimulatorPackage.objects.all().order_by('-id')
+    serializer_class = SimulatorPackageSerializer
+    
+    def get_permissions(self):
+        """
+        Instantiates and returns the list of permissions that this view requires.
+        """
+        if self.action in ['list', 'retrieve', 'active_packages']:
+            permission_classes = [AllowAny]  # Public access for viewing packages
+        else:
+            permission_classes = [IsAuthenticated, IsAdminUser]  # Admin only for create/update/delete
+        return [permission() for permission in permission_classes]
+    
+    def get_queryset(self):
+        queryset = SimulatorPackage.objects.all().order_by('-id')
+        
+        # Filter by active status if provided
+        is_active = self.request.query_params.get('is_active')
+        if is_active is not None:
+            queryset = queryset.filter(is_active=is_active.lower() == 'true')
+        
+        return queryset
+    
+    @action(detail=False, methods=['get'], url_path='active')
+    def active_packages(self, request):
+        """Get all active simulator packages"""
+        packages = SimulatorPackage.objects.filter(is_active=True).order_by('title')
+        serializer = self.get_serializer(packages, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=True, methods=['post'])
+    def toggle_active(self, request, pk=None):
+        package = self.get_object()
+        package.is_active = not package.is_active
+        package.save()
+        return Response({
+            'message': f'Package {"activated" if package.is_active else "deactivated"}',
+            'is_active': package.is_active
+        })
+
+
+class SimulatorPackagePurchaseViewSet(viewsets.ModelViewSet):
+    queryset = SimulatorPackagePurchase.objects.all().order_by('-purchased_at')
+    serializer_class = SimulatorPackagePurchaseSerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        user = self.request.user
+        queryset = SimulatorPackagePurchase.objects.all()
+        
+        # Regular users can only see their own purchases
+        if user.role not in ['admin', 'staff']:
+            queryset = queryset.filter(client=user)
+        
+        # Filter by purchase type
+        purchase_type = self.request.query_params.get('purchase_type')
+        if purchase_type:
+            queryset = queryset.filter(purchase_type=purchase_type)
+        
+        # Filter by status
+        package_status = self.request.query_params.get('package_status')
+        if package_status:
+            queryset = queryset.filter(package_status=package_status)
+        
+        return queryset.select_related('package', 'client', 'original_owner')
+    
+    @action(detail=False, methods=['get'], url_path='my')
+    def my_purchases(self, request):
+        """Get current user's simulator package purchases"""
+        purchases = SimulatorPackagePurchase.objects.filter(
+            client=request.user
+        ).exclude(
+            package_status='gifted'
+        ).order_by('-purchased_at')
+        
+        serializer = self.get_serializer(purchases, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=False, methods=['get'])
+    def transferable_purchases(self, request):
+        """Get simulator package purchases available for transfer"""
+        purchases = SimulatorPackagePurchase.objects.filter(
+            client=request.user,
+            hours_remaining__gt=0,
+            package_status='active',
+            gift_status__isnull=True  # Exclude pending gifts
+        ).exclude(purchase_type='organization').order_by('-purchased_at')
+        
+        # Apply pagination
+        paginator = TenPerPagePagination()
+        page = paginator.paginate_queryset(purchases, request)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return paginator.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(purchases, many=True)
+        return Response(serializer.data)
+    
+    def perform_create(self, serializer):
+        # Set client to current user if not admin
+        if self.request.user.role not in ['admin', 'staff']:
+            serializer.save(client=self.request.user)
+        else:
+            serializer.save()

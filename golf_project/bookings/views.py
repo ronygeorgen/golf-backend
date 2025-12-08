@@ -3,17 +3,24 @@ from rest_framework import viewsets, status
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.views import APIView
 from rest_framework import serializers
 from django.db import transaction
 from django.db.models import Q, Sum, F
 from django.utils import timezone
 from datetime import datetime, timedelta
-from .models import Booking
+import logging
+from .models import Booking, TempBooking
 from .serializers import BookingSerializer, BookingCreateSerializer
 from users.models import User
 from simulators.models import Simulator, SimulatorCredit
-from coaching.models import CoachingPackagePurchase, OrganizationPackageMember
+from coaching.models import (
+    CoachingPackagePurchase, OrganizationPackageMember, 
+    SimulatorPackagePurchase
+)
+
+logger = logging.getLogger(__name__)
 
 class TenPerPagePagination(PageNumberPagination):
     page_size = 10
@@ -32,6 +39,27 @@ class BookingViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     lock_window = timedelta(hours=24)
     pagination_class = TenPerPagePagination
+    
+    def _check_special_event_conflict(self, check_datetime):
+        """
+        Check if a datetime conflicts with any active special event.
+        Returns (has_conflict, event_title) tuple.
+        """
+        from special_events.models import SpecialEvent
+        
+        active_events = SpecialEvent.objects.filter(is_active=True)
+        for event in active_events:
+            if event.conflicts_with_datetime(check_datetime):
+                return (True, event.title)
+        return (False, None)
+    
+    def _check_closed_day(self, check_datetime):
+        """
+        Check if a datetime is on a closed day.
+        Returns (is_closed, message) tuple.
+        """
+        from admin_panel.models import ClosedDay
+        return ClosedDay.check_if_closed(check_datetime)
     
     def get_queryset(self):
         user = self.request.user
@@ -73,6 +101,31 @@ class BookingViewSet(viewsets.ModelViewSet):
         if self.action in ['create', 'update']:
             return BookingCreateSerializer
         return BookingSerializer
+    
+    def create(self, request, *args, **kwargs):
+        """Override create to handle temp booking creation for paid simulator bookings"""
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        
+        # Initialize temp booking response marker
+        self._temp_booking_response = None
+        
+        try:
+            self.perform_create(serializer)
+            
+            # Check if temp booking was created (for payment flow)
+            if hasattr(self, '_temp_booking_response') and self._temp_booking_response:
+                return Response(self._temp_booking_response, status=status.HTTP_200_OK)
+            
+            # Normal booking creation
+            headers = self.get_success_headers(serializer.data)
+            return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+        except Exception as e:
+            # Check if this is a temp booking redirect exception (fallback)
+            if hasattr(e, 'detail') and isinstance(e.detail, dict) and 'temp_id' in e.detail:
+                return Response(e.detail, status=status.HTTP_200_OK)
+            # Re-raise other exceptions
+            raise
     
     def _find_optimal_simulator(self, start_time, end_time):
         """Assign the best simulator by filling gaps and balancing usage."""
@@ -182,32 +235,96 @@ class BookingViewSet(viewsets.ModelViewSet):
         purchase.consume_session(1)
         return purchase
     
+    def _get_total_available_simulator_hours(self, use_organization=False):
+        """
+        Get total available simulator hours from all sources:
+        - Simulator credits
+        - Combo packages (coaching packages with simulator hours)
+        - Simulator-only packages
+        
+        Args:
+            use_organization: If True, also include organization packages where user is a member
+            
+        Returns:
+            Decimal: Total available hours
+        """
+        from decimal import Decimal
+        
+        total = Decimal('0')
+        
+        # 1. Simulator credits
+        credits = SimulatorCredit.objects.filter(
+            client=self.request.user,
+            status=SimulatorCredit.Status.AVAILABLE
+        ).aggregate(total=Sum('hours_remaining'))['total'] or Decimal('0')
+        total += credits
+        
+        # 2. Combo packages (coaching packages with simulator hours)
+        base_qs = CoachingPackagePurchase.objects.filter(
+            simulator_hours_remaining__gt=0,
+            package_status='active'
+        ).exclude(gift_status='pending')
+        
+        if use_organization:
+            org_purchase_ids = OrganizationPackageMember.objects.filter(
+                Q(phone=self.request.user.phone) | Q(user=self.request.user)
+            ).values_list('package_purchase_id', flat=True)
+            
+            combo_purchases = base_qs.filter(
+                Q(client=self.request.user) | 
+                Q(id__in=org_purchase_ids, purchase_type='organization')
+            )
+        else:
+            combo_purchases = base_qs.filter(
+                client=self.request.user
+            ).exclude(purchase_type='organization')
+        
+        combo_hours = combo_purchases.aggregate(
+            total=Sum('simulator_hours_remaining')
+        )['total'] or Decimal('0')
+        total += combo_hours
+        
+        # 3. Simulator-only packages
+        sim_base_qs = SimulatorPackagePurchase.objects.filter(
+            hours_remaining__gt=0,
+            package_status='active'
+        ).exclude(gift_status='pending')
+        
+        if use_organization:
+            # For simulator-only packages, check if user is the client
+            sim_purchases = sim_base_qs.filter(client=self.request.user)
+        else:
+            sim_purchases = sim_base_qs.filter(client=self.request.user)
+        
+        sim_hours = sim_purchases.aggregate(
+            total=Sum('hours_remaining')
+        )['total'] or Decimal('0')
+        total += sim_hours
+        
+        return total
+    
     def _consume_package_simulator_hours(self, duration_minutes, use_organization=False):
         """
-        Consume simulator hours from a package purchase.
-        Checks for any active package purchase with remaining simulator hours.
+        Consume simulator hours from packages (combo or simulator-only).
+        Priority: combo packages first, then simulator-only packages.
         
         Args:
             duration_minutes: Duration of the booking in minutes
             use_organization: If True, also check organization packages where user is a member
             
         Returns:
-            CoachingPackagePurchase if hours were consumed, None otherwise
+            Purchase object (CoachingPackagePurchase or SimulatorPackagePurchase) if hours were consumed, None otherwise
         """
         from decimal import Decimal
-        from coaching.models import OrganizationPackageMember
         hours_needed = Decimal(str(duration_minutes)) / Decimal('60')
         
-        # Base query for personal purchases and accepted gifts
+        # First, try combo packages (coaching packages with simulator hours)
         base_qs = CoachingPackagePurchase.objects.select_for_update().filter(
             simulator_hours_remaining__gt=0,
             package_status='active'
-        ).exclude(
-            gift_status='pending'
-        )
+        ).exclude(gift_status='pending')
         
         if use_organization:
-            # Include organization packages where user is a member
             org_purchase_ids = OrganizationPackageMember.objects.filter(
                 Q(phone=self.request.user.phone) | Q(user=self.request.user)
             ).values_list('package_purchase_id', flat=True)
@@ -217,23 +334,29 @@ class BookingViewSet(viewsets.ModelViewSet):
                 Q(id__in=org_purchase_ids, purchase_type='organization')
             ).order_by('purchased_at').first()
         else:
-            # Exclude organization packages
             purchase = base_qs.filter(
                 client=self.request.user
-            ).exclude(
-                purchase_type='organization'
-            ).order_by('purchased_at').first()
+            ).exclude(purchase_type='organization').order_by('purchased_at').first()
         
-        if not purchase:
-            return None
+        if purchase and purchase.simulator_hours_remaining >= hours_needed:
+            purchase.consume_simulator_hours(hours_needed)
+            return purchase
         
-        # Check if purchase has enough hours
-        if purchase.simulator_hours_remaining < hours_needed:
-            return None
+        # If no combo package or not enough hours, try simulator-only packages
+        sim_base_qs = SimulatorPackagePurchase.objects.select_for_update().filter(
+            hours_remaining__gt=0,
+            package_status='active'
+        ).exclude(gift_status='pending')
         
-        # Consume the hours
-        purchase.consume_simulator_hours(hours_needed)
-        return purchase
+        sim_purchase = sim_base_qs.filter(
+            client=self.request.user
+        ).order_by('purchased_at').first()
+        
+        if sim_purchase and sim_purchase.hours_remaining >= hours_needed:
+            sim_purchase.consume_hours(hours_needed)
+            return sim_purchase
+        
+        return None
     
     def perform_create(self, serializer):
         booking_data = serializer.validated_data
@@ -252,34 +375,95 @@ class BookingViewSet(viewsets.ModelViewSet):
                     if not assigned_simulator:
                         raise serializers.ValidationError("No simulators available for this time slot")
                     
-                    # Priority: 1. Simulator credit hours, 2. Package hours, 3. Charge price
+                    # User can choose: use pre-paid hours OR pay for one-off session
+                    # Pre-paid hours include: credits + combo package hours + simulator-only package hours
                     from decimal import Decimal
                     duration_minutes = booking_data.get('duration_minutes', 0)
                     hours_needed = Decimal(str(duration_minutes)) / Decimal('60')
                     
                     package_purchase = None
                     redeemed_credit = None
+                    use_prepaid_hours = booking_data.get('use_prepaid_hours', None)
                     
-                    if use_simulator_credit:
-                        # User explicitly wants to use credit
-                        redeemed_credit = self._reserve_simulator_credit(hours_needed)
-                    else:
-                        # Try credit hours first, then package hours, then charge
+                    if use_prepaid_hours is True:
+                        # User explicitly wants to use pre-paid hours
+                        # Try credits first, then packages
                         try:
                             redeemed_credit = self._reserve_simulator_credit(hours_needed)
                         except serializers.ValidationError:
-                            # No credits available, try package hours
-                            # For simulator bookings, automatically check organization packages if user is a member
+                            # No credits available, try package hours (combo or simulator-only)
                             package_purchase = self._consume_package_simulator_hours(duration_minutes, use_organization=True)
                             if not package_purchase:
-                                # No package hours available, will charge normal price
-                                package_purchase = None
+                                raise serializers.ValidationError("Insufficient pre-paid hours available")
+                    elif use_prepaid_hours is False:
+                        # User explicitly wants to pay - create temp booking and return redirect URL
+                        # Calculate price first
+                        calculated_price = self._calculate_simulator_price(
+                            assigned_simulator,
+                            duration_minutes
+                        )
+                        
+                        # Create temp booking - ensure it's saved and committed
+                        temp_booking = TempBooking(
+                            simulator=assigned_simulator,
+                            buyer_phone=self.request.user.phone,
+                            start_time=start_time,
+                            end_time=end_time,
+                            duration_minutes=duration_minutes,
+                            total_price=calculated_price
+                        )
+                        temp_booking.save()
+                        
+                        # Force database commit by refreshing from DB
+                        temp_booking.refresh_from_db()
+                        temp_id_str = str(temp_booking.temp_id)
+                        
+                        # Verify it was saved (within same transaction)
+                        logger.info(f"Temp booking created in perform_create: temp_id={temp_id_str}, buyer={temp_booking.buyer_phone}")
+                        
+                        # Get redirect URL - must be set for paid bookings
+                        redirect_url = assigned_simulator.redirect_url
+                        if not redirect_url:
+                            raise serializers.ValidationError(
+                                "This simulator does not have a redirect URL configured. Please contact support."
+                            )
+                        
+                        # Store temp_id in instance for later retrieval
+                        # Use a marker to indicate we should return redirect response
+                        self._temp_booking_response = {
+                            'temp_id': temp_id_str,
+                            'redirect_url': redirect_url,
+                            'message': 'Temporary booking created successfully. Redirect to payment.'
+                        }
+                        
+                        # Don't raise exception - just return early
+                        # The transaction will commit when we exit perform_create
+                        # The create method will check for _temp_booking_response
+                        return
+                    else:
+                        # Auto-detect: Try pre-paid hours first, fallback to payment
+                        try:
+                            redeemed_credit = self._reserve_simulator_credit(hours_needed)
+                        except serializers.ValidationError:
+                            package_purchase = self._consume_package_simulator_hours(duration_minutes, use_organization=True)
+                    
+                    # Determine if package_purchase is a combo package or simulator-only package
+                    simulator_package_purchase = None
+                    combo_package_purchase = None
+                    if package_purchase:
+                        # Check if it's a SimulatorPackagePurchase
+                        if isinstance(package_purchase, SimulatorPackagePurchase):
+                            simulator_package_purchase = package_purchase
+                        else:
+                            # It's a CoachingPackagePurchase (combo package)
+                            combo_package_purchase = package_purchase
                     
                     booking = serializer.save(
                         client=self.request.user,
                         simulator=assigned_simulator,
                         total_price=Decimal('0.00'),
-                        package_purchase=package_purchase
+                        package_purchase=combo_package_purchase,
+                        simulator_package_purchase=simulator_package_purchase
                     )
                     
                     if redeemed_credit:
@@ -288,9 +472,14 @@ class BookingViewSet(viewsets.ModelViewSet):
                         booking.total_price = 0
                         booking.save(update_fields=['simulator_credit_redemption', 'total_price', 'updated_at'])
                     elif package_purchase:
-                        # Hours were consumed from package, no charge
+                        # Hours were consumed from package (combo or simulator-only), no charge
                         booking.total_price = 0
-                        booking.save(update_fields=['total_price', 'package_purchase', 'updated_at'])
+                        update_fields = ['total_price', 'updated_at']
+                        if combo_package_purchase:
+                            update_fields.append('package_purchase')
+                        if simulator_package_purchase:
+                            update_fields.append('simulator_package_purchase')
+                        booking.save(update_fields=update_fields)
                     else:
                         # Charge the normal price
                         booking.total_price = self._calculate_simulator_price(
@@ -313,6 +502,22 @@ class BookingViewSet(viewsets.ModelViewSet):
                 return
             
             serializer.save(client=self.request.user)
+    
+    @action(detail=False, methods=['get'], url_path='available-simulator-hours')
+    def available_simulator_hours(self, request):
+        """
+        Get total available simulator hours from all sources:
+        - Simulator credits
+        - Combo packages (coaching packages with simulator hours)
+        - Simulator-only packages
+        """
+        use_organization = request.query_params.get('use_organization', 'false').lower() == 'true'
+        total_hours = self._get_total_available_simulator_hours(use_organization=use_organization)
+        
+        return Response({
+            'total_available_hours': float(total_hours),
+            'use_organization': use_organization
+        })
     
     @action(detail=False, methods=['get'])
     def upcoming(self, request):
@@ -596,13 +801,23 @@ class BookingViewSet(viewsets.ModelViewSet):
                 hours_to_restore = Decimal(str(booking.duration_minutes)) / Decimal('60')
                 
                 # Case 1: Booking used combo package hours -> restore to same package
-                if booking.package_purchase and not booking.simulator_credit_redemption:
+                if booking.package_purchase and not booking.simulator_credit_redemption and not booking.simulator_package_purchase:
                     purchase = booking.package_purchase
                     purchase.simulator_hours_remaining = F('simulator_hours_remaining') + hours_to_restore
                     purchase.save(update_fields=['simulator_hours_remaining', 'updated_at'])
                     purchase.refresh_from_db(fields=['simulator_hours_remaining'])
                     restitution['simulator_hours_restored'] = float(purchase.simulator_hours_remaining)
-                # Case 2: Booking used credit hours -> restore to credit
+                # Case 2: Booking used simulator-only package hours -> add to credits (per requirement)
+                elif booking.simulator_package_purchase:
+                    # When simulator-only package booking is cancelled, add hours to credits
+                    credit = self._issue_simulator_credit(
+                        booking,
+                        issued_by=request.user if force_override and self._is_admin(request.user) else None,
+                        reason=SimulatorCredit.Reason.CANCELLATION
+                    )
+                    restitution['simulator_credit_id'] = credit.id
+                    restitution['simulator_credit_hours'] = float(credit.hours)
+                # Case 3: Booking used credit hours -> restore to credit
                 elif booking.simulator_credit_redemption:
                     credit = booking.simulator_credit_redemption
                     credit.hours_remaining = F('hours_remaining') + hours_to_restore
@@ -611,7 +826,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                     credit.save(update_fields=['hours_remaining', 'status', 'redeemed_at', 'updated_at'])
                     credit.refresh_from_db(fields=['hours_remaining', 'status'])
                     restitution['simulator_credit_hours_restored'] = float(credit.hours_remaining)
-                # Case 3: Booking was paid (no package, no credit) -> issue credit with exact hours
+                # Case 4: Booking was paid (no package, no credit) -> issue credit with exact hours
                 else:
                     credit = self._issue_simulator_credit(
                         booking,
@@ -914,7 +1129,14 @@ class BookingViewSet(viewsets.ModelViewSet):
                         status__in=['confirmed', 'completed']
                     )
                     
-                    if not conflicting_bookings.exists():
+                    # Check for special event conflicts
+                    has_special_event, event_title = self._check_special_event_conflict(slot_start)
+                    
+                    # Check if facility is closed
+                    from admin_panel.models import ClosedDay
+                    is_closed, closed_message = ClosedDay.check_if_closed(slot_start)
+                    
+                    if not conflicting_bookings.exists() and not has_special_event and not is_closed:
                         slot_start_str = slot_start.isoformat()
                         existing_slot = next((s for s in available_slots if s['start_time'] == slot_start_str), None)
                         
@@ -961,11 +1183,20 @@ class BookingViewSet(viewsets.ModelViewSet):
         # Sort slots by start_time
         available_slots.sort(key=lambda x: x['start_time'])
         
-        return Response({
+        # Check if there's a special event blocking this entire date
+        booking_datetime = timezone.make_aware(datetime.combine(booking_date, datetime.min.time()))
+        has_special_event, event_title = self._check_special_event_conflict(booking_datetime)
+        
+        response_data = {
             'date': date_str,
             'duration_minutes': duration_minutes,
             'available_slots': available_slots
-        })
+        }
+        
+        if has_special_event:
+            response_data['special_event_message'] = f'Bookings are not available due to a special event: {event_title}'
+        
+        return Response(response_data)
     
     @action(detail=False, methods=['get'])
     def check_coaching_availability(self, request):
@@ -1126,7 +1357,15 @@ class BookingViewSet(viewsets.ModelViewSet):
                         end_time__gt=slot_start,
                         status__in=['confirmed', 'completed']
                     )
-                    if conflicting_bookings.exists():
+                    
+                    # Check for special event conflicts
+                    has_special_event, event_title = self._check_special_event_conflict(slot_start)
+                    
+                    # Check if facility is closed
+                    from admin_panel.models import ClosedDay
+                    is_closed, closed_message = ClosedDay.check_if_closed(slot_start)
+                    
+                    if conflicting_bookings.exists() or has_special_event or is_closed:
                         current_time += timedelta(minutes=slot_interval)
                         continue
                     
@@ -1191,9 +1430,249 @@ class BookingViewSet(viewsets.ModelViewSet):
         
         available_slots = sorted(available_slots_map.values(), key=lambda x: x['start_time'])
         
-        return Response({
+        # Check if there's a special event blocking this entire date
+        booking_datetime = timezone.make_aware(datetime.combine(booking_date, datetime.min.time()))
+        has_special_event, event_title = self._check_special_event_conflict(booking_datetime)
+        
+        response_data = {
             'date': date_str,
             'package_id': package_id,
             'coach_id': coach_id,
             'available_slots': available_slots
-        })
+        }
+        
+        if has_special_event:
+            response_data['special_event_message'] = f'Bookings are not available due to a special event: {event_title}'
+        
+        return Response(response_data)
+
+
+class CreateTempBookingView(APIView):
+    """
+    Create a temporary booking record before redirecting to payment for simulator bookings.
+    Returns temp_id which is used in the redirect URL and webhook.
+    """
+    permission_classes = [AllowAny]  # Allow unauthenticated for flexibility
+    
+    @transaction.atomic
+    def post(self, request):
+        simulator_id = request.data.get('simulator_id')
+        buyer_phone = request.data.get('buyer_phone')
+        start_time = request.data.get('start_time')
+        end_time = request.data.get('end_time')
+        duration_minutes = request.data.get('duration_minutes')
+        total_price = request.data.get('total_price')
+        
+        # Validate required fields
+        if not simulator_id:
+            return Response(
+                {'error': 'simulator_id is required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not buyer_phone:
+            return Response(
+                {'error': 'buyer_phone is required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not start_time or not end_time:
+            return Response(
+                {'error': 'start_time and end_time are required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not duration_minutes:
+            return Response(
+                {'error': 'duration_minutes is required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if not total_price:
+            return Response(
+                {'error': 'total_price is required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Validate simulator exists and is active
+        try:
+            simulator = Simulator.objects.get(id=simulator_id, is_active=True)
+        except Simulator.DoesNotExist:
+            return Response(
+                {'error': f'Simulator with ID {simulator_id} not found or is inactive.'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Get redirect URL - must be set
+        redirect_url = simulator.redirect_url
+        if not redirect_url:
+            return Response(
+                {'error': 'Simulator does not have a redirect URL configured.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Parse datetime strings
+        try:
+            start_time_dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+            end_time_dt = datetime.fromisoformat(end_time.replace('Z', '+00:00'))
+            if timezone.is_naive(start_time_dt):
+                start_time_dt = timezone.make_aware(start_time_dt)
+            if timezone.is_naive(end_time_dt):
+                end_time_dt = timezone.make_aware(end_time_dt)
+        except (ValueError, AttributeError) as e:
+            return Response(
+                {'error': f'Invalid datetime format: {str(e)}'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Create temp booking
+        try:
+            temp_booking = TempBooking.objects.create(
+                simulator=simulator,
+                buyer_phone=buyer_phone,
+                start_time=start_time_dt,
+                end_time=end_time_dt,
+                duration_minutes=int(duration_minutes),
+                total_price=Decimal(str(total_price))
+            )
+            
+            logger.info(f"Temp booking created: temp_id={temp_booking.temp_id}, buyer={buyer_phone}, simulator={simulator_id}")
+            
+            return Response({
+                'temp_id': str(temp_booking.temp_id),
+                'redirect_url': redirect_url,
+                'message': 'Temporary booking created successfully.'
+            }, status=status.HTTP_201_CREATED)
+            
+        except Exception as e:
+            logger.error(f"Error creating temp booking: {e}")
+            return Response(
+                {'error': f'Failed to create temporary booking: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
+class BookingWebhookView(APIView):
+    """
+    Webhook endpoint to create a simulator booking after external payment verification.
+    Receives recipient_phone (which contains temp_id), phone, and booking details.
+    Retrieves TempBooking, and creates actual booking.
+    """
+    permission_classes = [AllowAny]  # Webhook should be accessible without authentication
+    
+    @transaction.atomic
+    def post(self, request):
+        import uuid
+        
+        # New parameter name: recipient_phone contains the temp_id
+        temp_id_str = request.data.get('recipient_phone')
+        
+        # Fallback to temp_id for backward compatibility
+        if not temp_id_str:
+            temp_id_str = request.data.get('temp_id')
+        
+        if not temp_id_str:
+            return Response(
+                {'error': 'recipient_phone (temp_id) is required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Parse and validate temp_id
+        try:
+            temp_id = uuid.UUID(temp_id_str)
+        except (ValueError, TypeError):
+            return Response(
+                {'error': 'Invalid recipient_phone (temp_id) format. Must be a valid UUID.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Log webhook attempt
+        logger.info(f"Booking webhook called for temp_id: {temp_id_str}, phone: {request.data.get('phone')}")
+        
+        # Get temp booking
+        try:
+            temp_booking = TempBooking.objects.get(temp_id=temp_id)
+            logger.info(f"Temp booking found: temp_id={temp_id}, buyer={temp_booking.buyer_phone}, created_at={temp_booking.created_at}, expired={temp_booking.is_expired}")
+        except TempBooking.DoesNotExist:
+            # Log additional debugging info
+            recent_temp_bookings = TempBooking.objects.order_by('-created_at')[:5]
+            logger.error(
+                f"Temp booking not found: temp_id={temp_id_str}. "
+                f"Recent temp bookings (last 5): {[(str(tb.temp_id), tb.buyer_phone, tb.created_at) for tb in recent_temp_bookings]}"
+            )
+            
+            # Check if there are any temp bookings at all
+            total_count = TempBooking.objects.count()
+            logger.error(f"Total temp bookings in database: {total_count}")
+            
+            # Check if phone matches any recent temp bookings
+            phone_from_request = request.data.get('phone')
+            if phone_from_request:
+                temp_by_phone = TempBooking.objects.filter(buyer_phone=phone_from_request).order_by('-created_at').first()
+                if temp_by_phone:
+                    logger.warning(f"Found temp booking for phone {phone_from_request}: temp_id={temp_by_phone.temp_id}, created_at={temp_by_phone.created_at}")
+            
+            return Response(
+                {
+                    'error': f'Temporary booking with recipient_phone (temp_id) {temp_id_str} not found.',
+                    'debug_info': {
+                        'temp_id_received': temp_id_str,
+                        'phone_received': phone_from_request,
+                        'total_temp_bookings': total_count,
+                        'recent_temp_bookings': [
+                            {
+                                'temp_id': str(tb.temp_id),
+                                'buyer_phone': tb.buyer_phone,
+                                'created_at': tb.created_at.isoformat() if tb.created_at else None,
+                                'expired': tb.is_expired
+                            }
+                            for tb in recent_temp_bookings
+                        ]
+                    }
+                },
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Check if temp booking is expired
+        if temp_booking.is_expired:
+            return Response(
+                {'error': 'Temporary booking has expired.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get buyer user
+        try:
+            buyer = User.objects.get(phone=temp_booking.buyer_phone)
+        except User.DoesNotExist:
+            return Response(
+                {'error': f'Buyer with phone number {temp_booking.buyer_phone} not found.'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Create the booking
+        try:
+            booking = Booking.objects.create(
+                client=buyer,
+                booking_type='simulator',
+                simulator=temp_booking.simulator,
+                start_time=temp_booking.start_time,
+                end_time=temp_booking.end_time,
+                duration_minutes=temp_booking.duration_minutes,
+                total_price=temp_booking.total_price,
+                status='confirmed'
+            )
+            
+            logger.info(f"Simulator booking created via webhook: User {buyer.phone}, Booking ID {booking.id}, Simulator {temp_booking.simulator.id}")
+            
+            return Response({
+                'message': 'Simulator booking created successfully.',
+                'booking_id': booking.id,
+                'booking': BookingSerializer(booking).data
+            }, status=status.HTTP_201_CREATED)
+            
+        except Exception as e:
+            logger.error(f"Error creating booking via webhook: {e}")
+            return Response(
+                {'error': f'Failed to create booking: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )

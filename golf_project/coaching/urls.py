@@ -6,17 +6,23 @@ from .views import (
     CoachingPackagePurchaseViewSet,
     GiftClaimView,
     SessionTransferViewSet,
+    SimulatorHoursTransferViewSet,
     UserPhoneCheckView,
     PackagePurchaseWebhookView,
     CreateTempPurchaseView,
     ListTempPurchasesView,
-    ListPendingRecipientsView
+    ListPendingRecipientsView,
+    SimulatorPackageViewSet,
+    SimulatorPackagePurchaseViewSet,
 )
 
 router = DefaultRouter()
 router.register(r'packages', CoachingPackageViewSet, basename='coaching-package')
 router.register(r'purchases', CoachingPackagePurchaseViewSet, basename='coaching-purchase')
 router.register(r'transfers', SessionTransferViewSet, basename='session-transfer')
+router.register(r'simulator-packages', SimulatorPackageViewSet, basename='simulator-package')
+router.register(r'simulator-purchases', SimulatorPackagePurchaseViewSet, basename='simulator-purchase')
+router.register(r'simulator-transfers', SimulatorHoursTransferViewSet, basename='simulator-hours-transfer')
 
 urlpatterns = [
     path('', include(router.urls)),

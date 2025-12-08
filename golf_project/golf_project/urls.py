@@ -25,4 +25,5 @@ urlpatterns = [
     path('api/coaching/', include('coaching.urls')),
     path('api/admin/', include('admin_panel.urls')),
     path('api/ghlpage/', include('ghl.urls')),
+    path('api/special-events/', include('special_events.urls')),
 ] 

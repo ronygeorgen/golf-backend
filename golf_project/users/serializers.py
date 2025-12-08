@@ -238,6 +238,26 @@ class StaffDayAvailabilitySerializer(serializers.ModelSerializer):
         model = StaffDayAvailability
         fields = '__all__'
     
+    def validate(self, attrs):
+        """Check if the date/time is on a closed day"""
+        date = attrs.get('date')
+        start_time = attrs.get('start_time')
+        
+        if date and start_time:
+            from admin_panel.models import ClosedDay
+            from datetime import datetime as dt
+            
+            # Create datetime for checking
+            check_datetime = timezone.make_aware(dt.combine(date, start_time))
+            is_closed, message = ClosedDay.check_if_closed(check_datetime)
+            
+            if is_closed:
+                raise serializers.ValidationError({
+                    'date': message or "Facility is closed on this date/time. Staff availability cannot be set for closed days."
+                })
+        
+        return attrs
+    
     def to_representation(self, instance):
         """Return UTC times as-is (no conversion)"""
         representation = super().to_representation(instance)

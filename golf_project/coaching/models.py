@@ -261,7 +261,16 @@ class TempPurchase(models.Model):
     package = models.ForeignKey(
         CoachingPackage,
         on_delete=models.CASCADE,
-        related_name='temp_purchases'
+        related_name='temp_purchases',
+        null=True,
+        blank=True
+    )
+    simulator_package = models.ForeignKey(
+        'coaching.SimulatorPackage',
+        on_delete=models.CASCADE,
+        related_name='temp_purchases',
+        null=True,
+        blank=True
     )
     buyer_phone = models.CharField(max_length=15)
     purchase_type = models.CharField(max_length=20, choices=PURCHASE_TYPE_CHOICES, default='normal')
@@ -282,7 +291,15 @@ class TempPurchase(models.Model):
         verbose_name_plural = 'Temporary Purchases'
     
     def __str__(self):
-        return f"TempPurchase {self.temp_id} - {self.buyer_phone} - {self.purchase_type}"
+        package_name = self.package.title if self.package else (self.simulator_package.title if self.simulator_package else 'Unknown')
+        return f"TempPurchase {self.temp_id} - {self.buyer_phone} - {self.purchase_type} - {package_name}"
+    
+    def clean(self):
+        from django.core.exceptions import ValidationError
+        if not self.package and not self.simulator_package:
+            raise ValidationError("Either package or simulator_package must be set.")
+        if self.package and self.simulator_package:
+            raise ValidationError("Cannot set both package and simulator_package.")
     
     def save(self, *args, **kwargs):
         from django.utils import timezone
@@ -358,3 +375,215 @@ class PendingRecipient(models.Model):
     
     def __str__(self):
         return f"Pending {self.purchase_type} - {self.recipient_phone} - Status: {self.status}"
+
+
+class SimulatorPackage(models.Model):
+    """
+    Simulator-only packages that contain only simulator hours (no coaching sessions).
+    """
+    title = models.CharField(max_length=200)
+    description = models.TextField()
+    price = models.DecimalField(max_digits=8, decimal_places=2)
+    hours = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        help_text="Number of simulator hours included in this package"
+    )
+    redirect_url = models.URLField(max_length=500, blank=True, null=True, help_text="URL to redirect to after package purchase")
+    is_active = models.BooleanField(default=True)
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'Simulator Package'
+        verbose_name_plural = 'Simulator Packages'
+    
+    def __str__(self):
+        return self.title
+
+
+class SimulatorPackagePurchase(models.Model):
+    """
+    Purchase record for simulator-only packages.
+    Supports transfer (partial hours) and gift (entire package) functionality.
+    """
+    PURCHASE_TYPE_CHOICES = (
+        ('normal', 'Normal'),
+        ('gift', 'Gift'),
+    )
+    
+    GIFT_STATUS_CHOICES = (
+        ('pending', 'Pending'),
+        ('accepted', 'Accepted'),
+        ('rejected', 'Rejected'),
+        ('expired', 'Expired'),
+    )
+    
+    PACKAGE_STATUS_CHOICES = (
+        ('active', 'Active'),
+        ('completed', 'Completed'),
+        ('gifted', 'Gifted'),
+    )
+    
+    client = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='simulator_package_purchases'
+    )
+    package = models.ForeignKey(
+        SimulatorPackage,
+        on_delete=models.CASCADE,
+        related_name='purchases'
+    )
+    purchase_name = models.CharField(
+        max_length=100,
+        blank=True,
+        default='',
+        help_text="Custom label for this purchase"
+    )
+    hours_total = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        help_text="Total simulator hours in this purchase"
+    )
+    hours_remaining = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        help_text="Remaining simulator hours in this purchase"
+    )
+    notes = models.CharField(max_length=255, blank=True)
+    
+    # Gifting fields
+    purchase_type = models.CharField(max_length=15, choices=PURCHASE_TYPE_CHOICES, default='normal')
+    recipient_phone = models.CharField(max_length=15, blank=True, null=True, help_text="Phone number of gift recipient")
+    gift_status = models.CharField(max_length=10, choices=GIFT_STATUS_CHOICES, blank=True, null=True)
+    gift_token = models.CharField(max_length=64, unique=True, blank=True, null=True, help_text="Unique token for gift claim")
+    original_owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='gifted_simulator_packages',
+        help_text="Original purchaser for gifted packages"
+    )
+    package_status = models.CharField(max_length=10, choices=PACKAGE_STATUS_CHOICES, default='active')
+    
+    purchased_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    gift_expires_at = models.DateTimeField(null=True, blank=True, help_text="Expiration date for gift claim")
+    
+    class Meta:
+        ordering = ['-purchased_at']
+        verbose_name = 'Simulator Package Purchase'
+        verbose_name_plural = 'Simulator Package Purchases'
+    
+    def __str__(self):
+        return f"{self.purchase_name} - {self.package.title} ({self.hours_remaining}/{self.hours_total} hrs)"
+    
+    def generate_gift_token(self):
+        """Generate a unique gift claim token"""
+        alphabet = string.ascii_letters + string.digits
+        token = ''.join(secrets.choice(alphabet) for _ in range(32))
+        # Ensure uniqueness
+        while SimulatorPackagePurchase.objects.filter(gift_token=token).exists():
+            token = ''.join(secrets.choice(alphabet) for _ in range(32))
+        return token
+    
+    @property
+    def is_depleted(self):
+        return self.hours_remaining <= 0
+    
+    @property
+    def is_gift_pending(self):
+        return self.purchase_type == 'gift' and self.gift_status == 'pending'
+    
+    @property
+    def can_be_transferred(self):
+        """Check if package can have hours transferred"""
+        return (
+            self.package_status == 'active' and
+            self.hours_remaining > 0 and
+            not self.is_gift_pending
+        )
+    
+    def consume_hours(self, hours):
+        """
+        Consume simulator hours from this purchase.
+        
+        Args:
+            hours: Decimal or float representing hours to consume
+        """
+        from decimal import Decimal
+        hours = Decimal(str(hours))
+        if hours <= 0:
+            raise ValueError("hours must be greater than 0")
+        if self.hours_remaining < hours:
+            raise ValueError("Not enough simulator hours remaining")
+        self.hours_remaining -= hours
+        if self.hours_remaining <= 0:
+            self.package_status = 'completed'
+        self.save(update_fields=['hours_remaining', 'package_status', 'updated_at'])
+
+
+class SimulatorHoursTransfer(models.Model):
+    """
+    Transfer of simulator hours from one user to another.
+    Similar to SessionTransfer but for simulator-only packages.
+    """
+    TRANSFER_STATUS_CHOICES = (
+        ('pending', 'Pending'),
+        ('accepted', 'Accepted'),
+        ('rejected', 'Rejected'),
+        ('expired', 'Expired'),
+    )
+    
+    from_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='sent_simulator_transfers'
+    )
+    to_user_phone = models.CharField(max_length=15, help_text="Phone number of transfer recipient")
+    to_user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='received_simulator_transfers',
+        help_text="Set when recipient accepts transfer"
+    )
+    package_purchase = models.ForeignKey(
+        SimulatorPackagePurchase,
+        on_delete=models.CASCADE,
+        related_name='transfers'
+    )
+    hours = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        help_text="Number of hours to transfer"
+    )
+    transfer_status = models.CharField(max_length=10, choices=TRANSFER_STATUS_CHOICES, default='pending')
+    transfer_token = models.CharField(max_length=64, unique=True, help_text="Unique token for transfer claim")
+    notes = models.TextField(blank=True)
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    expires_at = models.DateTimeField(null=True, blank=True, help_text="Expiration date for transfer claim")
+    
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'Simulator Hours Transfer'
+        verbose_name_plural = 'Simulator Hours Transfers'
+    
+    def __str__(self):
+        return f"{self.from_user.username} → {self.to_user_phone} ({self.hours} hrs)"
+    
+    def generate_transfer_token(self):
+        """Generate a unique transfer claim token"""
+        alphabet = string.ascii_letters + string.digits
+        token = ''.join(secrets.choice(alphabet) for _ in range(32))
+        # Ensure uniqueness
+        while SimulatorHoursTransfer.objects.filter(transfer_token=token).exists():
+            token = ''.join(secrets.choice(alphabet) for _ in range(32))
+        return token

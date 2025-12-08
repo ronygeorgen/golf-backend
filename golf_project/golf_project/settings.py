@@ -47,6 +47,7 @@ INSTALLED_APPS = [
     'simulators',
     'admin_panel',
     'ghl',
+    'special_events',
 ]
 
 MIDDLEWARE = [

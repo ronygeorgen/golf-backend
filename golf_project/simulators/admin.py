@@ -3,8 +3,9 @@ from .models import Simulator, DurationPrice, SimulatorAvailability, SimulatorCr
 
 @admin.register(Simulator)
 class SimulatorAdmin(admin.ModelAdmin):
-    list_display = ('name', 'bay_number', 'hourly_price', 'is_active', 'is_coaching_bay')
+    list_display = ('name', 'bay_number', 'hourly_price', 'redirect_url', 'is_active', 'is_coaching_bay')
     list_filter = ('is_active', 'is_coaching_bay')
+    fields = ('name', 'bay_number', 'description', 'hourly_price', 'redirect_url', 'is_active', 'is_coaching_bay')
 
 @admin.register(DurationPrice)
 class DurationPriceAdmin(admin.ModelAdmin):

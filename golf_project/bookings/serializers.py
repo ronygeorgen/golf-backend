@@ -1,20 +1,25 @@
 from decimal import Decimal, ROUND_HALF_UP
 from rest_framework import serializers
+from datetime import timedelta
 from .models import Booking
 from users.serializers import UserSerializer
 from simulators.serializers import SimulatorSerializer, SimulatorCreditSerializer
-from coaching.serializers import CoachingPackageSerializer, CoachingPackagePurchaseSerializer
+from coaching.serializers import (
+    CoachingPackageSerializer, CoachingPackagePurchaseSerializer,
+    SimulatorPackagePurchaseSerializer
+)
 
 class BookingCreateSerializer(serializers.ModelSerializer):
     use_simulator_credit = serializers.BooleanField(write_only=True, required=False, default=False)
     use_organization_package = serializers.BooleanField(write_only=True, required=False, default=False)
+    use_prepaid_hours = serializers.BooleanField(write_only=True, required=False, default=None, allow_null=True)
     
     class Meta:
         model = Booking
         fields = [
             'booking_type', 'simulator', 'duration_minutes', 
             'coaching_package', 'coach', 'start_time', 'end_time', 'total_price',
-            'use_simulator_credit', 'use_organization_package'
+            'use_simulator_credit', 'use_organization_package', 'use_prepaid_hours'
         ]
     
     def __init__(self, *args, **kwargs):
@@ -35,6 +40,34 @@ class BookingCreateSerializer(serializers.ModelSerializer):
         if start_time and end_time:
             if start_time >= end_time:
                 raise serializers.ValidationError("End time must be after start time")
+            
+            # Check if facility is closed during booking time
+            from admin_panel.models import ClosedDay
+            
+            # Check start time
+            is_closed_start, message_start = ClosedDay.check_if_closed(start_time)
+            if is_closed_start:
+                raise serializers.ValidationError({
+                    'start_time': message_start or "Facility is closed at the selected start time."
+                })
+            
+            # Check end time
+            is_closed_end, message_end = ClosedDay.check_if_closed(end_time)
+            if is_closed_end:
+                raise serializers.ValidationError({
+                    'end_time': message_end or "Facility is closed at the selected end time."
+                })
+            
+            # Check if any time during the booking overlaps with closed period
+            # Check every 15 minutes during the booking
+            current_check = start_time
+            while current_check < end_time:
+                is_closed, message = ClosedDay.check_if_closed(current_check)
+                if is_closed:
+                    raise serializers.ValidationError({
+                        'start_time': message or "Facility is closed during the selected time period."
+                    })
+                current_check += timedelta(minutes=15)
             
             # Check for overlapping bookings
             conflicting_bookings = Booking.objects.filter(
@@ -96,6 +129,7 @@ class BookingCreateSerializer(serializers.ModelSerializer):
         # Remove write-only fields that are not part of the Booking model
         validated_data.pop('use_simulator_credit', None)
         validated_data.pop('use_organization_package', None)
+        validated_data.pop('use_prepaid_hours', None)
         return super().create(validated_data)
 
 class BookingSerializer(serializers.ModelSerializer):
@@ -104,6 +138,7 @@ class BookingSerializer(serializers.ModelSerializer):
     coach_details = UserSerializer(source='coach', read_only=True)
     package_details = CoachingPackageSerializer(source='coaching_package', read_only=True)
     package_purchase_details = CoachingPackagePurchaseSerializer(source='package_purchase', read_only=True)
+    simulator_package_purchase_details = SimulatorPackagePurchaseSerializer(source='simulator_package_purchase', read_only=True)
     simulator_credit_details = SimulatorCreditSerializer(source='simulator_credit_redemption', read_only=True)
     uses_simulator_credit = serializers.SerializerMethodField()
     coaching_session_price = serializers.SerializerMethodField()

@@ -1,4 +1,7 @@
 from django.db import models
+import uuid
+from django.utils import timezone
+from datetime import timedelta
 
 class Booking(models.Model):
     BOOKING_TYPE_CHOICES = (
@@ -31,6 +34,13 @@ class Booking(models.Model):
         blank=True,
         related_name='bookings'
     )
+    simulator_package_purchase = models.ForeignKey(
+        'coaching.SimulatorPackagePurchase',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='bookings'
+    )
     
     # Common fields
     start_time = models.DateTimeField()
@@ -49,3 +59,46 @@ class Booking(models.Model):
     
     def __str__(self):
         return f"{self.client.username} - {self.booking_type} - {self.start_time}"
+
+
+class TempBooking(models.Model):
+    """
+    Temporary booking record created before payment processing for simulator bookings.
+    Stores booking details until webhook confirms payment.
+    """
+    temp_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    simulator = models.ForeignKey(
+        'simulators.Simulator',
+        on_delete=models.CASCADE,
+        related_name='temp_bookings'
+    )
+    buyer_phone = models.CharField(max_length=15)
+    start_time = models.DateTimeField()
+    end_time = models.DateTimeField()
+    duration_minutes = models.IntegerField()
+    total_price = models.DecimalField(max_digits=8, decimal_places=2)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Expiration time for temp booking (default 24 hours)"
+    )
+    
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'Temporary Booking'
+        verbose_name_plural = 'Temporary Bookings'
+    
+    def __str__(self):
+        return f"TempBooking {self.temp_id} - {self.buyer_phone} - {self.start_time}"
+    
+    def save(self, *args, **kwargs):
+        if not self.expires_at:
+            self.expires_at = timezone.now() + timedelta(hours=24)
+        super().save(*args, **kwargs)
+    
+    @property
+    def is_expired(self):
+        if self.expires_at:
+            return timezone.now() > self.expires_at
+        return False

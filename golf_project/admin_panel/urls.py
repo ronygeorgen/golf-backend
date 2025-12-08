@@ -14,6 +14,7 @@ router.register(r'duration-prices', DurationPriceViewSet, basename='admin-durati
 router.register(r'packages', CoachingPackageViewSet, basename='admin-packages')
 router.register(r'bookings', BookingViewSet, basename='admin-bookings')
 router.register(r'overrides', views.AdminOverrideViewSet, basename='admin-overrides')
+router.register(r'closed-days', views.ClosedDayViewSet, basename='admin-closed-days')
 
 urlpatterns = [
     path('', include(router.urls)),

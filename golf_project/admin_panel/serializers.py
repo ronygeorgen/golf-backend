@@ -3,6 +3,7 @@ from decimal import Decimal
 from coaching.models import CoachingPackagePurchase
 from simulators.models import SimulatorCredit
 from users.models import User
+from .models import ClosedDay
 
 
 class ClientLookupMixin:
@@ -78,5 +79,215 @@ class SimulatorCreditGrantSerializer(serializers.Serializer, ClientLookupMixin):
                 attrs['hours'] = float(attrs['token_count'])  # Convert count to hours for backward compatibility
             else:
                 attrs['hours'] = 1.0  # Default to 1 hour
+        return attrs
+
+
+class ClosedDaySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ClosedDay
+        fields = [
+            'id',
+            'title',
+            'description',
+            'start_date',
+            'end_date',
+            'start_time',
+            'end_time',
+            'recurrence',
+            'is_active',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['created_at', 'updated_at']
+    
+    def validate(self, attrs):
+        from datetime import datetime, timedelta, date as date_obj
+        from django.utils import timezone
+        from users.models import StaffDayAvailability, StaffAvailability
+        from special_events.models import SpecialEvent
+        from bookings.models import Booking
+        
+        start_date = attrs.get('start_date')
+        end_date = attrs.get('end_date')
+        start_time = attrs.get('start_time')
+        end_time = attrs.get('end_time')
+        instance = self.instance  # For updates, exclude current instance
+        
+        if start_date and end_date:
+            if end_date < start_date:
+                raise serializers.ValidationError({
+                    'end_date': 'End date cannot be before start date.'
+                })
+        
+        if start_time and end_time:
+            if end_time <= start_time:
+                raise serializers.ValidationError({
+                    'end_time': 'End time must be after start time.'
+                })
+        
+        # Check for conflicts only if creating a new closed day or if dates changed
+        if start_date and end_date:
+            conflicts = []
+            current_date = start_date
+            
+            # Check each date in the range
+            while current_date <= end_date:
+                # Check staff day-specific availability
+                staff_day_availabilities = StaffDayAvailability.objects.filter(date=current_date)
+                if staff_day_availabilities.exists():
+                    staff_names = [f"{avail.staff.first_name} {avail.staff.last_name}" for avail in staff_day_availabilities[:5]]
+                    count = staff_day_availabilities.count()
+                    if count > 5:
+                        conflicts.append(f"• {count} staff members have availability set on {current_date.strftime('%Y-%m-%d')} (e.g., {', '.join(staff_names)})")
+                    else:
+                        conflicts.append(f"• Staff members have availability set on {current_date.strftime('%Y-%m-%d')}: {', '.join(staff_names)}")
+                
+                # Check staff weekly availability (for one_time, check if day of week matches weekly availability)
+                recurrence = attrs.get('recurrence', 'one_time')
+                if recurrence == 'one_time':
+                    day_of_week = current_date.weekday()
+                    weekly_availabilities = StaffAvailability.objects.filter(day_of_week=day_of_week)
+                    if weekly_availabilities.exists():
+                        staff_names = [f"{avail.staff.first_name} {avail.staff.last_name}" for avail in weekly_availabilities[:5]]
+                        count = weekly_availabilities.count()
+                        day_name = current_date.strftime('%A')
+                        if count > 5:
+                            conflicts.append(f"• {count} staff members have weekly availability on {day_name} (e.g., {', '.join(staff_names)})")
+                        else:
+                            conflicts.append(f"• Staff members have weekly availability on {day_name}: {', '.join(staff_names)}")
+                elif recurrence == 'weekly':
+                    # For weekly recurring, check if there are any bookings/events on future occurrences
+                    day_of_week = current_date.weekday()  # 0=Monday, 6=Sunday
+                    # Django week_day: 1=Sunday, 2=Monday, ..., 7=Saturday
+                    # Convert: weekday 0 (Mon) -> week_day 2, weekday 6 (Sun) -> week_day 1
+                    django_week_day = (day_of_week + 2) % 7
+                    if django_week_day == 0:
+                        django_week_day = 7
+                    
+                    # Check staff weekly availability
+                    weekly_availabilities = StaffAvailability.objects.filter(day_of_week=day_of_week)
+                    if weekly_availabilities.exists():
+                        staff_names = [f"{avail.staff.first_name} {avail.staff.last_name}" for avail in weekly_availabilities[:5]]
+                        count = weekly_availabilities.count()
+                        day_name = current_date.strftime('%A')
+                        if count > 5:
+                            conflicts.append(f"• {count} staff members have weekly availability on {day_name} (e.g., {', '.join(staff_names)})")
+                        else:
+                            conflicts.append(f"• Staff members have weekly availability on {day_name}: {', '.join(staff_names)}")
+                    
+                    # Check bookings on future occurrences (next 52 weeks)
+                    from django.utils import timezone
+                    today = timezone.now().date()
+                    future_bookings = Booking.objects.filter(
+                        start_time__date__gte=today,
+                        start_time__date__week_day=django_week_day,
+                        status__in=['confirmed', 'completed']
+                    )
+                    if future_bookings.exists():
+                        booking_count = future_bookings.count()
+                        day_name = current_date.strftime('%A')
+                        conflicts.append(f"• {booking_count} booking(s) exist on future {day_name}s (weekly recurring would conflict)")
+                    
+                    # Check special events on future occurrences (one-time and recurring)
+                    # Check one-time events on future occurrences
+                    future_events = SpecialEvent.objects.filter(
+                        is_active=True,
+                        date__gte=today,
+                        date__week_day=django_week_day
+                    )
+                    # Check weekly recurring events
+                    weekly_recurring_events = SpecialEvent.objects.filter(
+                        is_active=True,
+                        event_type='weekly',
+                        date__lte=current_date  # Event started before or on this date
+                    )
+                    # Check if weekly recurring event would occur on this day of week
+                    for event in weekly_recurring_events:
+                        if event.date.weekday() == day_of_week:
+                            future_events = future_events | SpecialEvent.objects.filter(id=event.id)
+                    
+                    if future_events.exists():
+                        event_titles = [event.title for event in future_events[:5]]
+                        count = future_events.count()
+                        day_name = current_date.strftime('%A')
+                        if count > 5:
+                            conflicts.append(f"• {count} special events scheduled on future {day_name}s (e.g., {', '.join(event_titles)})")
+                        else:
+                            conflicts.append(f"• Special events scheduled on future {day_name}s: {', '.join(event_titles)}")
+                elif recurrence == 'yearly':
+                    # For yearly recurring, check if there are any bookings/events on future occurrences
+                    month = current_date.month
+                    day = current_date.day
+                    today = timezone.now().date()
+                    # Check bookings on future occurrences (next 10 years)
+                    future_bookings = Booking.objects.filter(
+                        start_time__date__gte=today,
+                        start_time__date__month=month,
+                        start_time__date__day=day,
+                        status__in=['confirmed', 'completed']
+                    )
+                    if future_bookings.exists():
+                        booking_count = future_bookings.count()
+                        conflicts.append(f"• {booking_count} booking(s) exist on future occurrences of {current_date.strftime('%B %d')} (yearly recurring would conflict)")
+                    
+                    # Check special events on future occurrences (one-time and recurring)
+                    # Check one-time events on future occurrences
+                    future_events = SpecialEvent.objects.filter(
+                        is_active=True,
+                        date__gte=today,
+                        date__month=month,
+                        date__day=day
+                    )
+                    # Check yearly recurring events
+                    yearly_recurring_events = SpecialEvent.objects.filter(
+                        is_active=True,
+                        event_type='yearly',
+                        date__month=month,
+                        date__day=day
+                    )
+                    future_events = future_events | yearly_recurring_events
+                    
+                    if future_events.exists():
+                        event_titles = [event.title for event in future_events[:5]]
+                        count = future_events.count()
+                        if count > 5:
+                            conflicts.append(f"• {count} special events scheduled on future occurrences of {current_date.strftime('%B %d')} (e.g., {', '.join(event_titles)})")
+                        else:
+                            conflicts.append(f"• Special events scheduled on future occurrences of {current_date.strftime('%B %d')}: {', '.join(event_titles)}")
+                
+                # Check special events
+                special_events = SpecialEvent.objects.filter(
+                    is_active=True,
+                    date=current_date
+                )
+                if special_events.exists():
+                    event_titles = [event.title for event in special_events[:5]]
+                    count = special_events.count()
+                    if count > 5:
+                        conflicts.append(f"• {count} special events scheduled on {current_date.strftime('%Y-%m-%d')} (e.g., {', '.join(event_titles)})")
+                    else:
+                        conflicts.append(f"• Special events scheduled on {current_date.strftime('%Y-%m-%d')}: {', '.join(event_titles)}")
+                
+                # Check bookings (simulator and coaching)
+                bookings = Booking.objects.filter(
+                    start_time__date=current_date,
+                    status__in=['confirmed', 'completed']
+                )
+                if bookings.exists():
+                    booking_count = bookings.count()
+                    simulator_count = bookings.filter(booking_type='simulator').count()
+                    coaching_count = bookings.filter(booking_type='coaching').count()
+                    conflicts.append(f"• {booking_count} booking(s) on {current_date.strftime('%Y-%m-%d')} ({simulator_count} simulator, {coaching_count} coaching)")
+                
+                current_date += timedelta(days=1)
+            
+            # If there are conflicts, raise validation error with detailed message
+            if conflicts:
+                conflict_message = "Cannot create closed day due to existing conflicts:\n\n" + "\n".join(conflicts)
+                conflict_message += "\n\nPlease remove or reschedule these items before creating a closed day."
+                raise serializers.ValidationError({
+                    'start_date': conflict_message
+                })
+        
         return attrs
 

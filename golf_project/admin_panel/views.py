@@ -12,8 +12,9 @@ from simulators.models import Simulator, SimulatorCredit
 from bookings.models import Booking
 from users.serializers import UserSerializer, StaffSerializer, StaffAvailabilitySerializer, StaffDayAvailabilitySerializer
 from bookings.serializers import BookingSerializer
-from .serializers import CoachingSessionAdjustmentSerializer, SimulatorCreditGrantSerializer
+from .serializers import CoachingSessionAdjustmentSerializer, SimulatorCreditGrantSerializer, ClosedDaySerializer
 from simulators.serializers import SimulatorCreditSerializer
+from .models import ClosedDay
 
 class AdminDashboardViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'])
@@ -435,4 +436,122 @@ class UserViewSet(viewsets.ReadOnlyModelViewSet):
         return Response({
             'message': f'User {user.email} has been {action}.',
             'is_paused': user.is_paused
+        })
+
+
+class ClosedDayViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for managing closed days/holidays.
+    Only accessible by admin users.
+    """
+    queryset = ClosedDay.objects.all().order_by('-start_date', '-start_time')
+    serializer_class = ClosedDaySerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        """Filter closed days based on query parameters"""
+        queryset = ClosedDay.objects.all().order_by('-start_date', '-start_time')
+        
+        # Filter by active status
+        is_active = self.request.query_params.get('is_active', None)
+        if is_active is not None:
+            is_active_bool = is_active.lower() == 'true'
+            queryset = queryset.filter(is_active=is_active_bool)
+        
+        # Filter by recurrence
+        recurrence = self.request.query_params.get('recurrence', None)
+        if recurrence:
+            queryset = queryset.filter(recurrence=recurrence)
+        
+        return queryset
+    
+    def list(self, request, *args, **kwargs):
+        """List all closed days"""
+        # Check if user is admin
+        if not (request.user.role == 'admin' or request.user.is_superuser):
+            raise PermissionDenied("Administrator privileges are required.")
+        
+        return super().list(request, *args, **kwargs)
+    
+    def create(self, request, *args, **kwargs):
+        """Create a new closed day"""
+        # Check if user is admin
+        if not (request.user.role == 'admin' or request.user.is_superuser):
+            raise PermissionDenied("Administrator privileges are required.")
+        
+        return super().create(request, *args, **kwargs)
+    
+    def update(self, request, *args, **kwargs):
+        """Update a closed day"""
+        # Check if user is admin
+        if not (request.user.role == 'admin' or request.user.is_superuser):
+            raise PermissionDenied("Administrator privileges are required.")
+        
+        return super().update(request, *args, **kwargs)
+    
+    def destroy(self, request, *args, **kwargs):
+        """Delete a closed day"""
+        # Check if user is admin
+        if not (request.user.role == 'admin' or request.user.is_superuser):
+            raise PermissionDenied("Administrator privileges are required.")
+        
+        return super().destroy(request, *args, **kwargs)
+    
+    @action(detail=False, methods=['get'], url_path='check-date')
+    def check_date(self, request):
+        """
+        Check if a specific date is closed.
+        Query params: date (YYYY-MM-DD format)
+        """
+        date_str = request.query_params.get('date')
+        if not date_str:
+            return Response(
+                {'error': 'Date parameter is required (format: YYYY-MM-DD)'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            from datetime import date
+            check_date = date.fromisoformat(date_str)
+        except ValueError:
+            return Response(
+                {'error': 'Invalid date format. Use YYYY-MM-DD'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        is_closed, closure_title = ClosedDay.check_if_date_closed(check_date)
+        
+        return Response({
+            'date': date_str,
+            'is_closed': is_closed,
+            'closure_title': closure_title
+        })
+    
+    @action(detail=False, methods=['get'], url_path='check-datetime')
+    def check_datetime(self, request):
+        """
+        Check if a specific datetime is closed.
+        Query params: datetime (ISO format: YYYY-MM-DDTHH:MM:SS)
+        """
+        datetime_str = request.query_params.get('datetime')
+        if not datetime_str:
+            return Response(
+                {'error': 'Datetime parameter is required (format: YYYY-MM-DDTHH:MM:SS)'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            check_datetime = timezone.make_aware(datetime.fromisoformat(datetime_str.replace('Z', '+00:00')))
+        except (ValueError, TypeError):
+            return Response(
+                {'error': 'Invalid datetime format. Use YYYY-MM-DDTHH:MM:SS'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        is_closed, message = ClosedDay.check_if_closed(check_datetime)
+        
+        return Response({
+            'datetime': datetime_str,
+            'is_closed': is_closed,
+            'message': message
         })

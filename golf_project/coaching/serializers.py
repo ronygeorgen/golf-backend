@@ -1,7 +1,10 @@
 from rest_framework import serializers
 from django.utils import timezone
 from datetime import timedelta
-from .models import CoachingPackage, CoachingPackagePurchase, SessionTransfer, OrganizationPackageMember, TempPurchase, PendingRecipient
+from .models import (
+    CoachingPackage, CoachingPackagePurchase, SessionTransfer, OrganizationPackageMember, 
+    TempPurchase, PendingRecipient, SimulatorPackage, SimulatorPackagePurchase, SimulatorHoursTransfer
+)
 from users.serializers import UserSerializer
 from users.models import User
 
@@ -22,6 +25,16 @@ class CoachingPackageSerializer(serializers.ModelSerializer):
             required=False,
             allow_null=True
         )
+        
+        # For partial updates (PATCH), make required fields optional
+        if self.partial:
+            # Make title, description, and price optional for partial updates
+            if 'title' in self.fields:
+                self.fields['title'].required = False
+            if 'description' in self.fields:
+                self.fields['description'].required = False
+            if 'price' in self.fields:
+                self.fields['price'].required = False
     
     def validate_staff_members(self, value):
         """Filter out null, None, or invalid staff member IDs"""
@@ -386,6 +399,7 @@ class SessionTransferSerializer(serializers.ModelSerializer):
 
 class TempPurchaseSerializer(serializers.ModelSerializer):
     package_details = CoachingPackageSerializer(source='package', read_only=True)
+    simulator_package_details = serializers.SerializerMethodField()
     
     class Meta:
         model = TempPurchase
@@ -393,6 +407,8 @@ class TempPurchaseSerializer(serializers.ModelSerializer):
             'temp_id',
             'package',
             'package_details',
+            'simulator_package',
+            'simulator_package_details',
             'buyer_phone',
             'purchase_type',
             'recipients',
@@ -400,6 +416,22 @@ class TempPurchaseSerializer(serializers.ModelSerializer):
             'expires_at',
         ]
         read_only_fields = ['temp_id', 'created_at', 'expires_at']
+    
+    def get_simulator_package_details(self, obj):
+        if obj.simulator_package:
+            # Return basic serialization (SimulatorPackageSerializer is defined later in the file)
+            return {
+                'id': obj.simulator_package.id,
+                'title': obj.simulator_package.title,
+                'description': obj.simulator_package.description,
+                'price': str(obj.simulator_package.price),
+                'hours': str(obj.simulator_package.hours),
+                'redirect_url': obj.simulator_package.redirect_url,
+                'is_active': obj.simulator_package.is_active,
+                'created_at': obj.simulator_package.created_at,
+                'updated_at': obj.simulator_package.updated_at,
+            }
+        return None
     
     def validate_recipients(self, value):
         """Validate recipients list"""
@@ -452,4 +484,237 @@ class PendingRecipientSerializer(serializers.ModelSerializer):
             'updated_at',
         ]
         read_only_fields = ['status', 'created_at', 'updated_at']
+
+
+class SimulatorPackageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SimulatorPackage
+        fields = '__all__'
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # For partial updates (PATCH), make required fields optional
+        if self.partial:
+            if 'title' in self.fields:
+                self.fields['title'].required = False
+            if 'description' in self.fields:
+                self.fields['description'].required = False
+            if 'price' in self.fields:
+                self.fields['price'].required = False
+            if 'hours' in self.fields:
+                self.fields['hours'].required = False
+
+
+class SimulatorPackagePurchaseSerializer(serializers.ModelSerializer):
+    package_details = SimulatorPackageSerializer(source='package', read_only=True)
+    client_details = UserSerializer(source='client', read_only=True)
+    original_owner_details = UserSerializer(source='original_owner', read_only=True)
+    recipient_name = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = SimulatorPackagePurchase
+        fields = [
+            'id',
+            'client',
+            'client_details',
+            'package',
+            'package_details',
+            'purchase_name',
+            'hours_total',
+            'hours_remaining',
+            'notes',
+            'purchase_type',
+            'recipient_phone',
+            'recipient_name',
+            'gift_status',
+            'gift_token',
+            'original_owner',
+            'original_owner_details',
+            'package_status',
+            'purchased_at',
+            'updated_at',
+            'gift_expires_at',
+        ]
+        read_only_fields = [
+            'client', 'hours_remaining', 'purchased_at', 'updated_at',
+            'gift_token', 'original_owner', 'package_status'
+        ]
+    
+    def get_recipient_name(self, obj):
+        """Get recipient name if user exists"""
+        if obj.recipient_phone:
+            try:
+                user = User.objects.get(phone=obj.recipient_phone)
+                return user.get_full_name() or user.username
+            except User.DoesNotExist:
+                return None
+        return None
+    
+    def validate(self, attrs):
+        package = attrs.get('package')
+        hours_total = attrs.get('hours_total')
+        purchase_type = attrs.get('purchase_type', 'normal')
+        recipient_phone = attrs.get('recipient_phone')
+        request = self.context.get('request')
+        
+        if not package:
+            raise serializers.ValidationError("Package is required.")
+        
+        purchase_name = attrs.get('purchase_name')
+        if not purchase_name or not purchase_name.strip():
+            attrs['purchase_name'] = package.title if package else 'Simulator Package'
+        else:
+            attrs['purchase_name'] = purchase_name.strip()
+        
+        # Set hours from package if not provided
+        if hours_total is None or (request and getattr(request.user, 'role', None) == 'client'):
+            attrs['hours_total'] = package.hours
+            hours_total = attrs['hours_total']
+        
+        if hours_total <= 0:
+            raise serializers.ValidationError("hours_total must be greater than 0.")
+        
+        attrs['hours_remaining'] = hours_total
+        
+        # Validate gift purchase
+        if purchase_type == 'gift':
+            if not recipient_phone:
+                raise serializers.ValidationError({
+                    'recipient_phone': 'Recipient phone number is required for gift purchases.'
+                })
+            
+            # Check if recipient exists
+            try:
+                recipient = User.objects.get(phone=recipient_phone)
+                # Don't allow gifting to yourself
+                if request and request.user == recipient:
+                    raise serializers.ValidationError({
+                        'recipient_phone': 'You cannot gift a package to yourself.'
+                    })
+            except User.DoesNotExist:
+                raise serializers.ValidationError({
+                    'recipient_phone': 'Recipient with this phone number does not exist in the system.'
+                })
+        
+        # Set gift-related fields
+        if purchase_type == 'gift':
+            attrs['gift_status'] = 'pending'
+            attrs['original_owner'] = request.user if request else None
+            attrs['gift_expires_at'] = timezone.now() + timedelta(days=30)
+        else:
+            attrs['gift_status'] = None
+            attrs['package_status'] = 'active'
+        
+        return attrs
+    
+    def create(self, validated_data):
+        purchase_type = validated_data.get('purchase_type', 'normal')
+        
+        # Generate gift token if it's a gift purchase
+        if purchase_type == 'gift':
+            instance = SimulatorPackagePurchase(**validated_data)
+            instance.gift_token = instance.generate_gift_token()
+            instance.save()
+            return instance
+        
+        return super().create(validated_data)
+
+
+class SimulatorHoursTransferSerializer(serializers.ModelSerializer):
+    from_user_details = UserSerializer(source='from_user', read_only=True)
+    to_user_details = UserSerializer(source='to_user', read_only=True)
+    package_purchase_details = SimulatorPackagePurchaseSerializer(source='package_purchase', read_only=True)
+    recipient_name = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = SimulatorHoursTransfer
+        fields = [
+            'id',
+            'from_user',
+            'from_user_details',
+            'to_user_phone',
+            'to_user',
+            'to_user_details',
+            'recipient_name',
+            'package_purchase',
+            'package_purchase_details',
+            'hours',
+            'transfer_status',
+            'transfer_token',
+            'notes',
+            'created_at',
+            'updated_at',
+            'expires_at',
+        ]
+        read_only_fields = [
+            'from_user', 'to_user', 'transfer_token', 'transfer_status',
+            'created_at', 'updated_at'
+        ]
+    
+    def get_recipient_name(self, obj):
+        """Get recipient name if user exists"""
+        if obj.to_user_phone:
+            try:
+                user = User.objects.get(phone=obj.to_user_phone)
+                return user.get_full_name() or user.username
+            except User.DoesNotExist:
+                return None
+        return None
+    
+    def validate(self, attrs):
+        package_purchase = attrs.get('package_purchase')
+        hours = attrs.get('hours')
+        to_user_phone = attrs.get('to_user_phone')
+        request = self.context.get('request')
+        
+        if not package_purchase:
+            raise serializers.ValidationError("Package purchase is required.")
+        
+        # Validate package ownership
+        if request and package_purchase.client != request.user:
+            raise serializers.ValidationError({
+                'package_purchase': 'You can only transfer hours from your own packages.'
+            })
+        
+        # Validate hours
+        if hours <= 0:
+            raise serializers.ValidationError({
+                'hours': 'Hours must be greater than 0.'
+            })
+        
+        if hours > package_purchase.hours_remaining:
+            raise serializers.ValidationError({
+                'hours': f'Cannot transfer more hours than available. Available: {package_purchase.hours_remaining}'
+            })
+        
+        # Check if recipient exists
+        if to_user_phone:
+            try:
+                recipient = User.objects.get(phone=to_user_phone)
+                # Don't allow transferring to yourself
+                if request and request.user == recipient:
+                    raise serializers.ValidationError({
+                        'to_user_phone': 'You cannot transfer hours to yourself.'
+                    })
+            except User.DoesNotExist:
+                raise serializers.ValidationError({
+                    'to_user_phone': 'Recipient with this phone number does not exist in the system.'
+                })
+        
+        # Check if package can be transferred
+        if not package_purchase.can_be_transferred:
+            raise serializers.ValidationError({
+                'package_purchase': 'This package cannot be transferred. It may be depleted, completed, or have a pending gift.'
+            })
+        
+        # Transfer expires in 30 days
+        attrs['expires_at'] = timezone.now() + timedelta(days=30)
+        
+        return attrs
+    
+    def create(self, validated_data):
+        instance = SimulatorHoursTransfer(**validated_data)
+        instance.transfer_token = instance.generate_transfer_token()
+        instance.save()
+        return instance
 

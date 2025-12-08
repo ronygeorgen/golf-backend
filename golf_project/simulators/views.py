@@ -30,10 +30,8 @@ class SimulatorViewSet(viewsets.ModelViewSet):
         # Check if bay number already exists
         bay_number = serializer.validated_data.get('bay_number')
         if Simulator.objects.filter(bay_number=bay_number).exists():
-            return Response(
-                {'error': f'Bay number {bay_number} already exists'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({'bay_number': [f'Bay number {bay_number} already exists']})
         serializer.save()
     
     @action(detail=True, methods=['post'])

@@ -15,6 +15,12 @@ class Simulator(models.Model):
         blank=True,
         help_text="Hourly rate (in USD) for normal simulator sessions."
     )
+    redirect_url = models.URLField(
+        max_length=500,
+        blank=True,
+        null=True,
+        help_text="URL to redirect to after simulator booking payment"
+    )
     
     def __str__(self):
         return f"Bay {self.bay_number} - {self.name}"
