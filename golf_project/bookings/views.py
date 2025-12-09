@@ -1066,9 +1066,12 @@ class BookingViewSet(viewsets.ModelViewSet):
         ).order_by('bay_number')
         
         if not available_simulators.exists():
+            # Still try to get hourly_price even if no simulators are available
+            hourly_price = None
             return Response({
                 'available_slots': [],
-                'message': 'No simulators available'
+                'message': 'No simulators available',
+                'hourly_price': hourly_price
             })
         
         # Get simulator availability for this day of week
@@ -1183,6 +1186,13 @@ class BookingViewSet(viewsets.ModelViewSet):
         # Sort slots by start_time
         available_slots.sort(key=lambda x: x['start_time'])
         
+        # Get hourly_price from first available simulator (for price calculation on frontend)
+        # All simulators should have the same hourly_price, but we'll use the first one
+        hourly_price = None
+        if available_simulators.exists():
+            first_simulator = available_simulators.first()
+            hourly_price = float(first_simulator.hourly_price) if first_simulator.hourly_price else None
+        
         # Check if there's a special event blocking this entire date
         booking_datetime = timezone.make_aware(datetime.combine(booking_date, datetime.min.time()))
         has_special_event, event_title = self._check_special_event_conflict(booking_datetime)
@@ -1190,7 +1200,8 @@ class BookingViewSet(viewsets.ModelViewSet):
         response_data = {
             'date': date_str,
             'duration_minutes': duration_minutes,
-            'available_slots': available_slots
+            'available_slots': available_slots,
+            'hourly_price': hourly_price  # Always include hourly_price (can be None)
         }
         
         if has_special_event:
