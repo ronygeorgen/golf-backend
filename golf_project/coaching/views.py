@@ -983,15 +983,19 @@ class CreateTempPurchaseView(APIView):
                     simulator_package=simulator_package,
                     buyer_phone=buyer_phone,
                     purchase_type=purchase_type,
-                    recipients=recipients
+                    recipients=recipients if recipients else []
                 )
             else:
                 temp_purchase = TempPurchase(
                     package=package,
                     buyer_phone=buyer_phone,
                     purchase_type=purchase_type,
-                    recipients=recipients
+                    recipients=recipients if recipients else []
                 )
+            
+            # Ensure recipients is always a list (not None) for normal purchases
+            if temp_purchase.recipients is None:
+                temp_purchase.recipients = []
             
             # Validate before saving
             temp_purchase.full_clean()
@@ -1554,11 +1558,22 @@ class SimulatorPackagePurchaseViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path='my')
     def my_purchases(self, request):
         """Get current user's simulator package purchases"""
+        # Include purchases where user is the client, or where user received as accepted gift
         purchases = SimulatorPackagePurchase.objects.filter(
-            client=request.user
+            Q(client=request.user) | 
+            Q(recipient_phone=request.user.phone, gift_status='accepted')
         ).exclude(
             package_status='gifted'
         ).order_by('-purchased_at')
+        
+        # Debug: Log all purchases for this user
+        logger.info(f"User {request.user.phone} - Total simulator purchases found: {purchases.count()}")
+        for purchase in purchases:
+            logger.info(
+                f"  Purchase ID: {purchase.id}, Package: {purchase.package.title if purchase.package else 'N/A'}, "
+                f"Status: {purchase.package_status}, Client: {purchase.client.phone}, "
+                f"Gift Status: {purchase.gift_status}, Hours: {purchase.hours_remaining}/{purchase.hours_total}"
+            )
         
         serializer = self.get_serializer(purchases, many=True)
         return Response(serializer.data)

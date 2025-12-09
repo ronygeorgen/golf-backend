@@ -276,6 +276,8 @@ class TempPurchase(models.Model):
     purchase_type = models.CharField(max_length=20, choices=PURCHASE_TYPE_CHOICES, default='normal')
     recipients = models.JSONField(
         default=list,
+        blank=True,
+        null=False,
         help_text="List of recipient phone numbers (for gift/organization purchases)"
     )
     created_at = models.DateTimeField(auto_now_add=True)
@@ -300,6 +302,9 @@ class TempPurchase(models.Model):
             raise ValidationError("Either package or simulator_package must be set.")
         if self.package and self.simulator_package:
             raise ValidationError("Cannot set both package and simulator_package.")
+        # Ensure recipients is always a list (not None) for normal purchases
+        if self.recipients is None:
+            self.recipients = []
     
     def save(self, *args, **kwargs):
         from django.utils import timezone
