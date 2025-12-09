@@ -1597,8 +1597,18 @@ class BookingWebhookView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
+        # Get count parameter (duration in hours) - optional for backward compatibility
+        count = request.data.get('count')
+        if count:
+            try:
+                count = int(count)
+                logger.info(f"Booking webhook called with count: {count} hours")
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid count parameter: {count}, ignoring")
+                count = None
+        
         # Log webhook attempt
-        logger.info(f"Booking webhook called for temp_id: {temp_id_str}, phone: {request.data.get('phone')}")
+        logger.info(f"Booking webhook called for temp_id: {temp_id_str}, phone: {request.data.get('phone')}, count: {count}")
         
         # Get temp booking
         try:
@@ -1660,6 +1670,15 @@ class BookingWebhookView(APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
         
+        # Validate count if provided (should match duration_minutes / 60)
+        if count is not None:
+            expected_count = temp_booking.duration_minutes / 60
+            if count != expected_count:
+                logger.warning(
+                    f"Count mismatch: received count={count}, expected count={expected_count} "
+                    f"(duration_minutes={temp_booking.duration_minutes}). Using duration from temp_booking."
+                )
+        
         # Create the booking
         try:
             booking = Booking.objects.create(
@@ -1673,7 +1692,11 @@ class BookingWebhookView(APIView):
                 status='confirmed'
             )
             
-            logger.info(f"Simulator booking created via webhook: User {buyer.phone}, Booking ID {booking.id}, Simulator {temp_booking.simulator.id}")
+            logger.info(
+                f"Simulator booking created via webhook: User {buyer.phone}, Booking ID {booking.id}, "
+                f"Simulator {temp_booking.simulator.id}, Duration: {temp_booking.duration_minutes} minutes "
+                f"({temp_booking.duration_minutes / 60} hours), Count received: {count}"
+            )
             
             return Response({
                 'message': 'Simulator booking created successfully.',
