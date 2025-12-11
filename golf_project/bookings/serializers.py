@@ -13,13 +13,14 @@ class BookingCreateSerializer(serializers.ModelSerializer):
     use_simulator_credit = serializers.BooleanField(write_only=True, required=False, default=False)
     use_organization_package = serializers.BooleanField(write_only=True, required=False, default=False)
     use_prepaid_hours = serializers.BooleanField(write_only=True, required=False, default=None, allow_null=True)
+    simulator_count = serializers.IntegerField(write_only=True, required=False, default=1, min_value=1)
     
     class Meta:
         model = Booking
         fields = [
             'booking_type', 'simulator', 'duration_minutes', 
             'coaching_package', 'coach', 'start_time', 'end_time', 'total_price',
-            'use_simulator_credit', 'use_organization_package', 'use_prepaid_hours'
+            'use_simulator_credit', 'use_organization_package', 'use_prepaid_hours', 'simulator_count'
         ]
     
     def __init__(self, *args, **kwargs):
@@ -130,6 +131,7 @@ class BookingCreateSerializer(serializers.ModelSerializer):
         validated_data.pop('use_simulator_credit', None)
         validated_data.pop('use_organization_package', None)
         validated_data.pop('use_prepaid_hours', None)
+        validated_data.pop('simulator_count', None)
         return super().create(validated_data)
 
 class BookingSerializer(serializers.ModelSerializer):

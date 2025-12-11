@@ -75,7 +75,8 @@ class TempBooking(models.Model):
     buyer_phone = models.CharField(max_length=15)
     start_time = models.DateTimeField()
     end_time = models.DateTimeField()
-    duration_minutes = models.IntegerField()
+    duration_minutes = models.IntegerField(help_text="Duration per simulator in minutes")
+    simulator_count = models.IntegerField(default=1, help_text="Number of simulators to book")
     total_price = models.DecimalField(max_digits=8, decimal_places=2)
     created_at = models.DateTimeField(auto_now_add=True)
     expires_at = models.DateTimeField(

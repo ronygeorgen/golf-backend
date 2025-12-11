@@ -109,6 +109,7 @@ class BookingViewSet(viewsets.ModelViewSet):
         
         # Initialize temp booking response marker
         self._temp_booking_response = None
+        self._created_bookings = None
         
         try:
             self.perform_create(serializer)
@@ -116,6 +117,13 @@ class BookingViewSet(viewsets.ModelViewSet):
             # Check if temp booking was created (for payment flow)
             if hasattr(self, '_temp_booking_response') and self._temp_booking_response:
                 return Response(self._temp_booking_response, status=status.HTTP_200_OK)
+            
+            # Check if multiple bookings were created
+            if hasattr(self, '_created_bookings') and self._created_bookings:
+                # Return all created bookings
+                booking_serializer = BookingSerializer(self._created_bookings, many=True)
+                headers = self.get_success_headers(booking_serializer.data)
+                return Response(booking_serializer.data, status=status.HTTP_201_CREATED, headers=headers)
             
             # Normal booking creation
             headers = self.get_success_headers(serializer.data)
@@ -177,6 +185,34 @@ class BookingViewSet(viewsets.ModelViewSet):
                 best_choice = choice
         
         return best_choice[-1] if best_choice else None
+    
+    def _find_multiple_available_simulators(self, start_time, end_time, count):
+        """
+        Find multiple available simulators for a given time slot.
+        Returns a list of available simulators (up to count).
+        """
+        active_simulators = Simulator.objects.filter(
+            is_active=True,
+            is_coaching_bay=False
+        ).order_by('bay_number')
+        
+        available_simulators = []
+        for simulator in active_simulators:
+            if len(available_simulators) >= count:
+                break
+                
+            conflict_exists = Booking.objects.filter(
+                simulator=simulator,
+                start_time__lt=end_time,
+                end_time__gt=start_time,
+                status__in=['confirmed', 'completed'],
+                booking_type='simulator'
+            ).exists()
+            
+            if not conflict_exists:
+                available_simulators.append(simulator)
+        
+        return available_simulators if len(available_simulators) >= count else []
     
     def _consume_package_session(self, package, use_organization=False):
         """
@@ -363,6 +399,7 @@ class BookingViewSet(viewsets.ModelViewSet):
         booking_type = booking_data.get('booking_type')
         use_simulator_credit = booking_data.pop('use_simulator_credit', False)
         use_organization_package = booking_data.pop('use_organization_package', False)
+        simulator_count = booking_data.pop('simulator_count', 1)
         redeemed_credit = None
         
         with transaction.atomic():
@@ -371,15 +408,26 @@ class BookingViewSet(viewsets.ModelViewSet):
                 end_time = booking_data.get('end_time')
                 
                 if start_time and end_time:
-                    assigned_simulator = booking_data.get('simulator') or self._find_optimal_simulator(start_time, end_time)
-                    if not assigned_simulator:
-                        raise serializers.ValidationError("No simulators available for this time slot")
+                    # Handle multiple simulator bookings
+                    if simulator_count > 1:
+                        available_simulators = self._find_multiple_available_simulators(start_time, end_time, simulator_count)
+                        if len(available_simulators) < simulator_count:
+                            raise serializers.ValidationError(
+                                f"Only {len(available_simulators)} simulator(s) available for this time slot. Requested: {simulator_count}"
+                            )
+                    else:
+                        # Single simulator booking
+                        assigned_simulator = booking_data.get('simulator') or self._find_optimal_simulator(start_time, end_time)
+                        if not assigned_simulator:
+                            raise serializers.ValidationError("No simulators available for this time slot")
+                        available_simulators = [assigned_simulator]
                     
                     # User can choose: use pre-paid hours OR pay for one-off session
                     # Pre-paid hours include: credits + combo package hours + simulator-only package hours
                     from decimal import Decimal
                     duration_minutes = booking_data.get('duration_minutes', 0)
                     hours_needed = Decimal(str(duration_minutes)) / Decimal('60')
+                    total_hours_needed = hours_needed * simulator_count  # Total hours for all simulators
                     
                     package_purchase = None
                     redeemed_credit = None
@@ -387,29 +435,41 @@ class BookingViewSet(viewsets.ModelViewSet):
                     
                     if use_prepaid_hours is True:
                         # User explicitly wants to use pre-paid hours
+                        # For multiple simulators, we need total_hours_needed
                         # Try credits first, then packages
                         try:
-                            redeemed_credit = self._reserve_simulator_credit(hours_needed)
+                            # Try to reserve credit for total hours needed
+                            redeemed_credit = self._reserve_simulator_credit(total_hours_needed)
                         except serializers.ValidationError:
                             # No credits available, try package hours (combo or simulator-only)
-                            package_purchase = self._consume_package_simulator_hours(duration_minutes, use_organization=True)
+                            # For multiple simulators, we need to consume hours for each simulator
+                            # Calculate total duration in minutes for all simulators
+                            total_duration_minutes = duration_minutes * simulator_count
+                            package_purchase = self._consume_package_simulator_hours(total_duration_minutes, use_organization=True)
                             if not package_purchase:
                                 raise serializers.ValidationError("Insufficient pre-paid hours available")
                     elif use_prepaid_hours is False:
                         # User explicitly wants to pay - create temp booking and return redirect URL
-                        # Calculate price first
-                        calculated_price = self._calculate_simulator_price(
-                            assigned_simulator,
+                        # For multiple simulators, use the first simulator for redirect URL
+                        first_simulator = available_simulators[0]
+                        
+                        # Calculate total price for all simulators
+                        single_simulator_price = self._calculate_simulator_price(
+                            first_simulator,
                             duration_minutes
                         )
+                        calculated_price = single_simulator_price * simulator_count
                         
                         # Create temp booking - ensure it's saved and committed
+                        # Store simulator_count in a way that can be retrieved later
+                        # We'll use the first simulator for the temp booking
                         temp_booking = TempBooking(
-                            simulator=assigned_simulator,
+                            simulator=first_simulator,
                             buyer_phone=self.request.user.phone,
                             start_time=start_time,
                             end_time=end_time,
-                            duration_minutes=duration_minutes,
+                            duration_minutes=duration_minutes,  # Store original duration per simulator
+                            simulator_count=simulator_count,  # Store number of simulators
                             total_price=calculated_price
                         )
                         temp_booking.save()
@@ -419,10 +479,10 @@ class BookingViewSet(viewsets.ModelViewSet):
                         temp_id_str = str(temp_booking.temp_id)
                         
                         # Verify it was saved (within same transaction)
-                        logger.info(f"Temp booking created in perform_create: temp_id={temp_id_str}, buyer={temp_booking.buyer_phone}")
+                        logger.info(f"Temp booking created in perform_create: temp_id={temp_id_str}, buyer={temp_booking.buyer_phone}, simulator_count={simulator_count}")
                         
                         # Get redirect URL - must be set for paid bookings
-                        redirect_url = assigned_simulator.redirect_url
+                        redirect_url = first_simulator.redirect_url
                         if not redirect_url:
                             raise serializers.ValidationError(
                                 "This simulator does not have a redirect URL configured. Please contact support."
@@ -430,9 +490,11 @@ class BookingViewSet(viewsets.ModelViewSet):
                         
                         # Store temp_id in instance for later retrieval
                         # Use a marker to indicate we should return redirect response
+                        # Store simulator_count for webhook processing
                         self._temp_booking_response = {
                             'temp_id': temp_id_str,
                             'redirect_url': redirect_url,
+                            'simulator_count': simulator_count,  # Store count for webhook
                             'message': 'Temporary booking created successfully. Redirect to payment.'
                         }
                         
@@ -443,9 +505,12 @@ class BookingViewSet(viewsets.ModelViewSet):
                     else:
                         # Auto-detect: Try pre-paid hours first, fallback to payment
                         try:
-                            redeemed_credit = self._reserve_simulator_credit(hours_needed)
+                            # Try to reserve credit for total hours needed
+                            redeemed_credit = self._reserve_simulator_credit(total_hours_needed)
                         except serializers.ValidationError:
-                            package_purchase = self._consume_package_simulator_hours(duration_minutes, use_organization=True)
+                            # Calculate total duration in minutes for all simulators
+                            total_duration_minutes = duration_minutes * simulator_count
+                            package_purchase = self._consume_package_simulator_hours(total_duration_minutes, use_organization=True)
                     
                     # Determine if package_purchase is a combo package or simulator-only package
                     simulator_package_purchase = None
@@ -458,35 +523,63 @@ class BookingViewSet(viewsets.ModelViewSet):
                             # It's a CoachingPackagePurchase (combo package)
                             combo_package_purchase = package_purchase
                     
-                    booking = serializer.save(
-                        client=self.request.user,
-                        simulator=assigned_simulator,
-                        total_price=Decimal('0.00'),
-                        package_purchase=combo_package_purchase,
-                        simulator_package_purchase=simulator_package_purchase
-                    )
+                    # Create bookings for each simulator
+                    created_bookings = []
+                    for idx, simulator in enumerate(available_simulators):
+                        # For multiple bookings, we need to handle credits/packages differently
+                        # If using credits, we already consumed total_hours_needed, so don't consume again
+                        # If using packages, we already consumed total_duration_minutes, so don't consume again
+                        booking_instance = Booking(
+                            client=self.request.user,
+                            booking_type='simulator',
+                            simulator=simulator,
+                            start_time=start_time,
+                            end_time=end_time,
+                            duration_minutes=duration_minutes,
+                            total_price=Decimal('0.00'),
+                            package_purchase=combo_package_purchase if idx == 0 else None,  # Only link to first booking
+                            simulator_package_purchase=simulator_package_purchase if idx == 0 else None  # Only link to first booking
+                        )
+                        booking_instance.save()
+                        created_bookings.append(booking_instance)
                     
+                    # Handle credits and pricing for all bookings
                     if redeemed_credit:
                         # Credit hours were used (already consumed in _reserve_simulator_credit)
-                        booking.simulator_credit_redemption = redeemed_credit
-                        booking.total_price = 0
-                        booking.save(update_fields=['simulator_credit_redemption', 'total_price', 'updated_at'])
+                        # Link credit to first booking only
+                        created_bookings[0].simulator_credit_redemption = redeemed_credit
+                        created_bookings[0].total_price = 0
+                        created_bookings[0].save(update_fields=['simulator_credit_redemption', 'total_price', 'updated_at'])
+                        # Set other bookings to 0 price as well
+                        for booking in created_bookings[1:]:
+                            booking.total_price = 0
+                            booking.save(update_fields=['total_price', 'updated_at'])
                     elif package_purchase:
                         # Hours were consumed from package (combo or simulator-only), no charge
-                        booking.total_price = 0
+                        # Link package to first booking only
+                        created_bookings[0].total_price = 0
                         update_fields = ['total_price', 'updated_at']
                         if combo_package_purchase:
                             update_fields.append('package_purchase')
                         if simulator_package_purchase:
                             update_fields.append('simulator_package_purchase')
-                        booking.save(update_fields=update_fields)
+                        created_bookings[0].save(update_fields=update_fields)
+                        # Set other bookings to 0 price as well
+                        for booking in created_bookings[1:]:
+                            booking.total_price = 0
+                            booking.save(update_fields=['total_price', 'updated_at'])
                     else:
-                        # Charge the normal price
-                        booking.total_price = self._calculate_simulator_price(
-                            assigned_simulator,
-                            booking.duration_minutes
+                        # Charge the normal price for each booking
+                        single_price = self._calculate_simulator_price(
+                            available_simulators[0],
+                            duration_minutes
                         )
-                        booking.save(update_fields=['total_price', 'updated_at'])
+                        for booking in created_bookings:
+                            booking.total_price = single_price
+                            booking.save(update_fields=['total_price', 'updated_at'])
+                    
+                    # Store created bookings for response
+                    self._created_bookings = created_bookings
                     return
             elif booking_type == 'coaching':
                 package = booking_data.get('coaching_package')
@@ -823,7 +916,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                     credit.hours_remaining = F('hours_remaining') + hours_to_restore
                     credit.status = SimulatorCredit.Status.AVAILABLE
                     credit.redeemed_at = None
-                    credit.save(update_fields=['hours_remaining', 'status', 'redeemed_at', 'updated_at'])
+                    credit.save(update_fields=['hours_remaining', 'status', 'redeemed_at'])
                     credit.refresh_from_db(fields=['hours_remaining', 'status'])
                     restitution['simulator_credit_hours_restored'] = float(credit.hours_remaining)
                 # Case 4: Booking was paid (no package, no credit) -> issue credit with exact hours
@@ -1040,6 +1133,7 @@ class BookingViewSet(viewsets.ModelViewSet):
         
         date_str = request.query_params.get('date')
         duration_minutes = request.query_params.get('duration', 60)
+        simulator_count = request.query_params.get('simulator_count', 1)  # Default to 1 for backward compatibility
         show_bay_details = request.user.role in ['admin', 'staff']
         
         if not date_str:
@@ -1050,12 +1144,18 @@ class BookingViewSet(viewsets.ModelViewSet):
         
         try:
             duration_minutes = int(duration_minutes)
+            simulator_count = int(simulator_count)
+            if simulator_count < 1:
+                return Response(
+                    {'error': 'simulator_count must be at least 1'}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
             booking_date = datetime.strptime(date_str, '%Y-%m-%d').date()
             # Get day of week (0=Monday, 6=Sunday)
             day_of_week = booking_date.weekday()
         except (ValueError, TypeError):
             return Response(
-                {'error': 'Invalid date or duration format'}, 
+                {'error': 'Invalid date, duration, or simulator_count format'}, 
                 status=status.HTTP_400_BAD_REQUEST
             )
         
@@ -1065,14 +1165,24 @@ class BookingViewSet(viewsets.ModelViewSet):
             is_coaching_bay=False
         ).order_by('bay_number')
         
+        max_available_simulators = available_simulators.count()
+        
         if not available_simulators.exists():
             # Still try to get hourly_price even if no simulators are available
             hourly_price = None
             return Response({
                 'available_slots': [],
                 'message': 'No simulators available',
-                'hourly_price': hourly_price
+                'hourly_price': hourly_price,
+                'max_available_simulators': 0
             })
+        
+        # Validate simulator_count doesn't exceed available simulators
+        if simulator_count > max_available_simulators:
+            return Response(
+                {'error': f'simulator_count ({simulator_count}) cannot exceed available simulators ({max_available_simulators})'}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
         
         # Get simulator availability for this day of week
         simulator_availabilities = SimulatorAvailability.objects.filter(
@@ -1183,8 +1293,16 @@ class BookingViewSet(viewsets.ModelViewSet):
                     
                     current_time += timedelta(minutes=slot_interval)
         
+        # Filter slots to only include those with at least simulator_count available simulators
+        filtered_slots = []
+        for slot in available_slots:
+            bay_count = slot.get('bay_count', 0)
+            if bay_count >= simulator_count:
+                slot['available_simulator_count'] = bay_count
+                filtered_slots.append(slot)
+        
         # Sort slots by start_time
-        available_slots.sort(key=lambda x: x['start_time'])
+        filtered_slots.sort(key=lambda x: x['start_time'])
         
         # Get hourly_price from first available simulator (for price calculation on frontend)
         # All simulators should have the same hourly_price, but we'll use the first one
@@ -1200,8 +1318,10 @@ class BookingViewSet(viewsets.ModelViewSet):
         response_data = {
             'date': date_str,
             'duration_minutes': duration_minutes,
-            'available_slots': available_slots,
-            'hourly_price': hourly_price  # Always include hourly_price (can be None)
+            'simulator_count': simulator_count,
+            'available_slots': filtered_slots,
+            'hourly_price': hourly_price,  # Always include hourly_price (can be None)
+            'max_available_simulators': max_available_simulators
         }
         
         if has_special_event:
@@ -1670,38 +1790,84 @@ class BookingWebhookView(APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
         
-        # Validate count if provided (should match duration_minutes / 60)
+        # Get simulator_count from temp_booking (default to 1 for backward compatibility)
+        simulator_count = getattr(temp_booking, 'simulator_count', 1)
+        
+        # Validate count if provided (should match duration_minutes * simulator_count / 60)
         if count is not None:
-            expected_count = temp_booking.duration_minutes / 60
-            if count != expected_count:
+            expected_count = (temp_booking.duration_minutes * simulator_count) / 60
+            if abs(count - expected_count) > 0.01:  # Allow small floating point differences
                 logger.warning(
                     f"Count mismatch: received count={count}, expected count={expected_count} "
-                    f"(duration_minutes={temp_booking.duration_minutes}). Using duration from temp_booking."
+                    f"(duration_minutes={temp_booking.duration_minutes}, simulator_count={simulator_count}). Using values from temp_booking."
                 )
         
-        # Create the booking
+        # Create bookings for each simulator
         try:
-            booking = Booking.objects.create(
-                client=buyer,
-                booking_type='simulator',
-                simulator=temp_booking.simulator,
-                start_time=temp_booking.start_time,
-                end_time=temp_booking.end_time,
-                duration_minutes=temp_booking.duration_minutes,
-                total_price=temp_booking.total_price,
-                status='confirmed'
-            )
+            created_bookings = []
+            
+            # Find available simulators for this time slot
+            # Use the same logic as in BookingViewSet
+            active_simulators = Simulator.objects.filter(
+                is_active=True,
+                is_coaching_bay=False
+            ).order_by('bay_number')
+            
+            available_simulators = []
+            for simulator in active_simulators:
+                if len(available_simulators) >= simulator_count:
+                    break
+                    
+                conflict_exists = Booking.objects.filter(
+                    simulator=simulator,
+                    start_time__lt=temp_booking.end_time,
+                    end_time__gt=temp_booking.start_time,
+                    status__in=['confirmed', 'completed'],
+                    booking_type='simulator'
+                ).exists()
+                
+                if not conflict_exists:
+                    available_simulators.append(simulator)
+            
+            if len(available_simulators) < simulator_count:
+                logger.error(
+                    f"Only {len(available_simulators)} simulator(s) available for webhook booking. "
+                    f"Requested: {simulator_count}. Temp booking: {temp_booking.temp_id}"
+                )
+                return Response(
+                    {'error': f'Only {len(available_simulators)} simulator(s) available for this time slot.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Create a booking for each simulator
+            single_simulator_price = temp_booking.total_price / simulator_count
+            for simulator in available_simulators:
+                booking = Booking.objects.create(
+                    client=buyer,
+                    booking_type='simulator',
+                    simulator=simulator,
+                    start_time=temp_booking.start_time,
+                    end_time=temp_booking.end_time,
+                    duration_minutes=temp_booking.duration_minutes,
+                    total_price=single_simulator_price,
+                    status='confirmed'
+                )
+                created_bookings.append(booking)
             
             logger.info(
-                f"Simulator booking created via webhook: User {buyer.phone}, Booking ID {booking.id}, "
-                f"Simulator {temp_booking.simulator.id}, Duration: {temp_booking.duration_minutes} minutes "
+                f"Simulator booking(s) created via webhook: User {buyer.phone}, "
+                f"Booking IDs: {[b.id for b in created_bookings]}, "
+                f"Simulator count: {simulator_count}, "
+                f"Duration per simulator: {temp_booking.duration_minutes} minutes "
                 f"({temp_booking.duration_minutes / 60} hours), Count received: {count}"
             )
             
+            # Return all created bookings
+            booking_serializer = BookingSerializer(created_bookings, many=True)
             return Response({
-                'message': 'Simulator booking created successfully.',
-                'booking_id': booking.id,
-                'booking': BookingSerializer(booking).data
+                'message': f'Simulator booking(s) created successfully ({simulator_count} booking(s)).',
+                'booking_ids': [b.id for b in created_bookings],
+                'bookings': booking_serializer.data
             }, status=status.HTTP_201_CREATED)
             
         except Exception as e:
