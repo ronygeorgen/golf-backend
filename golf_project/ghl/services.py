@@ -102,7 +102,10 @@ def get_contact_custom_field_mapping(location_id):
     required_fields = [
         {"name": "Login Otp", "type": "TEXT", "key": "login_otp"},  # Changed to match your GHL
         {"name": "Last Login At", "type": "TEXT", "key": "last_login_at"},
-        {"name": "Purchase Amount", "type": "TEXT", "key": "purchase_amount"}
+        {"name": "Purchase Amount", "type": "TEXT", "key": "purchase_amount"},
+        {"name": "Total Coaching Session", "type": "TEXT", "key": "total_coaching_session"},
+        {"name": "Total Simulator Hour", "type": "TEXT", "key": "total_simulator_hour"},
+        {"name": "Last Active Package", "type": "TEXT", "key": "last_active_package"}
     ]
     
     field_mapping = {}
@@ -215,7 +218,10 @@ def set_contact_custom_values(contact_id, location_id, custom_fields_dict):
                 field_name_mapping = {
                     'login_otp': 'Login Otp',
                     'last_login_at': 'Last Login At', 
-                    'purchase_amount': 'Purchase Amount'
+                    'purchase_amount': 'Purchase Amount',
+                    'total_coaching_session': 'Total Coaching Session',
+                    'total_simulator_hour': 'Total Simulator Hour',
+                    'last_active_package': 'Last Active Package'
                 }
                 if field_name_mapping.get(key) == field_name:
                     field_id = f_id
@@ -419,8 +425,8 @@ class GHLClient:
 
     def upsert_contact(self, *, phone: str, location_id: Optional[str] = None,
                    email: Optional[str] = None, first_name: Optional[str] = None,
-                   last_name: Optional[str] = None, tags: Optional[List[str]] = None,
-                   custom_fields: Optional[dict] = None):
+                   last_name: Optional[str] = None, date_of_birth: Optional[str] = None,
+                   tags: Optional[List[str]] = None, custom_fields: Optional[dict] = None):
         """
         Create or update a contact in GHL using the correct approach.
         """
@@ -446,6 +452,9 @@ class GHLClient:
             payload["lastName"] = last_name
         if first_name and last_name:
             payload["name"] = f"{first_name} {last_name}".strip()
+        if date_of_birth:
+            # Format: YYYY-MM-DD (GHL expects ISO date format)
+            payload["dateOfBirth"] = date_of_birth
         
         # REMOVED: if tags: payload["tags"] = tags
 
@@ -535,7 +544,8 @@ def sync_user_contact(user, *, location_id: Optional[str] = None,
         logger.warning("Cannot sync user to GHL: user or phone missing")
         return None, None
 
-    resolved_location = location_id or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+    # Resolve location: use provided location_id, or user's ghl_location_id, or default from settings
+    resolved_location = location_id or getattr(user, 'ghl_location_id', None) or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
     if not resolved_location:
         logger.warning("No GHL location available for user %s", user.id)
         return None, None
@@ -551,6 +561,9 @@ def sync_user_contact(user, *, location_id: Optional[str] = None,
                 'login_otp': 'Login Otp',
                 'last_login_at': 'Last Login At',
                 'purchase_amount': 'Purchase Amount',
+                'total_coaching_session': 'Total Coaching Session',
+                'total_simulator_hour': 'Total Simulator Hour',
+                'last_active_package': 'Last Active Package',
             }
             
             for key, value in custom_fields.items():
@@ -566,11 +579,17 @@ def sync_user_contact(user, *, location_id: Optional[str] = None,
         
         # REMOVED: All tag creation logic
         
+        # Format date_of_birth for GHL (YYYY-MM-DD format)
+        date_of_birth = None
+        if hasattr(user, 'date_of_birth') and user.date_of_birth:
+            date_of_birth = user.date_of_birth.strftime('%Y-%m-%d')
+        
         response = client.upsert_contact(
             phone=user.phone,
             email=getattr(user, 'email', None),
             first_name=getattr(user, 'first_name', None),
             last_name=getattr(user, 'last_name', None),
+            date_of_birth=date_of_birth,
             location_id=resolved_location,
             tags=None,  # REMOVED: tags parameter
             custom_fields=mapped_custom_fields,
@@ -592,6 +611,204 @@ def sync_user_contact(user, *, location_id: Optional[str] = None,
         logger.error("GHL sync failed for user %s (location: %s): %s", 
                    user.id, resolved_location, exc, exc_info=True)
         return None, None
+
+
+def calculate_total_coaching_sessions(user):
+    """
+    Calculate total coaching sessions available for a user from all sources:
+    - Personal purchases
+    - Gifted packages (accepted)
+    - Transferred sessions (accepted)
+    - Organization packages where user is a member
+    """
+    from coaching.models import CoachingPackagePurchase, OrganizationPackageMember
+    from django.db.models import Sum, Q
+    
+    # Get all coaching package purchases for the user
+    # Include: personal purchases, accepted gifts, accepted transfers
+    personal_purchases = CoachingPackagePurchase.objects.filter(
+        Q(client=user) | 
+        Q(recipient_phone=user.phone, gift_status='accepted')
+    ).exclude(
+        gift_status='pending'
+    ).exclude(
+        purchase_type='organization'
+    ).filter(
+        package_status='active'
+    )
+    
+    # Sum sessions remaining from personal purchases
+    total_sessions = personal_purchases.aggregate(
+        total=Sum('sessions_remaining')
+    )['total'] or 0
+    
+    # Add organization packages where user is a member
+    org_purchase_ids = OrganizationPackageMember.objects.filter(
+        Q(phone=user.phone) | Q(user=user)
+    ).values_list('package_purchase_id', flat=True)
+    
+    org_purchases = CoachingPackagePurchase.objects.filter(
+        id__in=org_purchase_ids,
+        purchase_type='organization',
+        package_status='active',
+        sessions_remaining__gt=0
+    )
+    
+    org_sessions = org_purchases.aggregate(
+        total=Sum('sessions_remaining')
+    )['total'] or 0
+    
+    total_sessions += org_sessions
+    
+    return int(total_sessions)
+
+
+def calculate_total_simulator_hours(user):
+    """
+    Calculate total simulator hours available for a user from all sources:
+    - Simulator credits
+    - Combo packages (coaching packages with simulator hours)
+    - Simulator-only packages
+    - Includes organization packages where user is a member
+    """
+    from decimal import Decimal
+    from simulators.models import SimulatorCredit
+    from coaching.models import CoachingPackagePurchase, SimulatorPackagePurchase, OrganizationPackageMember
+    from django.db.models import Sum, Q
+    
+    total = Decimal('0')
+    
+    # 1. Simulator credits
+    credits = SimulatorCredit.objects.filter(
+        client=user,
+        status=SimulatorCredit.Status.AVAILABLE
+    ).aggregate(total=Sum('hours_remaining'))['total'] or Decimal('0')
+    total += credits
+    
+    # 2. Combo packages (coaching packages with simulator hours)
+    base_qs = CoachingPackagePurchase.objects.filter(
+        simulator_hours_remaining__gt=0,
+        package_status='active'
+    ).exclude(gift_status='pending')
+    
+    # Personal combo packages
+    personal_combo = base_qs.filter(
+        Q(client=user) | 
+        Q(recipient_phone=user.phone, gift_status='accepted')
+    ).exclude(purchase_type='organization')
+    
+    # Organization combo packages
+    org_purchase_ids = OrganizationPackageMember.objects.filter(
+        Q(phone=user.phone) | Q(user=user)
+    ).values_list('package_purchase_id', flat=True)
+    
+    org_combo = base_qs.filter(
+        id__in=org_purchase_ids,
+        purchase_type='organization'
+    )
+    
+    combo_hours = (personal_combo | org_combo).aggregate(
+        total=Sum('simulator_hours_remaining')
+    )['total'] or Decimal('0')
+    total += combo_hours
+    
+    # 3. Simulator-only packages
+    sim_base_qs = SimulatorPackagePurchase.objects.filter(
+        hours_remaining__gt=0,
+        package_status='active'
+    ).exclude(gift_status='pending')
+    
+    personal_sim = sim_base_qs.filter(
+        Q(client=user) | 
+        Q(recipient_phone=user.phone, gift_status='accepted')
+    )
+    
+    sim_hours = personal_sim.aggregate(
+        total=Sum('hours_remaining')
+    )['total'] or Decimal('0')
+    total += sim_hours
+    
+    return float(total)
+
+
+def get_last_active_package(user):
+    """
+    Get the latest package purchased by the user.
+    Can be coaching package, combo package, or simulator-only package.
+    Returns the package name/title.
+    """
+    from coaching.models import CoachingPackagePurchase, SimulatorPackagePurchase
+    from django.db.models import Q
+    
+    # Get latest coaching/combo package purchase
+    latest_coaching = CoachingPackagePurchase.objects.filter(
+        Q(client=user) | 
+        Q(recipient_phone=user.phone, gift_status='accepted')
+    ).exclude(
+        gift_status='pending'
+    ).exclude(
+        purchase_type='organization'
+    ).select_related('package').order_by('-purchased_at').first()
+    
+    # Get latest simulator-only package purchase
+    latest_simulator = SimulatorPackagePurchase.objects.filter(
+        Q(client=user) | 
+        Q(recipient_phone=user.phone, gift_status='accepted')
+    ).exclude(
+        gift_status='pending'
+    ).select_related('package').order_by('-purchased_at').first()
+    
+    # Compare and return the most recent
+    if latest_coaching and latest_simulator:
+        if latest_coaching.purchased_at > latest_simulator.purchased_at:
+            return latest_coaching.package.title
+        else:
+            return latest_simulator.package.title
+    elif latest_coaching:
+        return latest_coaching.package.title
+    elif latest_simulator:
+        return latest_simulator.package.title
+    else:
+        return ''
+
+
+def update_user_ghl_custom_fields(user, location_id=None):
+    """
+    Update GHL custom fields for a user:
+    - Total Coaching Session
+    - Total Simulator Hour
+    - Last Active Package
+    """
+    if not user or not getattr(user, 'phone', None):
+        logger.warning("Cannot update GHL custom fields: user or phone missing")
+        return False
+    
+    try:
+        total_sessions = calculate_total_coaching_sessions(user)
+        total_hours = calculate_total_simulator_hours(user)
+        last_package = get_last_active_package(user)
+        
+        custom_fields = {
+            'total_coaching_session': str(total_sessions),
+            'total_simulator_hour': str(total_hours),
+            'last_active_package': last_package
+        }
+        
+        result, contact_id = sync_user_contact(
+            user,
+            location_id=location_id,
+            custom_fields=custom_fields
+        )
+        
+        if contact_id:
+            logger.info(f"Updated GHL custom fields for user {user.id}: sessions={total_sessions}, hours={total_hours}, package={last_package}")
+            return True
+        else:
+            logger.warning(f"Failed to update GHL custom fields for user {user.id}")
+            return False
+    except Exception as exc:
+        logger.error(f"Error updating GHL custom fields for user {user.id}: {exc}", exc_info=True)
+        return False
 
 
 def debug_contact_custom_fields(contact_id, location_id):
@@ -634,7 +851,10 @@ def debug_contact_custom_fields(contact_id, location_id):
             display_names = {
                 'login_otp': 'Login OTP',
                 'last_login_at': 'Last Login At',
-                'purchase_amount': 'Purchase Amount'
+                'purchase_amount': 'Purchase Amount',
+                'total_coaching_session': 'Total Coaching Session',
+                'total_simulator_hour': 'Total Simulator Hour',
+                'last_active_package': 'Last Active Package'
             }
             
             if custom_fields:

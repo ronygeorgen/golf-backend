@@ -198,6 +198,17 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
             purchase = serializer.save(client=self.request.user)
 
         self._sync_purchase_with_ghl(purchase)
+        
+        # Update GHL custom fields for the purchase owner
+        try:
+            from ghl.services import update_user_ghl_custom_fields
+            location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            update_user_ghl_custom_fields(purchase.client, location_id=location_id)
+            # Also update original owner if different (for gifts)
+            if purchase.original_owner and purchase.original_owner != purchase.client:
+                update_user_ghl_custom_fields(purchase.original_owner, location_id=location_id)
+        except Exception as exc:
+            logger.warning("Failed to update GHL custom fields after purchase %s: %s", purchase.id, exc)
     
     @action(detail=False, methods=['get'])
     def my(self, request):
@@ -470,6 +481,16 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
         
         # Refresh purchase to get updated members
         purchase.refresh_from_db()
+        
+        # Update GHL custom fields for the new member if they have an account
+        try:
+            from ghl.services import update_user_ghl_custom_fields
+            location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            if member_user:
+                update_user_ghl_custom_fields(member_user, location_id=location_id)
+        except Exception as exc:
+            logger.warning("Failed to update GHL custom fields after adding member %s: %s", phone, exc)
+        
         serializer = self.get_serializer(purchase)
         return Response({
             'message': 'Member added successfully.',
@@ -588,27 +609,46 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
 
 
 class GiftClaimView(APIView):
-    """Handle gift claim (accept/reject)"""
+    """Handle gift claim (accept/reject) for both coaching and simulator packages"""
     permission_classes = [IsAuthenticated]
     
     def post(self, request, token):
-        purchase = get_object_or_404(
-            CoachingPackagePurchase,
-            gift_token=token,
-            gift_status='pending'
-        )
+        # Try to find coaching package purchase first
+        purchase = None
+        simulator_purchase = None
+        
+        try:
+            purchase = CoachingPackagePurchase.objects.get(
+                gift_token=token,
+                gift_status='pending'
+            )
+        except CoachingPackagePurchase.DoesNotExist:
+            try:
+                simulator_purchase = SimulatorPackagePurchase.objects.get(
+                    gift_token=token,
+                    gift_status='pending'
+                )
+            except SimulatorPackagePurchase.DoesNotExist:
+                return Response(
+                    {'error': 'Gift not found or already claimed.'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+        
+        # Use the appropriate purchase object
+        active_purchase = purchase or simulator_purchase
+        recipient_phone = active_purchase.recipient_phone
         
         # Verify recipient
-        if purchase.recipient_phone != request.user.phone:
+        if recipient_phone != request.user.phone:
             return Response(
                 {'error': 'You are not authorized to claim this gift.'},
                 status=status.HTTP_403_FORBIDDEN
             )
         
         # Check expiration
-        if purchase.gift_expires_at and purchase.gift_expires_at < timezone.now():
-            purchase.gift_status = 'expired'
-            purchase.save()
+        if active_purchase.gift_expires_at and active_purchase.gift_expires_at < timezone.now():
+            active_purchase.gift_status = 'expired'
+            active_purchase.save()
             return Response(
                 {'error': 'This gift has expired.'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -617,21 +657,42 @@ class GiftClaimView(APIView):
         action = request.data.get('action', 'accept')
         
         if action == 'accept':
-            purchase.gift_status = 'accepted'
-            purchase.package_status = 'active'
-            purchase.client = request.user
-            purchase.save()
-            serializer = CoachingPackagePurchaseSerializer(purchase)
+            active_purchase.gift_status = 'accepted'
+            active_purchase.package_status = 'active'
+            active_purchase.client = request.user
+            active_purchase.save()
+            
+            # Update GHL custom fields for both recipient and original owner
+            try:
+                from ghl.services import update_user_ghl_custom_fields
+                location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+                update_user_ghl_custom_fields(request.user, location_id=location_id)
+                if active_purchase.original_owner:
+                    update_user_ghl_custom_fields(active_purchase.original_owner, location_id=location_id)
+            except Exception as exc:
+                logger.warning("Failed to update GHL custom fields after gift acceptance %s: %s", active_purchase.id, exc)
+            
+            if purchase:
+                serializer = CoachingPackagePurchaseSerializer(purchase)
+            else:
+                serializer = SimulatorPackagePurchaseSerializer(simulator_purchase)
+            
             return Response({
                 'message': 'Gift accepted successfully.',
                 'purchase': serializer.data
             })
         elif action == 'reject':
-            purchase.gift_status = 'rejected'
-            purchase.save()
+            active_purchase.gift_status = 'rejected'
+            active_purchase.save()
+            
+            if purchase:
+                serializer = CoachingPackagePurchaseSerializer(purchase)
+            else:
+                serializer = SimulatorPackagePurchaseSerializer(simulator_purchase)
+            
             return Response({
                 'message': 'Gift rejected.',
-                'purchase': CoachingPackagePurchaseSerializer(purchase).data
+                'purchase': serializer.data
             })
         else:
             return Response(
@@ -726,6 +787,16 @@ class SessionTransferViewSet(viewsets.ModelViewSet):
             transfer.transfer_status = 'accepted'
             transfer.to_user = request.user
             transfer.save()
+            
+            # Update GHL custom fields for both sender and recipient
+            try:
+                from ghl.services import update_user_ghl_custom_fields
+                location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+                update_user_ghl_custom_fields(request.user, location_id=location_id)  # Recipient
+                if transfer.from_user:
+                    update_user_ghl_custom_fields(transfer.from_user, location_id=location_id)  # Sender
+            except Exception as exc:
+                logger.warning("Failed to update GHL custom fields after transfer acceptance %s: %s", transfer.id, exc)
             
             return Response({
                 'message': 'Transfer accepted successfully.',
@@ -835,6 +906,16 @@ class SimulatorHoursTransferViewSet(viewsets.ModelViewSet):
                 transfer.to_user = request.user
                 transfer.transfer_status = 'accepted'
                 transfer.save()
+            
+            # Update GHL custom fields for both sender and recipient
+            try:
+                from ghl.services import update_user_ghl_custom_fields
+                location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+                update_user_ghl_custom_fields(request.user, location_id=location_id)  # Recipient
+                if transfer.from_user:
+                    update_user_ghl_custom_fields(transfer.from_user, location_id=location_id)  # Sender
+            except Exception as exc:
+                logger.warning("Failed to update GHL custom fields after simulator hours transfer acceptance %s: %s", transfer.id, exc)
             
             serializer = self.get_serializer(transfer)
             return Response({
@@ -1159,6 +1240,14 @@ class PackagePurchaseWebhookView(APIView):
                     
                     logger.info(f"Simulator package purchase created via webhook: User {buyer.phone}, Package {simulator_package.id}, Purchase ID {purchase.id}")
                     
+                    # Update GHL custom fields
+                    try:
+                        from ghl.services import update_user_ghl_custom_fields
+                        location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+                        update_user_ghl_custom_fields(buyer, location_id=location_id)
+                    except Exception as exc:
+                        logger.warning("Failed to update GHL custom fields after simulator package purchase %s: %s", purchase.id, exc)
+                    
                     return Response({
                         'message': 'Simulator package purchase created successfully.',
                         'purchase_id': purchase.id,
@@ -1188,6 +1277,14 @@ class PackagePurchaseWebhookView(APIView):
                             logger.error(f"Failed to queue GHL sync for purchase {purchase.id}: {e}")
                     
                     logger.info(f"Package purchase created via webhook: User {buyer.phone}, Package {package.id}, Purchase ID {purchase.id}")
+                    
+                    # Update GHL custom fields
+                    try:
+                        from ghl.services import update_user_ghl_custom_fields
+                        location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+                        update_user_ghl_custom_fields(buyer, location_id=location_id)
+                    except Exception as exc:
+                        logger.warning("Failed to update GHL custom fields after coaching package purchase %s: %s", purchase.id, exc)
                     
                     return Response({
                         'message': 'Package purchase created successfully.',

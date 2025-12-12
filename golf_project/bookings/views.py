@@ -9,6 +9,7 @@ from rest_framework import serializers
 from django.db import transaction
 from django.db.models import Q, Sum, F
 from django.utils import timezone
+from django.conf import settings
 from datetime import datetime, timedelta
 import logging
 from .models import Booking, TempBooking
@@ -580,6 +581,15 @@ class BookingViewSet(viewsets.ModelViewSet):
                     
                     # Store created bookings for response
                     self._created_bookings = created_bookings
+                    
+                    # Update GHL custom fields after simulator booking creation
+                    try:
+                        from ghl.services import update_user_ghl_custom_fields
+                        location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+                        update_user_ghl_custom_fields(self.request.user, location_id=location_id)
+                    except Exception as exc:
+                        logger.warning("Failed to update GHL custom fields after simulator booking creation: %s", exc)
+                    
                     return
             elif booking_type == 'coaching':
                 package = booking_data.get('coaching_package')
@@ -592,6 +602,15 @@ class BookingViewSet(viewsets.ModelViewSet):
                     package_purchase=purchase,
                     total_price=booking_data.get('total_price', 0)
                 )
+                
+                # Update GHL custom fields after booking creation
+                try:
+                    from ghl.services import update_user_ghl_custom_fields
+                    location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+                    update_user_ghl_custom_fields(self.request.user, location_id=location_id)
+                except Exception as exc:
+                    logger.warning("Failed to update GHL custom fields after coaching booking creation: %s", exc)
+                
                 return
             
             serializer.save(client=self.request.user)
@@ -927,6 +946,14 @@ class BookingViewSet(viewsets.ModelViewSet):
                     )
                     restitution['simulator_credit_id'] = credit.id
                     restitution['simulator_credit_hours'] = float(credit.hours)
+        
+        # Update GHL custom fields after booking cancellation
+        try:
+            from ghl.services import update_user_ghl_custom_fields
+            location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            update_user_ghl_custom_fields(booking.client, location_id=location_id)
+        except Exception as exc:
+            logger.warning("Failed to update GHL custom fields after booking cancellation: %s", exc)
         
         serializer = self.get_serializer(booking)
         return Response({

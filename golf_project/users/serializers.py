@@ -23,6 +23,7 @@ class UserSerializer(serializers.ModelSerializer):
             'is_paused',
             'ghl_location_id',
             'ghl_contact_id',
+            'date_of_birth',
         )
         read_only_fields = (
             'id',
@@ -34,12 +35,15 @@ class UserSerializer(serializers.ModelSerializer):
             'ghl_location_id',
             'ghl_contact_id',
         )
+        extra_kwargs = {
+            'date_of_birth': {'required': False, 'allow_null': True},
+        }
 
 class StaffSerializer(serializers.ModelSerializer):
     """Serializer for creating/updating staff members by admin - auto-generates username"""
     class Meta:
         model = User
-        fields = ('id', 'username', 'email', 'phone', 'role', 'first_name', 'last_name', 'email_verified', 'phone_verified', 'is_superuser', 'is_staff')
+        fields = ('id', 'username', 'email', 'phone', 'role', 'first_name', 'last_name', 'email_verified', 'phone_verified', 'is_superuser', 'is_staff', 'date_of_birth')
         read_only_fields = ('id', 'email_verified', 'phone_verified', 'is_superuser', 'is_staff', 'username')
         extra_kwargs = {
             'email': {'required': True},
@@ -85,15 +89,24 @@ class StaffSerializer(serializers.ModelSerializer):
 class SignupSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=True, validators=[validate_password])
     password_confirm = serializers.CharField(write_only=True, required=True)
+    ghl_location_id = serializers.CharField(write_only=True, required=False, allow_blank=True, allow_null=True)
+    date_of_birth = serializers.DateField(required=False, allow_null=True)
     
     class Meta:
         model = User
-        fields = ('email', 'password', 'password_confirm', 'phone', 'first_name', 'last_name', 'role')
+        fields = ('email', 'password', 'password_confirm', 'phone', 'first_name', 'last_name', 'role', 'ghl_location_id', 'date_of_birth')
         extra_kwargs = {
             'phone': {'required': True},
             'email': {'required': True},
             'username': {'required': False, 'read_only': True},
         }
+    
+    def to_internal_value(self, data):
+        """Handle empty strings for date_of_birth before validation"""
+        # Convert empty string to None for date_of_birth
+        if 'date_of_birth' in data and (data['date_of_birth'] == '' or data['date_of_birth'] is None):
+            data['date_of_birth'] = None
+        return super().to_internal_value(data)
     
     def validate(self, attrs):
         if attrs['password'] != attrs['password_confirm']:

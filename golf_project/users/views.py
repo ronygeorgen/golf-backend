@@ -28,6 +28,40 @@ from .serializers import (
 logger = logging.getLogger(__name__)
 
 
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def list_ghl_locations(request):
+    """
+    List all active GHL locations for signup dropdown.
+    Returns location_id and display name (company_name or location_id).
+    GET /api/auth/ghl-locations/
+    """
+    try:
+        from ghl.models import GHLLocation
+        locations = GHLLocation.objects.filter(status='active').order_by('company_name', 'location_id')
+        
+        location_list = []
+        for location in locations:
+            display_name = location.company_name if location.company_name else location.location_id
+            location_list.append({
+                'location_id': location.location_id,
+                'display_name': display_name,
+                'company_name': location.company_name or '',
+            })
+        
+        return Response({
+            'locations': location_list,
+            'count': len(location_list)
+        }, status=status.HTTP_200_OK)
+    except Exception as exc:
+        logger.error("Failed to list GHL locations: %s", exc, exc_info=True)
+        return Response({
+            'error': 'Failed to fetch locations',
+            'locations': [],
+            'count': 0
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
 @api_view(['POST'])
 @permission_classes([AllowAny])
 def request_otp(request):
@@ -70,12 +104,10 @@ def request_otp(request):
         user.otp_code = otp
         user.otp_created_at = timezone.now()
         
-        # Save default location ID to user
-        resolved_location = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
-        if resolved_location:
-            user.ghl_location_id = resolved_location
+        # Use user's existing ghl_location_id if set, otherwise don't change it
+        resolved_location = user.ghl_location_id or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
         
-        user.save(update_fields=['otp_code', 'otp_created_at', 'ghl_location_id'] if resolved_location else ['otp_code', 'otp_created_at'])
+        user.save(update_fields=['otp_code', 'otp_created_at'])
         
         # Sync with GHL when OTP is requested (create/update contact with OTP code) - via Celery
         if resolved_location:
@@ -154,15 +186,10 @@ def verify_otp(request):
                 user.otp_created_at = None
                 user.phone_verified = True
                 
-                # Save default location ID to user
-                resolved_location = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
-                if resolved_location:
-                    user.ghl_location_id = resolved_location
+                # Use user's existing ghl_location_id if set
+                resolved_location = user.ghl_location_id or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
                 
-                update_fields = ['otp_code', 'otp_created_at', 'phone_verified']
-                if resolved_location:
-                    update_fields.append('ghl_location_id')
-                user.save(update_fields=update_fields)
+                user.save(update_fields=['otp_code', 'otp_created_at', 'phone_verified'])
                 
                 logger.info("OTP verification for user %s (phone: %s)", user.id, user.phone)
                 
@@ -174,9 +201,10 @@ def verify_otp(request):
                     try:
                         if CELERY_AVAILABLE and sync_user_contact_task:
                             # Queue async task to update last_login_at
+                            # Don't pass location_id - let sync_user_contact use user's ghl_location_id
                             sync_user_contact_task.delay(
                                 user.id,
-                                location_id=resolved_location,
+                                location_id=None,  # Will use user's ghl_location_id
                                 tags=None,  # REMOVED: tags
                                 custom_fields={
                                     'last_login_at': timezone.now().isoformat(),
@@ -188,7 +216,7 @@ def verify_otp(request):
                             from ghl.services import sync_user_contact
                             sync_user_contact(
                                 user,
-                                location_id=resolved_location,
+                                location_id=None,  # Will use user's ghl_location_id
                                 tags=None,  # REMOVED: tags
                                 custom_fields={
                                     'last_login_at': timezone.now().isoformat(),
@@ -199,11 +227,14 @@ def verify_otp(request):
                         logger.warning("Failed to update GHL for OTP verification %s: %s", user.phone, exc)
                         # Don't fail the login if GHL sync fails
                 
-                return Response({
+                response_data = {
                     'token': token.key,
                     'user': UserSerializer(user).data,
-                    'message': 'Login successful'
-                })
+                    'message': 'Login successful',
+                    'needs_dob': not bool(user.date_of_birth)  # True if DOB is missing
+                }
+                
+                return Response(response_data)
             else:
                 return Response({
                     'error': 'Invalid or expired OTP'
@@ -379,10 +410,25 @@ def signup(request):
         user.otp_code = otp
         user.otp_created_at = timezone.now()
         
-        # Save default location ID to user
-        resolved_location = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
-        if resolved_location:
-            user.ghl_location_id = resolved_location
+        # Save location ID to user (from request or default)
+        location_id = request.data.get('ghl_location_id')
+        if location_id:
+            # Validate that the location exists and is active
+            from ghl.models import GHLLocation
+            try:
+                location = GHLLocation.objects.get(location_id=location_id, status='active')
+                user.ghl_location_id = location_id
+            except GHLLocation.DoesNotExist:
+                logger.warning("Invalid location_id %s provided during signup for user %s", location_id, user.id)
+                # Fallback to default if provided location is invalid
+                resolved_location = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+                if resolved_location:
+                    user.ghl_location_id = resolved_location
+        else:
+            # Fallback to default location if not provided
+            resolved_location = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            if resolved_location:
+                user.ghl_location_id = resolved_location
         
         user.save()
         
@@ -404,8 +450,8 @@ def signup(request):
         
         # Sync user to GHL (create contact if doesn't exist)
         try:
-            # Use default location from settings
-            resolved_location = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            # Use user's ghl_location_id if set, otherwise fallback to default
+            resolved_location = user.ghl_location_id or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
             
             if resolved_location:
                 if CELERY_AVAILABLE and sync_user_contact_task:
@@ -481,12 +527,157 @@ def logout(request):
             'error': 'Error during logout'
         }, status=status.HTTP_400_BAD_REQUEST)
 
-@api_view(['GET'])
+@api_view(['GET', 'PUT'])
 @permission_classes([IsAuthenticated])
 def profile(request):
-    """Get current user profile"""
-    serializer = UserSerializer(request.user)
-    return Response(serializer.data, status=status.HTTP_200_OK)
+    """Get or update current user profile"""
+    user = request.user
+    
+    if request.method == 'GET':
+        serializer = UserSerializer(user)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+    
+    elif request.method == 'PUT':
+        # Get current phone to check if it changed
+        old_phone = user.phone
+        new_phone = request.data.get('phone', old_phone)
+        phone_changed = old_phone != new_phone
+        
+        # If phone changed, check if new phone already exists
+        if phone_changed:
+            if User.objects.filter(phone=new_phone).exclude(id=user.id).exists():
+                return Response({
+                    'error': 'This phone number is already registered to another account.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+            # Reset phone verification when phone changes
+            user.phone_verified = False
+        
+        # Check if DOB is being updated
+        old_dob = user.date_of_birth
+        new_dob = request.data.get('date_of_birth')
+        dob_changed = False
+        if new_dob:
+            try:
+                from datetime import datetime
+                new_dob_date = datetime.strptime(new_dob, '%Y-%m-%d').date()
+                dob_changed = old_dob != new_dob_date
+            except (ValueError, TypeError):
+                pass
+        
+        # Update user fields
+        serializer = UserSerializer(user, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            
+            # Sync to GHL if any standard fields changed (including DOB)
+            try:
+                resolved_location = getattr(user, 'ghl_location_id', None) or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+                if resolved_location:
+                    if CELERY_AVAILABLE and sync_user_contact_task:
+                        # Queue async task to sync with GHL
+                        sync_user_contact_task.delay(
+                            user.id,
+                            location_id=None,  # Will use user's ghl_location_id
+                            tags=None,
+                            custom_fields=None,
+                        )
+                        logger.info("Queued GHL sync task for user %s (profile update)", user.id)
+                    else:
+                        # Fallback to synchronous call if Celery not available
+                        from ghl.services import sync_user_contact
+                        sync_user_contact(
+                            user,
+                            location_id=None,  # Will use user's ghl_location_id
+                            tags=None,
+                            custom_fields=None,
+                        )
+                        logger.info("Successfully synced profile for user %s to GHL", user.id)
+            except Exception as exc:
+                logger.warning("Failed to sync profile to GHL for user %s: %s", user.id, exc)
+                # Don't fail the profile update if GHL sync fails
+            
+            response_data = {
+                'message': 'Profile updated successfully',
+                'user': serializer.data
+            }
+            
+            # If phone changed, inform user they need to logout and login with new phone
+            if phone_changed:
+                response_data['phone_changed'] = True
+                response_data['message'] = 'Profile updated. Please logout and login with your new phone number to verify it.'
+            
+            return Response(response_data, status=status.HTTP_200_OK)
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+@api_view(['PUT'])
+@permission_classes([IsAuthenticated])
+def update_dob(request):
+    """Update user's date of birth"""
+    user = request.user
+    date_of_birth = request.data.get('date_of_birth')
+    
+    if not date_of_birth:
+        return Response({
+            'error': 'date_of_birth is required'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    try:
+        from datetime import datetime
+        # Validate date format
+        dob = datetime.strptime(date_of_birth, '%Y-%m-%d').date()
+        
+        # Validate date is not in the future
+        from django.utils import timezone
+        if dob > timezone.now().date():
+            return Response({
+                'error': 'Date of birth cannot be in the future'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        user.date_of_birth = dob
+        user.save(update_fields=['date_of_birth'])
+        
+        # Sync DOB to GHL
+        try:
+            resolved_location = getattr(user, 'ghl_location_id', None) or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            if resolved_location:
+                if CELERY_AVAILABLE and sync_user_contact_task:
+                    # Queue async task to sync with GHL
+                    sync_user_contact_task.delay(
+                        user.id,
+                        location_id=None,  # Will use user's ghl_location_id
+                        tags=None,
+                        custom_fields=None,
+                    )
+                    logger.info("Queued GHL sync task for user %s (DOB update)", user.id)
+                else:
+                    # Fallback to synchronous call if Celery not available
+                    from ghl.services import sync_user_contact
+                    sync_user_contact(
+                        user,
+                        location_id=None,  # Will use user's ghl_location_id
+                        tags=None,
+                        custom_fields=None,
+                    )
+                    logger.info("Successfully synced DOB for user %s to GHL", user.id)
+        except Exception as exc:
+            logger.warning("Failed to sync DOB to GHL for user %s: %s", user.id, exc)
+            # Don't fail the DOB update if GHL sync fails
+        
+        serializer = UserSerializer(user)
+        return Response({
+            'message': 'Date of birth updated successfully',
+            'user': serializer.data
+        }, status=status.HTTP_200_OK)
+    except ValueError:
+        return Response({
+            'error': 'Invalid date format. Use YYYY-MM-DD'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    except Exception as e:
+        logger.error("Error updating DOB for user %s: %s", user.id, e)
+        return Response({
+            'error': 'Failed to update date of birth'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 @api_view(['GET'])
 @permission_classes([AllowAny])

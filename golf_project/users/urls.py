@@ -15,5 +15,11 @@ urlpatterns = [
     # OTP authentication endpoints
     path('request-otp/', views.request_otp, name='request_otp'),
     path('verify-otp/', views.verify_otp, name='verify_otp'),
+    
+    # GHL locations endpoint for signup
+    path('ghl-locations/', views.list_ghl_locations, name='list_ghl_locations'),
+    
+    # Profile endpoints
+    path('update-dob/', views.update_dob, name='update_dob'),
 ] + router.urls
 
