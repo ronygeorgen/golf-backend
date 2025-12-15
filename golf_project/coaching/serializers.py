@@ -10,10 +10,21 @@ from users.models import User
 
 class CoachingPackageSerializer(serializers.ModelSerializer):
     staff_members_details = UserSerializer(source='staff_members', many=True, read_only=True)
+    category = serializers.SerializerMethodField()
     
     class Meta:
         model = CoachingPackage
         fields = '__all__'
+    
+    def get_category(self, obj):
+        """
+        Determine package category:
+        - 'coaching': coaching-only package (no simulator hours)
+        - 'combo': combo package (has simulator hours)
+        """
+        if obj.simulator_hours and float(obj.simulator_hours) > 0:
+            return 'combo'
+        return 'coaching'
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -487,9 +498,17 @@ class PendingRecipientSerializer(serializers.ModelSerializer):
 
 
 class SimulatorPackageSerializer(serializers.ModelSerializer):
+    category = serializers.SerializerMethodField()
+    
     class Meta:
         model = SimulatorPackage
         fields = '__all__'
+    
+    def get_category(self, obj):
+        """
+        Simulator packages are always 'simulator' type.
+        """
+        return 'simulator'
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

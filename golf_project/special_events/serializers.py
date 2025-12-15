@@ -21,7 +21,7 @@ class SpecialEventSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'title', 'description', 'event_type', 'date', 
             'start_time', 'end_time', 'max_capacity', 'is_active',
-            'price', 'show_price',
+            'price', 'show_price', 'location_id',
             'registered_count', 'showed_up_count', 'available_spots',
             'is_full', 'user_registered', 'user_registration_status',
             'next_occurrence_date', 'created_at', 'updated_at'
@@ -152,7 +152,8 @@ class SpecialEventSerializer(serializers.ModelSerializer):
             
             # Create datetime for checking
             check_datetime = timezone.make_aware(dt.combine(date, start_time))
-            is_closed, message = ClosedDay.check_if_closed(check_datetime)
+            location_id = self.context.get('location_id') if hasattr(self, 'context') else None
+            is_closed, message = ClosedDay.check_if_closed(check_datetime, location_id=location_id)
             
             if is_closed:
                 raise serializers.ValidationError({

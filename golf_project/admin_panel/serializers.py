@@ -95,6 +95,7 @@ class ClosedDaySerializer(serializers.ModelSerializer):
             'end_time',
             'recurrence',
             'is_active',
+            'location_id',
             'created_at',
             'updated_at',
         ]

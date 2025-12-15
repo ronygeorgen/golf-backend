@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from django.utils import timezone
 from datetime import datetime, timedelta
+from users.utils import get_location_id_from_request
 from .models import SpecialEvent, SpecialEventRegistration
 from .serializers import SpecialEventSerializer, SpecialEventRegistrationSerializer
 
@@ -13,7 +14,13 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     
     def get_queryset(self):
+        from users.utils import get_location_id_from_request
+        location_id = get_location_id_from_request(self.request)
         queryset = SpecialEvent.objects.filter(is_active=True)
+        
+        # Filter by location_id
+        if location_id:
+            queryset = queryset.filter(location_id=location_id)
         
         # Admin/staff can see all events, clients see only future events
         if self.request.user.role not in ['admin', 'staff']:
@@ -26,6 +33,7 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
     def get_serializer_context(self):
         context = super().get_serializer_context()
         context['request'] = self.request
+        context['location_id'] = get_location_id_from_request(self.request)
         
         # For admin list view, check if we need to show upcoming or conducted events
         view_type = self.request.query_params.get('view_type', 'upcoming')  # 'upcoming' or 'conducted'
@@ -233,10 +241,24 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
         serializer = SpecialEventRegistrationSerializer(registration)
         return Response(serializer.data)
     
+    def perform_create(self, serializer):
+        """Set location_id when creating event"""
+        location_id = get_location_id_from_request(self.request)
+        if location_id:
+            serializer.save(location_id=location_id)
+        else:
+            serializer.save()
+    
     @action(detail=True, methods=['get'])
     def registrations(self, request, pk=None):
         """Get all registrations for this event (admin/staff only) - show all registrations including cancelled"""
         event = self.get_object()
+        
+        # Verify event belongs to admin's location
+        location_id = get_location_id_from_request(request)
+        if location_id and event.location_id != location_id:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("You can only view registrations for events in your location.")
         
         if request.user.role not in ['admin', 'staff']:
             return Response(

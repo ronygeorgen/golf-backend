@@ -262,7 +262,8 @@ class StaffDayAvailabilitySerializer(serializers.ModelSerializer):
             
             # Create datetime for checking
             check_datetime = timezone.make_aware(dt.combine(date, start_time))
-            is_closed, message = ClosedDay.check_if_closed(check_datetime)
+            location_id = self.context.get('location_id') if hasattr(self, 'context') else None
+            is_closed, message = ClosedDay.check_if_closed(check_datetime, location_id=location_id)
             
             if is_closed:
                 raise serializers.ValidationError({

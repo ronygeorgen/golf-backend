@@ -26,13 +26,34 @@ class SimulatorViewSet(viewsets.ModelViewSet):
             permission_classes = [IsAuthenticated, IsAdminUser]  # Admin only for create/update/delete
         return [permission() for permission in permission_classes]
     
+    def get_queryset(self):
+        from users.utils import get_location_id_from_request
+        location_id = get_location_id_from_request(self.request)
+        queryset = Simulator.objects.all().order_by('bay_number')
+        
+        # Filter by location_id
+        if location_id:
+            queryset = queryset.filter(location_id=location_id)
+        
+        return queryset
+    
     def perform_create(self, serializer):
-        # Check if bay number already exists
+        from users.utils import get_location_id_from_request
+        location_id = get_location_id_from_request(self.request)
+        
+        # Check if bay number already exists for this location
         bay_number = serializer.validated_data.get('bay_number')
-        if Simulator.objects.filter(bay_number=bay_number).exists():
-            from rest_framework.exceptions import ValidationError
-            raise ValidationError({'bay_number': [f'Bay number {bay_number} already exists']})
-        serializer.save()
+        if location_id:
+            if Simulator.objects.filter(bay_number=bay_number, location_id=location_id).exists():
+                from rest_framework.exceptions import ValidationError
+                raise ValidationError({'bay_number': [f'Bay number {bay_number} already exists for this location']})
+            serializer.save(location_id=location_id)
+        else:
+            # Fallback: check globally if no location_id
+            if Simulator.objects.filter(bay_number=bay_number).exists():
+                from rest_framework.exceptions import ValidationError
+                raise ValidationError({'bay_number': [f'Bay number {bay_number} already exists']})
+            serializer.save()
     
     @action(detail=True, methods=['post'])
     def toggle_active(self, request, pk=None):
@@ -46,14 +67,27 @@ class SimulatorViewSet(viewsets.ModelViewSet):
     
     @action(detail=False, methods=['get'])
     def active_simulators(self, request):
+        from users.utils import get_location_id_from_request
+        location_id = get_location_id_from_request(request)
         active_simulators = Simulator.objects.filter(is_active=True)
+        
+        if location_id:
+            active_simulators = active_simulators.filter(location_id=location_id)
+        
         serializer = self.get_serializer(active_simulators, many=True)
         return Response(serializer.data)
     
     @action(detail=True, methods=['get', 'put'], url_path='availability')
     def availability(self, request, pk=None):
         """Get or update simulator availability"""
+        from users.utils import get_location_id_from_request
         simulator = self.get_object()
+        
+        # Verify simulator belongs to admin's location
+        location_id = get_location_id_from_request(request)
+        if location_id and simulator.location_id != location_id:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("You can only manage availability for simulators in your location.")
         
         if request.method == 'GET':
             # Get all recurring weekly availability
@@ -112,37 +146,40 @@ class SimulatorViewSet(viewsets.ModelViewSet):
                 if day_of_week is not None:
                     try:
                         day_of_week = int(day_of_week)
-                        # Use serializer to handle timezone conversion
-                        serializer_data = {**avail_data, 'simulator': simulator.id, 'day_of_week': day_of_week}
-                        serializer = SimulatorAvailabilitySerializer(data=serializer_data)
-                        if serializer.is_valid():
-                            availability, created = SimulatorAvailability.objects.update_or_create(
-                                simulator=simulator,
-                                day_of_week=day_of_week,
-                                start_time=serializer.validated_data.get('start_time'),
-                                defaults={
-                                    'end_time': serializer.validated_data.get('end_time'),
-                                }
-                            )
-                            updated_availability.append(availability)
-                        else:
-                            # Fallback to direct assignment if serializer fails
-                            print(f"Serializer validation failed: {serializer.errors}")
+                        # Parse start_time
+                        start_time_str = avail_data.get('start_time', '09:00')
+                        try:
+                            start_time_obj = datetime.strptime(start_time_str, '%H:%M').time()
+                        except ValueError:
+                            # Try with seconds if present
                             try:
-                                start_time_obj = datetime.strptime(avail_data.get('start_time', '09:00'), '%H:%M').time()
-                                end_time_obj = datetime.strptime(avail_data.get('end_time', '17:00'), '%H:%M').time()
-                                availability, created = SimulatorAvailability.objects.update_or_create(
-                                    simulator=simulator,
-                                    day_of_week=day_of_week,
-                                    start_time=start_time_obj,
-                                    defaults={
-                                        'end_time': end_time_obj,
-                                    }
-                                )
-                                updated_availability.append(availability)
+                                start_time_obj = datetime.strptime(start_time_str, '%H:%M:%S').time()
                             except ValueError:
-                                pass
-                    except (ValueError, TypeError):
+                                start_time_obj = datetime.strptime('09:00', '%H:%M').time()
+                        
+                        # Parse end_time
+                        end_time_str = avail_data.get('end_time', '17:00')
+                        try:
+                            end_time_obj = datetime.strptime(end_time_str, '%H:%M').time()
+                        except ValueError:
+                            try:
+                                end_time_obj = datetime.strptime(end_time_str, '%H:%M:%S').time()
+                            except ValueError:
+                                end_time_obj = datetime.strptime('17:00', '%H:%M').time()
+                        
+                        # Use update_or_create directly to handle uniqueness constraint properly
+                        # This avoids serializer validation issues with unique constraints
+                        availability, created = SimulatorAvailability.objects.update_or_create(
+                            simulator=simulator,
+                            day_of_week=day_of_week,
+                            start_time=start_time_obj,
+                            defaults={
+                                'end_time': end_time_obj,
+                            }
+                        )
+                        updated_availability.append(availability)
+                    except (ValueError, TypeError) as e:
+                        print(f"Error processing availability data: {e}")
                         pass
             
             # Return updated availability list

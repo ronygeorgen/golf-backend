@@ -4,7 +4,8 @@ from django.utils import timezone
 
 class Simulator(models.Model):
     name = models.CharField(max_length=100)
-    bay_number = models.IntegerField(unique=True)
+    bay_number = models.IntegerField()
+    location_id = models.CharField(max_length=100, blank=True, null=True, help_text="GHL location ID for this simulator")
     is_active = models.BooleanField(default=True)
     is_coaching_bay = models.BooleanField(default=False)
     description = models.TextField(blank=True)
@@ -21,6 +22,9 @@ class Simulator(models.Model):
         null=True,
         help_text="URL to redirect to after simulator booking payment"
     )
+    
+    class Meta:
+        unique_together = [['bay_number', 'location_id']]  # Bay number must be unique per location
     
     def __str__(self):
         return f"Bay {self.bay_number} - {self.name}"

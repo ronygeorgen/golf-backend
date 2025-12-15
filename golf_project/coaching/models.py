@@ -9,6 +9,7 @@ class CoachingPackage(models.Model):
     title = models.CharField(max_length=200)
     description = models.TextField()
     price = models.DecimalField(max_digits=8, decimal_places=2)
+    location_id = models.CharField(max_length=100, blank=True, null=True, help_text="GHL location ID for this package")
     staff_members = models.ManyToManyField('users.User', limit_choices_to={'role': 'staff'})
     session_count = models.PositiveIntegerField(default=1, help_text="How many coaching sessions are included.")
     session_duration_minutes = models.PositiveIntegerField(default=60, help_text="Duration of a single session in minutes.")
@@ -274,6 +275,13 @@ class TempPurchase(models.Model):
     )
     buyer_phone = models.CharField(max_length=15)
     purchase_type = models.CharField(max_length=20, choices=PURCHASE_TYPE_CHOICES, default='normal')
+    package_type = models.CharField(
+        max_length=20,
+        choices=[('coaching', 'Coaching'), ('simulator', 'Simulator')],
+        null=True,
+        blank=True,
+        help_text="Type of package: 'coaching' or 'simulator'. Explicitly stored to avoid ambiguity when both package types exist with same ID."
+    )
     recipients = models.JSONField(
         default=list,
         blank=True,
@@ -389,6 +397,7 @@ class SimulatorPackage(models.Model):
     title = models.CharField(max_length=200)
     description = models.TextField()
     price = models.DecimalField(max_digits=8, decimal_places=2)
+    location_id = models.CharField(max_length=100, blank=True, null=True, help_text="GHL location ID for this simulator package")
     hours = models.DecimalField(
         max_digits=6,
         decimal_places=2,

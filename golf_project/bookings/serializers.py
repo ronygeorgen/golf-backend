@@ -14,13 +14,15 @@ class BookingCreateSerializer(serializers.ModelSerializer):
     use_organization_package = serializers.BooleanField(write_only=True, required=False, default=False)
     use_prepaid_hours = serializers.BooleanField(write_only=True, required=False, default=None, allow_null=True)
     simulator_count = serializers.IntegerField(write_only=True, required=False, default=1, min_value=1)
+    location_id = serializers.CharField(required=False, allow_null=True, allow_blank=True)  # Allow location_id to be passed or set in perform_create
     
     class Meta:
         model = Booking
         fields = [
             'booking_type', 'simulator', 'duration_minutes', 
             'coaching_package', 'coach', 'start_time', 'end_time', 'total_price',
-            'use_simulator_credit', 'use_organization_package', 'use_prepaid_hours', 'simulator_count'
+            'use_simulator_credit', 'use_organization_package', 'use_prepaid_hours', 'simulator_count',
+            'location_id'  # Include location_id so it can be saved during booking creation
         ]
     
     def __init__(self, *args, **kwargs):
@@ -44,16 +46,17 @@ class BookingCreateSerializer(serializers.ModelSerializer):
             
             # Check if facility is closed during booking time
             from admin_panel.models import ClosedDay
+            location_id = self.context.get('location_id') if hasattr(self, 'context') else None
             
             # Check start time
-            is_closed_start, message_start = ClosedDay.check_if_closed(start_time)
+            is_closed_start, message_start = ClosedDay.check_if_closed(start_time, location_id=location_id)
             if is_closed_start:
                 raise serializers.ValidationError({
                     'start_time': message_start or "Facility is closed at the selected start time."
                 })
             
             # Check end time
-            is_closed_end, message_end = ClosedDay.check_if_closed(end_time)
+            is_closed_end, message_end = ClosedDay.check_if_closed(end_time, location_id=location_id)
             if is_closed_end:
                 raise serializers.ValidationError({
                     'end_time': message_end or "Facility is closed at the selected end time."
@@ -63,7 +66,7 @@ class BookingCreateSerializer(serializers.ModelSerializer):
             # Check every 15 minutes during the booking
             current_check = start_time
             while current_check < end_time:
-                is_closed, message = ClosedDay.check_if_closed(current_check)
+                is_closed, message = ClosedDay.check_if_closed(current_check, location_id=location_id)
                 if is_closed:
                     raise serializers.ValidationError({
                         'start_time': message or "Facility is closed during the selected time period."
@@ -132,6 +135,7 @@ class BookingCreateSerializer(serializers.ModelSerializer):
         validated_data.pop('use_organization_package', None)
         validated_data.pop('use_prepaid_hours', None)
         validated_data.pop('simulator_count', None)
+        # location_id should be in validated_data if provided, and will be saved by super().create()
         return super().create(validated_data)
 
 class BookingSerializer(serializers.ModelSerializer):

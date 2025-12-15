@@ -12,6 +12,7 @@ class SpecialEvent(models.Model):
         ('yearly', 'Yearly Recurring'),
     )
     
+    location_id = models.CharField(max_length=100, blank=True, null=True, help_text="GHL location ID for this event")
     title = models.CharField(max_length=200)
     description = models.TextField(blank=True)
     event_type = models.CharField(max_length=20, choices=EVENT_TYPE_CHOICES, default='one_time')

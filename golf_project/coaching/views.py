@@ -73,7 +73,13 @@ class CoachingPackageViewSet(viewsets.ModelViewSet):
         return [permission() for permission in permission_classes]
     
     def get_queryset(self):
+        from users.utils import get_location_id_from_request
+        location_id = get_location_id_from_request(self.request)
         queryset = CoachingPackage.objects.all().order_by('-id')
+        
+        # Filter by location_id
+        if location_id:
+            queryset = queryset.filter(location_id=location_id)
         
         # Filter by active status if provided
         is_active = self.request.query_params.get('is_active')
@@ -88,7 +94,9 @@ class CoachingPackageViewSet(viewsets.ModelViewSet):
         return queryset.select_related().prefetch_related('staff_members')
     
     def perform_create(self, serializer):
-        package = serializer.save()
+        from users.utils import get_location_id_from_request
+        location_id = get_location_id_from_request(self.request)
+        package = serializer.save(location_id=location_id)
         
         # Log package creation
         print(f"New coaching package created: {package.title} by {self.request.user}")
@@ -141,11 +149,15 @@ class CoachingPackageViewSet(viewsets.ModelViewSet):
     
     @action(detail=False, methods=['get'])
     def active_packages(self, request):
+        # Get filtered queryset (includes location_id filtering from get_queryset)
+        queryset = self.get_queryset()
+        
         # Only return packages that have a redirect_url (for client-side)
-        active_packages = CoachingPackage.objects.filter(
+        active_packages = queryset.filter(
             is_active=True,
             redirect_url__isnull=False
         ).exclude(redirect_url='')
+        
         serializer = self.get_serializer(active_packages, many=True)
         return Response(serializer.data)
 
@@ -155,12 +167,18 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     
     def get_queryset(self):
+        from users.utils import get_location_id_from_request
         user = self.request.user
+        location_id = get_location_id_from_request(self.request)
         base_qs = CoachingPackagePurchase.objects.select_related(
             'client', 'package', 'original_owner'
         ).prefetch_related('package__staff_members', 'organization_members')
         
         if user.role in ['admin', 'staff']:
+            # Filter by location_id for admin/staff
+            if location_id:
+                # Filter by package location_id
+                base_qs = base_qs.filter(package__location_id=location_id)
             return base_qs
         
         # Clients see their own purchases, gifts received, and organization packages where they are members
@@ -179,9 +197,14 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         package = serializer.validated_data.get('package')
         purchase_type = serializer.validated_data.get('purchase_type', 'normal')
+        location_id = get_location_id_from_request(self.request)
         
         if not package or not package.is_active:
             raise serializers.ValidationError("Selected package is not available.")
+        
+        # Verify package belongs to location (if location_id is provided)
+        if location_id and package.location_id != location_id:
+            raise serializers.ValidationError("Selected package is not available for your location.")
         
         # For gift purchases, set client to recipient when creating
         if purchase_type == 'gift':
@@ -707,19 +730,28 @@ class SessionTransferViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
+        location_id = get_location_id_from_request(self.request)
         base_qs = SessionTransfer.objects.select_related(
             'from_user', 'to_user', 'package_purchase'
         )
         
         if user.role in ['admin', 'staff']:
+            # Filter by location_id for admin/staff
+            if location_id:
+                # Filter by package location_id
+                base_qs = base_qs.filter(package_purchase__package__location_id=location_id)
             return base_qs
         
         # Users see transfers they sent or received
-        return base_qs.filter(
+        queryset = base_qs.filter(
             Q(from_user=user) | 
             Q(to_user_phone=user.phone) |
             Q(to_user=user)
         )
+        # Also filter by location_id for clients
+        if location_id:
+            queryset = queryset.filter(package_purchase__package__location_id=location_id)
+        return queryset
     
     def perform_create(self, serializer):
         serializer.save(from_user=self.request.user)
@@ -835,19 +867,28 @@ class SimulatorHoursTransferViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
+        location_id = get_location_id_from_request(self.request)
         base_qs = SimulatorHoursTransfer.objects.select_related(
             'from_user', 'to_user', 'package_purchase'
         )
         
         if user.role in ['admin', 'staff']:
+            # Filter by location_id for admin/staff
+            if location_id:
+                # Filter by package location_id
+                base_qs = base_qs.filter(package_purchase__package__location_id=location_id)
             return base_qs
         
         # Users see transfers they sent or received
-        return base_qs.filter(
+        queryset = base_qs.filter(
             Q(from_user=user) | 
             Q(to_user_phone=user.phone) |
             Q(to_user=user)
         )
+        # Also filter by location_id for clients
+        if location_id:
+            queryset = queryset.filter(package_purchase__package__location_id=location_id)
+        return queryset
     
     def perform_create(self, serializer):
         serializer.save(from_user=self.request.user)
@@ -1012,22 +1053,42 @@ class CreateTempPurchaseView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Validate package exists and is active - check both CoachingPackage and SimulatorPackage
+        # Get package_type from request - REQUIRED to determine which table to check
+        requested_package_type = request.data.get('package_type')  # 'coaching' or 'simulator'
+        
+        if not requested_package_type:
+            return Response(
+                {'error': 'package_type is required. Must be either "coaching" or "simulator".'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if requested_package_type not in ['coaching', 'simulator']:
+            return Response(
+                {'error': 'Invalid package_type. Must be either "coaching" or "simulator".'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # ALWAYS use the package_type specified by the frontend - check ONLY that table
         package = None
         simulator_package = None
+        package_type = requested_package_type
         
-        try:
-            # First check if it's a simulator package
-            simulator_package = SimulatorPackage.objects.get(id=package_id, is_active=True)
-            package_type = 'simulator'
-        except SimulatorPackage.DoesNotExist:
+        if requested_package_type == 'simulator':
+            # Only check SimulatorPackage table
             try:
-                # If not simulator, check coaching package
+                simulator_package = SimulatorPackage.objects.get(id=package_id, is_active=True)
+            except SimulatorPackage.DoesNotExist:
+                return Response(
+                    {'error': f'Simulator package with ID {package_id} not found or is inactive.'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+        else:  # requested_package_type == 'coaching'
+            # Only check CoachingPackage table
+            try:
                 package = CoachingPackage.objects.get(id=package_id, is_active=True)
-                package_type = 'coaching'
             except CoachingPackage.DoesNotExist:
                 return Response(
-                    {'error': f'Package with ID {package_id} not found or is inactive.'},
+                    {'error': f'Coaching package with ID {package_id} not found or is inactive.'},
                     status=status.HTTP_404_NOT_FOUND
                 )
         
@@ -1064,6 +1125,7 @@ class CreateTempPurchaseView(APIView):
                     simulator_package=simulator_package,
                     buyer_phone=buyer_phone,
                     purchase_type=purchase_type,
+                    package_type='simulator',  # Explicitly store package type
                     recipients=recipients if recipients else []
                 )
             else:
@@ -1071,6 +1133,7 @@ class CreateTempPurchaseView(APIView):
                     package=package,
                     buyer_phone=buyer_phone,
                     purchase_type=purchase_type,
+                    package_type='coaching',  # Explicitly store package type
                     recipients=recipients if recipients else []
                 )
             
@@ -1082,7 +1145,12 @@ class CreateTempPurchaseView(APIView):
             temp_purchase.full_clean()
             temp_purchase.save()
             
-            logger.info(f"Temp purchase created successfully: temp_id={temp_purchase.temp_id}, buyer={buyer_phone}, type={purchase_type}, created_at={temp_purchase.created_at}")
+            logger.info(
+                f"Temp purchase created successfully: temp_id={temp_purchase.temp_id}, buyer={buyer_phone}, "
+                f"purchase_type={purchase_type}, package_type={temp_purchase.package_type}, "
+                f"package_id={package.id if package else None}, simulator_package_id={simulator_package.id if simulator_package else None}, "
+                f"created_at={temp_purchase.created_at}"
+            )
             
             # Verify it was saved
             verify_purchase = TempPurchase.objects.get(temp_id=temp_purchase.temp_id)
@@ -1212,10 +1280,192 @@ class PackagePurchaseWebhookView(APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
         
-        # Determine package type
+        # Determine package type - use explicit package_type field (more reliable than inferring from foreign keys)
+        # First, get both foreign keys to validate consistency
         package = temp_purchase.package
         simulator_package = temp_purchase.simulator_package
-        package_type = 'simulator' if simulator_package else 'coaching'
+        
+        # Get package_id from request (if provided) to help determine correct type when package_type is missing
+        request_package_id = request.data.get('package_id')
+        if request_package_id:
+            try:
+                request_package_id = int(request_package_id)
+            except (ValueError, TypeError):
+                request_package_id = None
+        
+        # Try to get explicit package_type field (may not exist if migration hasn't been run)
+        try:
+            package_type = temp_purchase.package_type
+        except AttributeError:
+            # Field doesn't exist yet (migration not run)
+            package_type = None
+        
+        # PRIORITY 3 & 4: If package_type is not set, try to determine from request package_id and database
+        if not package_type:
+            # If we have request_package_id, check both tables to determine correct type
+            if request_package_id:
+                coaching_exists = CoachingPackage.objects.filter(id=request_package_id, is_active=True).exists()
+                simulator_exists = SimulatorPackage.objects.filter(id=request_package_id, is_active=True).exists()
+                
+                if coaching_exists and simulator_exists:
+                    # Both exist with same ID - this is the problematic case
+                    # Check which foreign key in temp_purchase matches
+                    if package and package.id == request_package_id:
+                        package_type = 'coaching'
+                        simulator_package = None  # Clear wrong one
+                        logger.warning(
+                            f"Both packages exist with ID={request_package_id}. "
+                            f"TempPurchase has coaching package set. Using coaching."
+                        )
+                    elif simulator_package and simulator_package.id == request_package_id:
+                        package_type = 'simulator'
+                        package = None  # Clear wrong one
+                        logger.warning(
+                            f"Both packages exist with ID={request_package_id}. "
+                            f"TempPurchase has simulator package set. Using simulator."
+                        )
+                    else:
+                        # Neither matches or both are None - can't determine
+                        logger.error(
+                            f"Both packages exist with ID={request_package_id}, but temp_purchase has "
+                            f"package_id={package.id if package else None}, "
+                            f"simulator_package_id={simulator_package.id if simulator_package else None}. "
+                            f"Cannot determine correct type!"
+                        )
+                        return Response(
+                            {'error': f'Package ID {request_package_id} exists in both tables. Cannot determine package type from temp purchase.'},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+                elif coaching_exists:
+                    package_type = 'coaching'
+                    # Validate temp_purchase has coaching package
+                    if simulator_package:
+                        logger.warning(
+                            f"Request package_id={request_package_id} is a coaching package, "
+                            f"but temp_purchase has simulator_package_id={simulator_package.id}. "
+                            f"Clearing simulator_package and using coaching."
+                        )
+                        simulator_package = None
+                    if not package or package.id != request_package_id:
+                        # Try to get the correct package
+                        try:
+                            package = CoachingPackage.objects.get(id=request_package_id, is_active=True)
+                            logger.warning(f"Updated temp_purchase package to match request package_id={request_package_id}")
+                        except CoachingPackage.DoesNotExist:
+                            pass
+                elif simulator_exists:
+                    package_type = 'simulator'
+                    # Validate temp_purchase has simulator package
+                    if package:
+                        logger.warning(
+                            f"Request package_id={request_package_id} is a simulator package, "
+                            f"but temp_purchase has package_id={package.id}. "
+                            f"Clearing package and using simulator."
+                        )
+                        package = None
+                    if not simulator_package or simulator_package.id != request_package_id:
+                        # Try to get the correct package
+                        try:
+                            simulator_package = SimulatorPackage.objects.get(id=request_package_id, is_active=True)
+                            logger.warning(f"Updated temp_purchase simulator_package to match request package_id={request_package_id}")
+                        except SimulatorPackage.DoesNotExist:
+                            pass
+                else:
+                    # Package doesn't exist in either table
+                    logger.error(f"Package ID {request_package_id} not found in either CoachingPackage or SimulatorPackage")
+                    return Response(
+                        {'error': f'Package with ID {request_package_id} not found or is inactive.'},
+                        status=status.HTTP_404_NOT_FOUND
+                    )
+            else:
+                # No request_package_id - infer from foreign keys (backward compatibility)
+                if package and simulator_package:
+                    logger.error(
+                        f"TempPurchase {temp_purchase.temp_id} has BOTH package and simulator_package set! "
+                        f"package_id={package.id}, simulator_package_id={simulator_package.id}. "
+                        f"No package_id in request to determine correct type."
+                    )
+                    return Response(
+                        {'error': 'Temp purchase has both package types set and no package_id in request to determine correct type.'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                elif simulator_package:
+                    package_type = 'simulator'
+                else:
+                    package_type = 'coaching'
+            
+            logger.warning(
+                f"TempPurchase {temp_purchase.temp_id} missing package_type field (migration may not be run), "
+                f"determined type: {package_type}. package_id={package.id if package else None}, "
+                f"simulator_package_id={simulator_package.id if simulator_package else None}, "
+                f"request_package_id={request_package_id}"
+            )
+        
+        # Validate consistency and get the correct package object
+        # If package_type came from request, we may need to fetch the package from database
+        if package_type == 'simulator':
+            # Ensure we have the simulator package
+            if not simulator_package:
+                # Try to get it from database if we have package_id
+                if request_package_id:
+                    try:
+                        simulator_package = SimulatorPackage.objects.get(id=request_package_id, is_active=True)
+                        logger.info(f"Fetched simulator_package from database: id={simulator_package.id}")
+                    except SimulatorPackage.DoesNotExist:
+                        logger.error(
+                            f"package_type='simulator' but simulator_package not found in temp_purchase "
+                            f"and package_id={request_package_id} not found in SimulatorPackage table!"
+                        )
+                        return Response(
+                            {'error': f'Simulator package with ID {request_package_id} not found or is inactive.'},
+                            status=status.HTTP_404_NOT_FOUND
+                        )
+                else:
+                    logger.error(
+                        f"TempPurchase {temp_purchase.temp_id} has package_type='simulator' but simulator_package is None "
+                        f"and no package_id in request!"
+                    )
+                    return Response(
+                        {'error': 'Data inconsistency: package_type is simulator but simulator_package is not set.'},
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                    )
+            # Clear package to ensure we use simulator_package
+            package = None
+        else:  # package_type == 'coaching'
+            # Ensure we have the coaching package
+            if not package:
+                # Try to get it from database if we have package_id
+                if request_package_id:
+                    try:
+                        package = CoachingPackage.objects.get(id=request_package_id, is_active=True)
+                        logger.info(f"Fetched coaching package from database: id={package.id}")
+                    except CoachingPackage.DoesNotExist:
+                        logger.error(
+                            f"package_type='coaching' but package not found in temp_purchase "
+                            f"and package_id={request_package_id} not found in CoachingPackage table!"
+                        )
+                        return Response(
+                            {'error': f'Coaching package with ID {request_package_id} not found or is inactive.'},
+                            status=status.HTTP_404_NOT_FOUND
+                        )
+                else:
+                    logger.error(
+                        f"TempPurchase {temp_purchase.temp_id} has package_type='coaching' but package is None "
+                        f"and no package_id in request!"
+                    )
+                    return Response(
+                        {'error': 'Data inconsistency: package_type is coaching but package is not set.'},
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                    )
+            # Clear simulator_package to ensure we use package
+            simulator_package = None
+        
+        logger.info(
+            f"Webhook processing temp_purchase {temp_purchase.temp_id}: package_type={package_type}, "
+            f"package_id={package.id if package else None}, simulator_package_id={simulator_package.id if simulator_package else None}, "
+            f"request_package_id={request_package_id}"
+        )
+        
         active_package = simulator_package if simulator_package else package
         
         purchase_type = temp_purchase.purchase_type
@@ -1600,7 +1850,13 @@ class SimulatorPackageViewSet(viewsets.ModelViewSet):
         return [permission() for permission in permission_classes]
     
     def get_queryset(self):
+        from users.utils import get_location_id_from_request
+        location_id = get_location_id_from_request(self.request)
         queryset = SimulatorPackage.objects.all().order_by('-id')
+        
+        # Filter by location_id
+        if location_id:
+            queryset = queryset.filter(location_id=location_id)
         
         # Filter by active status if provided
         is_active = self.request.query_params.get('is_active')
@@ -1609,10 +1865,24 @@ class SimulatorPackageViewSet(viewsets.ModelViewSet):
         
         return queryset
     
+    def perform_create(self, serializer):
+        """Set location_id when creating simulator package"""
+        from users.utils import get_location_id_from_request
+        location_id = get_location_id_from_request(self.request)
+        if location_id:
+            serializer.save(location_id=location_id)
+        else:
+            serializer.save()
+    
     @action(detail=False, methods=['get'], url_path='active')
     def active_packages(self, request):
         """Get all active simulator packages"""
-        packages = SimulatorPackage.objects.filter(is_active=True).order_by('title')
+        from users.utils import get_location_id_from_request
+        location_id = get_location_id_from_request(request)
+        packages = SimulatorPackage.objects.filter(is_active=True)
+        if location_id:
+            packages = packages.filter(location_id=location_id)
+        packages = packages.order_by('title')
         serializer = self.get_serializer(packages, many=True)
         return Response(serializer.data)
     
@@ -1634,11 +1904,15 @@ class SimulatorPackagePurchaseViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         user = self.request.user
+        location_id = get_location_id_from_request(self.request)
         queryset = SimulatorPackagePurchase.objects.all()
         
         # Regular users can only see their own purchases
         if user.role not in ['admin', 'staff']:
             queryset = queryset.filter(client=user)
+        elif location_id:
+            # Filter by location_id for admin/staff
+            queryset = queryset.filter(package__location_id=location_id)
         
         # Filter by purchase type
         purchase_type = self.request.query_params.get('purchase_type')

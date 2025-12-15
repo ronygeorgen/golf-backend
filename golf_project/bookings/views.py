@@ -15,6 +15,7 @@ import logging
 from .models import Booking, TempBooking
 from .serializers import BookingSerializer, BookingCreateSerializer
 from users.models import User
+from users.utils import get_location_id_from_request
 from simulators.models import Simulator, SimulatorCredit
 from coaching.models import (
     CoachingPackagePurchase, OrganizationPackageMember, 
@@ -48,7 +49,11 @@ class BookingViewSet(viewsets.ModelViewSet):
         """
         from special_events.models import SpecialEvent
         
+        location_id = get_location_id_from_request(self.request)
         active_events = SpecialEvent.objects.filter(is_active=True)
+        if location_id:
+            active_events = active_events.filter(location_id=location_id)
+        
         for event in active_events:
             if event.conflicts_with_datetime(check_datetime):
                 return (True, event.title)
@@ -60,17 +65,23 @@ class BookingViewSet(viewsets.ModelViewSet):
         Returns (is_closed, message) tuple.
         """
         from admin_panel.models import ClosedDay
-        return ClosedDay.check_if_closed(check_datetime)
+        location_id = get_location_id_from_request(self.request)
+        return ClosedDay.check_if_closed(check_datetime, location_id=location_id)
     
     def get_queryset(self):
         user = self.request.user
+        location_id = get_location_id_from_request(self.request)
         
-        # Admins and staff can see all bookings
+        # Admins and staff can see all bookings (filtered by location)
         if user.role in ['admin', 'staff']:
             queryset = Booking.objects.all()
+            if location_id:
+                queryset = queryset.filter(location_id=location_id)
         else:
             # Clients can only see their own bookings
             queryset = Booking.objects.filter(client=user)
+            if location_id:
+                queryset = queryset.filter(location_id=location_id)
         
         # Apply filters
         status_filter = self.request.query_params.get('status')
@@ -97,6 +108,11 @@ class BookingViewSet(viewsets.ModelViewSet):
         return queryset.select_related(
             'client', 'simulator', 'coach', 'coaching_package'
     ).prefetch_related()
+    
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context['location_id'] = get_location_id_from_request(self.request)
+        return context
     
     def get_serializer_class(self):
         if self.action in ['create', 'update']:
@@ -126,7 +142,13 @@ class BookingViewSet(viewsets.ModelViewSet):
                 headers = self.get_success_headers(booking_serializer.data)
                 return Response(booking_serializer.data, status=status.HTTP_201_CREATED, headers=headers)
             
-            # Normal booking creation
+            # Normal booking creation - use BookingSerializer to include all fields (including location_id)
+            booking_instance = serializer.instance
+            if booking_instance:
+                booking_serializer = BookingSerializer(booking_instance)
+                headers = self.get_success_headers(booking_serializer.data)
+                return Response(booking_serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+            # Fallback to original serializer if instance not available
             headers = self.get_success_headers(serializer.data)
             return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
         except Exception as e:
@@ -138,10 +160,14 @@ class BookingViewSet(viewsets.ModelViewSet):
     
     def _find_optimal_simulator(self, start_time, end_time):
         """Assign the best simulator by filling gaps and balancing usage."""
+        location_id = get_location_id_from_request(self.request)
         active_simulators = Simulator.objects.filter(
             is_active=True,
             is_coaching_bay=False
-        ).order_by('bay_number')
+        )
+        if location_id:
+            active_simulators = active_simulators.filter(location_id=location_id)
+        active_simulators = active_simulators.order_by('bay_number')
         
         best_choice = None
         for simulator in active_simulators:
@@ -192,10 +218,14 @@ class BookingViewSet(viewsets.ModelViewSet):
         Find multiple available simulators for a given time slot.
         Returns a list of available simulators (up to count).
         """
+        location_id = get_location_id_from_request(self.request)
         active_simulators = Simulator.objects.filter(
             is_active=True,
             is_coaching_bay=False
-        ).order_by('bay_number')
+        )
+        if location_id:
+            active_simulators = active_simulators.filter(location_id=location_id)
+        active_simulators = active_simulators.order_by('bay_number')
         
         available_simulators = []
         for simulator in active_simulators:
@@ -461,11 +491,15 @@ class BookingViewSet(viewsets.ModelViewSet):
                         )
                         calculated_price = single_simulator_price * simulator_count
                         
+                        # Get location_id for temp booking
+                        location_id = get_location_id_from_request(self.request)
+                        
                         # Create temp booking - ensure it's saved and committed
                         # Store simulator_count in a way that can be retrieved later
                         # We'll use the first simulator for the temp booking
                         temp_booking = TempBooking(
                             simulator=first_simulator,
+                            location_id=location_id,  # Store location_id so webhook can use it
                             buyer_phone=self.request.user.phone,
                             start_time=start_time,
                             end_time=end_time,
@@ -524,6 +558,9 @@ class BookingViewSet(viewsets.ModelViewSet):
                             # It's a CoachingPackagePurchase (combo package)
                             combo_package_purchase = package_purchase
                     
+                    # Get location_id for bookings
+                    location_id = get_location_id_from_request(self.request)
+                    
                     # Create bookings for each simulator
                     created_bookings = []
                     for idx, simulator in enumerate(available_simulators):
@@ -532,6 +569,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                         # If using packages, we already consumed total_duration_minutes, so don't consume again
                         booking_instance = Booking(
                             client=self.request.user,
+                            location_id=location_id,
                             booking_type='simulator',
                             simulator=simulator,
                             start_time=start_time,
@@ -596,12 +634,19 @@ class BookingViewSet(viewsets.ModelViewSet):
                 if not package:
                     raise serializers.ValidationError("A coaching package is required for coaching bookings.")
                 
+                location_id = get_location_id_from_request(self.request)
                 purchase = self._consume_package_session(package, use_organization=use_organization_package)
-                serializer.save(
+                booking_instance = serializer.save(
                     client=self.request.user,
+                    location_id=location_id,
                     package_purchase=purchase,
                     total_price=booking_data.get('total_price', 0)
                 )
+                # Ensure location_id is saved (in case serializer didn't include it)
+                if location_id and not booking_instance.location_id:
+                    booking_instance.location_id = location_id
+                    booking_instance.save(update_fields=['location_id'])
+                logger.info(f"Coaching booking created: id={booking_instance.id}, location_id={booking_instance.location_id}, client={self.request.user.phone}")
                 
                 # Update GHL custom fields after booking creation
                 try:
@@ -613,7 +658,8 @@ class BookingViewSet(viewsets.ModelViewSet):
                 
                 return
             
-            serializer.save(client=self.request.user)
+            location_id = get_location_id_from_request(self.request)
+            serializer.save(client=self.request.user, location_id=location_id)
     
     @action(detail=False, methods=['get'], url_path='available-simulator-hours')
     def available_simulator_hours(self, request):
@@ -633,14 +679,30 @@ class BookingViewSet(viewsets.ModelViewSet):
     
     @action(detail=False, methods=['get'])
     def upcoming(self, request):
-        """Get all upcoming bookings for the current user"""
+        """Get all upcoming bookings for the current user, filtered by location_id"""
         booking_type = request.query_params.get('booking_type')
+        location_id = get_location_id_from_request(request)
+        
+        logger.info(f"Upcoming bookings request: user={request.user.phone}, location_id={location_id}, booking_type={booking_type}")
+        
         upcoming_bookings = Booking.objects.filter(
             client=request.user,
             start_time__gte=timezone.now()
-        ).exclude(status='cancelled').order_by('start_time')
+        ).exclude(status='cancelled')
+        
+        # Filter by location_id if provided
+        if location_id:
+            upcoming_bookings = upcoming_bookings.filter(location_id=location_id)
+            logger.info(f"Filtered by location_id={location_id}, count before type filter: {upcoming_bookings.count()}")
+        else:
+            logger.warning(f"No location_id provided for upcoming bookings request from user {request.user.phone}")
+        
+        # Filter by booking_type if provided
         if booking_type in ['simulator', 'coaching']:
             upcoming_bookings = upcoming_bookings.filter(booking_type=booking_type)
+            logger.info(f"Filtered by booking_type={booking_type}, final count: {upcoming_bookings.count()}")
+        
+        upcoming_bookings = upcoming_bookings.order_by('start_time')
         
         # Use 5 per page pagination for upcoming bookings
         paginator = FivePerPagePagination()
@@ -661,10 +723,14 @@ class BookingViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN
             )
         
+        location_id = get_location_id_from_request(request)
         today = timezone.now().date()
         today_bookings = Booking.objects.filter(
             start_time__date=today
-        ).order_by('start_time')
+        )
+        if location_id:
+            today_bookings = today_bookings.filter(location_id=location_id)
+        today_bookings = today_bookings.order_by('start_time')
         
         serializer = self.get_serializer(today_bookings, many=True)
         return Response(serializer.data)
@@ -1090,6 +1156,9 @@ class BookingViewSet(viewsets.ModelViewSet):
         # Get coach_id filter if provided
         coach_id = request.query_params.get('coach_id')
         
+        # Get location_id for filtering
+        location_id = get_location_id_from_request(request)
+        
         # For clients, only show their bookings
         if request.user.role == 'client':
             bookings = Booking.objects.filter(
@@ -1097,12 +1166,18 @@ class BookingViewSet(viewsets.ModelViewSet):
                 start_time__gte=start_datetime,
                 end_time__lte=end_datetime
             )
+            if location_id:
+                # Filter strictly by location_id - only show bookings with matching location_id
+                bookings = bookings.filter(location_id=location_id)
         else:
-            # Admins and staff see all bookings
+            # Admins and staff see all bookings (filtered by location)
             bookings = Booking.objects.filter(
                 start_time__gte=start_datetime,
                 end_time__lte=end_datetime
             )
+            if location_id:
+                # Filter strictly by location_id - only show bookings with matching location_id
+                bookings = bookings.filter(location_id=location_id)
         
         # Filter by booking_type if provided
         if booking_type:
@@ -1134,19 +1209,24 @@ class BookingViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN
             )
         
+        location_id = get_location_id_from_request(request)
         today = timezone.now().date()
         week_ago = today - timedelta(days=7)
         
+        bookings_qs = Booking.objects.all()
+        if location_id:
+            bookings_qs = bookings_qs.filter(location_id=location_id)
+        
         stats = {
-            'total_bookings': Booking.objects.count(),
-            'today_bookings': Booking.objects.filter(start_time__date=today).count(),
-            'week_bookings': Booking.objects.filter(start_time__date__gte=week_ago).count(),
-            'simulator_bookings': Booking.objects.filter(booking_type='simulator').count(),
-            'coaching_bookings': Booking.objects.filter(booking_type='coaching').count(),
-            'revenue_today': Booking.objects.filter(
+            'total_bookings': bookings_qs.count(),
+            'today_bookings': bookings_qs.filter(start_time__date=today).count(),
+            'week_bookings': bookings_qs.filter(start_time__date__gte=week_ago).count(),
+            'simulator_bookings': bookings_qs.filter(booking_type='simulator').count(),
+            'coaching_bookings': bookings_qs.filter(booking_type='coaching').count(),
+            'revenue_today': bookings_qs.filter(
                 start_time__date=today
             ).aggregate(total=Sum('total_price'))['total'] or 0,
-            'revenue_week': Booking.objects.filter(
+            'revenue_week': bookings_qs.filter(
                 start_time__date__gte=week_ago
             ).aggregate(total=Sum('total_price'))['total'] or 0,
         }
@@ -1186,11 +1266,17 @@ class BookingViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
+        # Get location_id for filtering
+        location_id = get_location_id_from_request(request)
+        
         # Get all active simulators (bays 1-5, excluding coaching bay)
         available_simulators = Simulator.objects.filter(
             is_active=True,
             is_coaching_bay=False
-        ).order_by('bay_number')
+        )
+        if location_id:
+            available_simulators = available_simulators.filter(location_id=location_id)
+        available_simulators = available_simulators.order_by('bay_number')
         
         max_available_simulators = available_simulators.count()
         
@@ -1256,8 +1342,39 @@ class BookingViewSet(viewsets.ModelViewSet):
                 # Generate slots at 30-minute intervals (regardless of requested duration)
                 # This allows frontend to validate if selected duration fits
                 current_time = avail_start
+                now = timezone.now()
+                
+                # If booking is for today, adjust start time to skip past slots
+                if booking_date == now.date():
+                    # Round current time up to next 30-minute interval
+                    current_minute = now.minute
+                    current_second = now.second
+                    current_microsecond = now.microsecond
+                    
+                    # Calculate minutes to add to round up to next 30-minute slot
+                    minutes_to_add = 30 - (current_minute % 30)
+                    if minutes_to_add == 30 and current_second == 0 and current_microsecond == 0:
+                        minutes_to_add = 0  # Already on a 30-minute boundary
+                    
+                    # Calculate the next valid slot start time (timezone-aware)
+                    next_slot_time = now + timedelta(minutes=minutes_to_add)
+                    next_slot_time = next_slot_time.replace(second=0, microsecond=0)
+                    
+                    # Convert to naive datetime for comparison with current_time
+                    next_slot_naive = next_slot_time.replace(tzinfo=None)
+                    if next_slot_naive > current_time:
+                        current_time = next_slot_naive
+                        # If we've passed the availability window, skip to next availability
+                        if current_time >= avail_end:
+                            break
+                
                 while current_time < avail_end:
                     slot_start = timezone.make_aware(current_time)
+                    # Skip slots that have already passed (for today's bookings)
+                    if booking_date == now.date() and slot_start <= now:
+                        current_time += timedelta(minutes=slot_interval)
+                        continue
+                    
                     slot_end = slot_start + timedelta(minutes=duration_minutes)
                     slot_fits_duration = slot_end <= availability_end_datetime
                     
@@ -1274,7 +1391,8 @@ class BookingViewSet(viewsets.ModelViewSet):
                     
                     # Check if facility is closed
                     from admin_panel.models import ClosedDay
-                    is_closed, closed_message = ClosedDay.check_if_closed(slot_start)
+                    location_id = get_location_id_from_request(request)
+                    is_closed, closed_message = ClosedDay.check_if_closed(slot_start, location_id=location_id)
                     
                     if not conflicting_bookings.exists() and not has_special_event and not is_closed:
                         slot_start_str = slot_start.isoformat()
@@ -1386,8 +1504,14 @@ class BookingViewSet(viewsets.ModelViewSet):
         from coaching.models import CoachingPackage
         from users.models import StaffAvailability, StaffDayAvailability
         
-        # Get coaching bay (bay 6)
-        coaching_bay = Simulator.objects.filter(is_coaching_bay=True, is_active=True).first()
+        # Get location_id for filtering
+        location_id = get_location_id_from_request(request)
+        
+        # Get coaching bay (bay 6) - filter by location if provided
+        coaching_bay_qs = Simulator.objects.filter(is_coaching_bay=True, is_active=True)
+        if location_id:
+            coaching_bay_qs = coaching_bay_qs.filter(location_id=location_id)
+        coaching_bay = coaching_bay_qs.first()
         if not coaching_bay:
             return Response({
                 'available_slots': [],
@@ -1396,6 +1520,8 @@ class BookingViewSet(viewsets.ModelViewSet):
         
         # Build the coach queryset based on package/coach selections
         coaches_qs = User.objects.filter(role__in=['staff', 'admin'], is_active=True)
+        if location_id:
+            coaches_qs = coaches_qs.filter(ghl_location_id=location_id)
         try:
             selected_package = CoachingPackage.objects.get(id=package_id, is_active=True)
             coaches_qs = selected_package.staff_members.filter(role__in=['staff', 'admin'], is_active=True)
@@ -1502,8 +1628,39 @@ class BookingViewSet(viewsets.ModelViewSet):
                         continue
                 
                 current_time = avail_start
+                now = timezone.now()
+                
+                # If booking is for today, adjust start time to skip past slots
+                if booking_date == now.date():
+                    # Round current time up to next 30-minute interval
+                    current_minute = now.minute
+                    current_second = now.second
+                    current_microsecond = now.microsecond
+                    
+                    # Calculate minutes to add to round up to next 30-minute slot
+                    minutes_to_add = 30 - (current_minute % 30)
+                    if minutes_to_add == 30 and current_second == 0 and current_microsecond == 0:
+                        minutes_to_add = 0  # Already on a 30-minute boundary
+                    
+                    # Calculate the next valid slot start time
+                    next_slot_time = now + timedelta(minutes=minutes_to_add)
+                    next_slot_time = next_slot_time.replace(second=0, microsecond=0)
+                    
+                    # If the next slot time is after availability start, use it
+                    next_slot_naive = next_slot_time.replace(tzinfo=None)
+                    if next_slot_naive > current_time:
+                        current_time = next_slot_naive
+                        # If we've passed the availability window, skip to next availability
+                        if current_time >= avail_end:
+                            continue
+                
                 while current_time + timedelta(minutes=slot_interval) <= avail_end:
                     slot_start = timezone.make_aware(current_time)
+                    # Skip slots that have already passed (for today's bookings)
+                    if booking_date == now.date() and slot_start < now:
+                        current_time += timedelta(minutes=slot_interval)
+                        continue
+                    
                     slot_end = slot_start + timedelta(minutes=duration_minutes)
                     availability_end_datetime = timezone.make_aware(avail_end)
                     slot_fits_duration = slot_end <= availability_end_datetime
@@ -1521,7 +1678,8 @@ class BookingViewSet(viewsets.ModelViewSet):
                     
                     # Check if facility is closed
                     from admin_panel.models import ClosedDay
-                    is_closed, closed_message = ClosedDay.check_if_closed(slot_start)
+                    location_id = get_location_id_from_request(request)
+                    is_closed, closed_message = ClosedDay.check_if_closed(slot_start, location_id=location_id)
                     
                     if conflicting_bookings.exists() or has_special_event or is_closed:
                         current_time += timedelta(minutes=slot_interval)
@@ -1683,10 +1841,14 @@ class CreateTempBookingView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
+        # Get location_id for temp booking
+        location_id = get_location_id_from_request(request)
+        
         # Create temp booking
         try:
             temp_booking = TempBooking.objects.create(
                 simulator=simulator,
+                location_id=location_id,
                 buyer_phone=buyer_phone,
                 start_time=start_time_dt,
                 end_time=end_time_dt,
@@ -1833,12 +1995,24 @@ class BookingWebhookView(APIView):
         try:
             created_bookings = []
             
+            # Get location_id from temp booking, with fallback to user's location_id or simulator's location_id
+            location_id = temp_booking.location_id
+            if not location_id:
+                # Fallback: try to get from buyer's ghl_location_id
+                location_id = getattr(buyer, 'ghl_location_id', None)
+                if not location_id:
+                    # Final fallback: get from simulator
+                    location_id = getattr(temp_booking.simulator, 'location_id', None)
+            
             # Find available simulators for this time slot
             # Use the same logic as in BookingViewSet
             active_simulators = Simulator.objects.filter(
                 is_active=True,
                 is_coaching_bay=False
-            ).order_by('bay_number')
+            )
+            if location_id:
+                active_simulators = active_simulators.filter(location_id=location_id)
+            active_simulators = active_simulators.order_by('bay_number')
             
             available_simulators = []
             for simulator in active_simulators:
@@ -1871,6 +2045,7 @@ class BookingWebhookView(APIView):
             for simulator in available_simulators:
                 booking = Booking.objects.create(
                     client=buyer,
+                    location_id=location_id,
                     booking_type='simulator',
                     simulator=simulator,
                     start_time=temp_booking.start_time,

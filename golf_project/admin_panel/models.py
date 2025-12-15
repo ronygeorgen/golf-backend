@@ -15,6 +15,7 @@ class ClosedDay(models.Model):
         ('yearly', 'Yearly Recurring'),
     )
     
+    location_id = models.CharField(max_length=100, blank=True, null=True, help_text="GHL location ID for this closed day")
     title = models.CharField(max_length=200, help_text="Name/description of the closure (e.g., 'Holiday', 'Maintenance')")
     description = models.TextField(blank=True, help_text="Additional details about the closure")
     
@@ -130,17 +131,20 @@ class ClosedDay(models.Model):
         return (False, None)
     
     @classmethod
-    def check_if_closed(cls, check_datetime):
+    def check_if_closed(cls, check_datetime, location_id=None):
         """
         Check if a datetime is closed by any active closure rule.
         
         Args:
             check_datetime: datetime.datetime object to check
+            location_id: Optional location_id to filter closures
             
         Returns:
             tuple: (is_closed: bool, message: str or None)
         """
         active_closures = cls.objects.filter(is_active=True)
+        if location_id:
+            active_closures = active_closures.filter(location_id=location_id)
         
         for closure in active_closures:
             is_closed, message = closure.is_datetime_closed(check_datetime)
@@ -150,17 +154,20 @@ class ClosedDay(models.Model):
         return (False, None)
     
     @classmethod
-    def check_if_date_closed(cls, check_date):
+    def check_if_date_closed(cls, check_date, location_id=None):
         """
         Check if a date is closed (any time during the day).
         
         Args:
             check_date: datetime.date object to check
+            location_id: Optional location_id to filter closures
             
         Returns:
             tuple: (is_closed: bool, closure_title: str or None)
         """
         active_closures = cls.objects.filter(is_active=True)
+        if location_id:
+            active_closures = active_closures.filter(location_id=location_id)
         
         for closure in active_closures:
             if closure.is_date_closed(check_date):

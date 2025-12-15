@@ -9,6 +9,7 @@ from rest_framework.authtoken.models import Token
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from .utils import get_location_id_from_request, filter_by_location, get_users_by_location
 
 try:
     from ghl.tasks import sync_user_contact_task

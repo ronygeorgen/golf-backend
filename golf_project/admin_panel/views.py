@@ -8,6 +8,7 @@ from django.db.models import Count, Sum, Q, F
 from django.utils import timezone
 from datetime import datetime, timedelta
 from users.models import User, StaffAvailability, StaffDayAvailability
+from users.utils import get_location_id_from_request, filter_by_location
 from simulators.models import Simulator, SimulatorCredit
 from bookings.models import Booking
 from users.serializers import UserSerializer, StaffSerializer, StaffAvailabilitySerializer, StaffDayAvailabilitySerializer
@@ -19,15 +20,24 @@ from .models import ClosedDay
 class AdminDashboardViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'])
     def stats(self, request):
+        location_id = get_location_id_from_request(request)
         today = timezone.now().date()
         
+        # Filter by location
+        bookings_qs = Booking.objects.all()
+        simulators_qs = Simulator.objects.all()
+        
+        if location_id:
+            bookings_qs = bookings_qs.filter(location_id=location_id)
+            simulators_qs = simulators_qs.filter(location_id=location_id)
+        
         stats = {
-            'total_bookings': Booking.objects.count(),
-            'today_bookings': Booking.objects.filter(
+            'total_bookings': bookings_qs.count(),
+            'today_bookings': bookings_qs.filter(
                 start_time__date=today
             ).count(),
-            'active_simulators': Simulator.objects.filter(is_active=True).count(),
-            'total_revenue': Booking.objects.aggregate(
+            'active_simulators': simulators_qs.filter(is_active=True).count(),
+            'total_revenue': bookings_qs.aggregate(
                 total=Sum('total_price')
             )['total'] or 0
         }
@@ -36,9 +46,16 @@ class AdminDashboardViewSet(viewsets.ViewSet):
     
     @action(detail=False, methods=['get'], url_path='recent-bookings')
     def recent_bookings(self, request):
+        location_id = get_location_id_from_request(request)
+        
         bookings = Booking.objects.select_related(
             'client', 'simulator', 'coach', 'coaching_package'
-        ).order_by('-created_at')[:10]
+        )
+        
+        if location_id:
+            bookings = bookings.filter(location_id=location_id)
+        
+        bookings = bookings.order_by('-created_at')[:10]
         
         from bookings.serializers import BookingSerializer
         serializer = BookingSerializer(bookings, many=True)
@@ -48,6 +65,14 @@ class StaffViewSet(viewsets.ModelViewSet):
     queryset = User.objects.filter(role__in=['staff', 'admin'])
     serializer_class = StaffSerializer
     
+    def get_queryset(self):
+        """Filter staff by location_id"""
+        queryset = User.objects.filter(role__in=['staff', 'admin'])
+        location_id = get_location_id_from_request(self.request)
+        if location_id:
+            queryset = queryset.filter(ghl_location_id=location_id)
+        return queryset
+    
     def get_serializer_class(self):
         # Use UserSerializer for read operations to include username
         if self.action in ['list', 'retrieve']:
@@ -55,14 +80,27 @@ class StaffViewSet(viewsets.ModelViewSet):
         # Use StaffSerializer for create/update to auto-generate username
         return StaffSerializer
     
+    def perform_create(self, serializer):
+        """Set location_id when creating staff"""
+        location_id = get_location_id_from_request(self.request)
+        if location_id:
+            serializer.save(ghl_location_id=location_id)
+        else:
+            serializer.save()
+    
     @action(detail=True, methods=['get', 'put'])
     def availability(self, request, pk=None):
         staff = self.get_object()
         
+        # Verify staff belongs to admin's location
+        location_id = get_location_id_from_request(request)
+        if location_id and staff.ghl_location_id != location_id:
+            raise PermissionDenied("You can only manage availability for staff in your location.")
+        
         if request.method == 'GET':
             # Get all recurring weekly availability
             availability = StaffAvailability.objects.filter(staff=staff).order_by('day_of_week', 'start_time')
-            serializer = StaffAvailabilitySerializer(availability, many=True)
+            serializer = StaffAvailabilitySerializer(availability, many=True, context={'location_id': location_id})
             return Response(serializer.data)
         
         elif request.method == 'PUT':
@@ -116,7 +154,7 @@ class StaffViewSet(viewsets.ModelViewSet):
                         day_of_week = int(day_of_week)
                         # Use serializer to handle timezone conversion
                         serializer_data = {**avail_data, 'staff': staff.id, 'day_of_week': day_of_week}
-                        serializer = StaffAvailabilitySerializer(data=serializer_data)
+                        serializer = StaffAvailabilitySerializer(data=serializer_data, context={'location_id': location_id})
                         if serializer.is_valid():
                             availability, created = StaffAvailability.objects.update_or_create(
                                 staff=staff,
@@ -148,7 +186,7 @@ class StaffViewSet(viewsets.ModelViewSet):
                         pass
             
             # Return updated availability list
-            serializer = StaffAvailabilitySerializer(updated_availability, many=True)
+            serializer = StaffAvailabilitySerializer(updated_availability, many=True, context={'location_id': location_id})
             return Response(serializer.data)
     
     @action(detail=True, methods=['get', 'put'], url_path='day-availability')
@@ -160,10 +198,15 @@ class StaffViewSet(viewsets.ModelViewSet):
         """
         staff = self.get_object()
         
+        # Verify staff belongs to admin's location
+        location_id = get_location_id_from_request(request)
+        if location_id and staff.ghl_location_id != location_id:
+            raise PermissionDenied("You can only manage availability for staff in your location.")
+        
         if request.method == 'GET':
             # Get all day-specific availability, ordered by date
             day_availability = StaffDayAvailability.objects.filter(staff=staff).order_by('date', 'start_time')
-            serializer = StaffDayAvailabilitySerializer(day_availability, many=True)
+            serializer = StaffDayAvailabilitySerializer(day_availability, many=True, context={'location_id': location_id})
             return Response(serializer.data)
         
         elif request.method == 'PUT':
@@ -210,7 +253,7 @@ class StaffViewSet(viewsets.ModelViewSet):
                     try:
                         # Use serializer to handle timezone conversion
                         serializer_data = {**avail_data, 'staff': staff.id, 'date': date}
-                        serializer = StaffDayAvailabilitySerializer(data=serializer_data)
+                        serializer = StaffDayAvailabilitySerializer(data=serializer_data, context={'location_id': location_id})
                         if serializer.is_valid():
                             availability, created = StaffDayAvailability.objects.update_or_create(
                                 staff=staff,
@@ -246,7 +289,7 @@ class StaffViewSet(viewsets.ModelViewSet):
                         pass
             
             # Return updated availability list
-            serializer = StaffDayAvailabilitySerializer(updated_availability, many=True)
+            serializer = StaffDayAvailabilitySerializer(updated_availability, many=True, context={'location_id': location_id})
             return Response(serializer.data)
 
 
@@ -257,15 +300,64 @@ class AdminOverrideViewSet(viewsets.ViewSet):
         if getattr(request.user, 'role', None) != 'admin' and not getattr(request.user, 'is_superuser', False):
             raise PermissionDenied("Administrator privileges are required for this action.")
     
+    @action(detail=False, methods=['get'], url_path='locked-bookings')
+    def locked_bookings(self, request):
+        """
+        Get all bookings that are less than 24 hours away (locked bookings)
+        for the admin's location. Only admins can cancel these.
+        """
+        self._ensure_admin(request)
+        from bookings.models import Booking
+        from bookings.serializers import BookingSerializer
+        from django.utils import timezone
+        from datetime import timedelta
+        
+        location_id = get_location_id_from_request(request)
+        if not location_id:
+            return Response(
+                {'error': 'Location ID is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        now = timezone.now()
+        lock_window = timedelta(hours=24)
+        
+        # Get bookings that:
+        # 1. Are in the future (start_time > now)
+        # 2. Are less than 24 hours away (start_time - now < 24 hours)
+        # 3. Are confirmed (not cancelled, completed, or no_show)
+        # 4. Belong to the admin's location
+        locked_bookings = Booking.objects.filter(
+            location_id=location_id,
+            start_time__gt=now,
+            start_time__lt=now + lock_window,
+            status='confirmed'  # Only show confirmed bookings that can be cancelled
+        ).select_related(
+            'client', 'simulator', 'coach', 'coaching_package', 
+            'package_purchase', 'simulator_package_purchase'
+        ).order_by('start_time')
+        
+        serializer = BookingSerializer(locked_bookings, many=True)
+        return Response({
+            'count': locked_bookings.count(),
+            'bookings': serializer.data
+        })
+    
     @action(detail=False, methods=['post'], url_path='coaching-sessions')
     def coaching_sessions(self, request):
         self._ensure_admin(request)
         from decimal import Decimal
         from simulators.models import SimulatorCredit
         
+        location_id = get_location_id_from_request(request)
         serializer = CoachingSessionAdjustmentSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         purchase = serializer.validated_data['purchase']
+        
+        # Verify purchase belongs to admin's location
+        if location_id and purchase.package.location_id != location_id:
+            raise PermissionDenied("You can only manage purchases for packages in your location.")
+        
         session_count = serializer.validated_data['session_count']
         simulator_hours = serializer.validated_data.get('simulator_hours', Decimal('0'))
         note = serializer.validated_data.get('note')
@@ -326,12 +418,18 @@ class AdminOverrideViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['post'], url_path='simulator-credits')
     def simulator_credits(self, request):
         self._ensure_admin(request)
+        location_id = get_location_id_from_request(request)
         serializer = SimulatorCreditGrantSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         
         from decimal import Decimal
         
         client = serializer.validated_data['client']
+        
+        # Verify client belongs to admin's location
+        if location_id and client.ghl_location_id != location_id:
+            raise PermissionDenied("You can only grant credits to users in your location.")
+        
         hours = Decimal(str(serializer.validated_data['hours']))
         reason = serializer.validated_data['reason']
         note = serializer.validated_data.get('note') or ''
@@ -370,8 +468,13 @@ class UserViewSet(viewsets.ReadOnlyModelViewSet):
     pagination_class = UserPagination
     
     def get_queryset(self):
-        """Filter users based on query parameters"""
+        """Filter users based on query parameters and location"""
+        location_id = get_location_id_from_request(self.request)
         queryset = User.objects.all().order_by('-date_joined')
+        
+        # Filter by location_id (admin can only see users from their location)
+        if location_id:
+            queryset = queryset.filter(ghl_location_id=location_id)
         
         # Filter by role
         role = self.request.query_params.get('role', None)
@@ -449,8 +552,13 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     
     def get_queryset(self):
-        """Filter closed days based on query parameters"""
+        """Filter closed days based on query parameters and location"""
+        location_id = get_location_id_from_request(self.request)
         queryset = ClosedDay.objects.all().order_by('-start_date', '-start_time')
+        
+        # Filter by location_id
+        if location_id:
+            queryset = queryset.filter(location_id=location_id)
         
         # Filter by active status
         is_active = self.request.query_params.get('is_active', None)
@@ -464,6 +572,14 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(recurrence=recurrence)
         
         return queryset
+    
+    def perform_create(self, serializer):
+        """Set location_id when creating closed day"""
+        location_id = get_location_id_from_request(self.request)
+        if location_id:
+            serializer.save(location_id=location_id)
+        else:
+            serializer.save()
     
     def list(self, request, *args, **kwargs):
         """List all closed days"""
@@ -503,6 +619,7 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
         Check if a specific date is closed.
         Query params: date (YYYY-MM-DD format)
         """
+        location_id = get_location_id_from_request(request)
         date_str = request.query_params.get('date')
         if not date_str:
             return Response(
@@ -519,7 +636,19 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        is_closed, closure_title = ClosedDay.check_if_date_closed(check_date)
+        # Filter closed days by location_id
+        if location_id:
+            closed_days = ClosedDay.objects.filter(location_id=location_id, is_active=True)
+        else:
+            closed_days = ClosedDay.objects.filter(is_active=True)
+        
+        is_closed = False
+        closure_title = None
+        for closure in closed_days:
+            if closure.is_date_closed(check_date):
+                is_closed = True
+                closure_title = closure.title
+                break
         
         return Response({
             'date': date_str,
@@ -533,6 +662,7 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
         Check if a specific datetime is closed.
         Query params: datetime (ISO format: YYYY-MM-DDTHH:MM:SS)
         """
+        location_id = get_location_id_from_request(request)
         datetime_str = request.query_params.get('datetime')
         if not datetime_str:
             return Response(
@@ -548,7 +678,20 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        is_closed, message = ClosedDay.check_if_closed(check_datetime)
+        # Filter closed days by location_id
+        if location_id:
+            closed_days = ClosedDay.objects.filter(location_id=location_id, is_active=True)
+        else:
+            closed_days = ClosedDay.objects.filter(is_active=True)
+        
+        is_closed = False
+        message = None
+        for closure in closed_days:
+            closed, msg = closure.is_datetime_closed(check_datetime)
+            if closed:
+                is_closed = True
+                message = msg
+                break
         
         return Response({
             'datetime': datetime_str,

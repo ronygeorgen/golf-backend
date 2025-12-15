@@ -17,6 +17,7 @@ class Booking(models.Model):
     )
     
     client = models.ForeignKey('users.User', on_delete=models.CASCADE, related_name='bookings')
+    location_id = models.CharField(max_length=100, blank=True, null=True, help_text="GHL location ID for this booking")
     booking_type = models.CharField(max_length=10, choices=BOOKING_TYPE_CHOICES)
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='confirmed')
     
@@ -72,6 +73,7 @@ class TempBooking(models.Model):
         on_delete=models.CASCADE,
         related_name='temp_bookings'
     )
+    location_id = models.CharField(max_length=100, blank=True, null=True, help_text="GHL location ID for this temp booking")
     buyer_phone = models.CharField(max_length=15)
     start_time = models.DateTimeField()
     end_time = models.DateTimeField()
