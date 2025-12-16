@@ -3,6 +3,7 @@ from django.db import models
 
 class User(AbstractUser):
     ROLE_CHOICES = (
+        ('superadmin', 'Super Admin'),
         ('admin', 'Admin'),
         ('staff', 'Staff'),
         ('client', 'Client'),

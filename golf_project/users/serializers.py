@@ -41,18 +41,32 @@ class UserSerializer(serializers.ModelSerializer):
 
 class StaffSerializer(serializers.ModelSerializer):
     """Serializer for creating/updating staff members by admin - auto-generates username"""
+    password = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    
     class Meta:
         model = User
-        fields = ('id', 'username', 'email', 'phone', 'role', 'first_name', 'last_name', 'email_verified', 'phone_verified', 'is_superuser', 'is_staff', 'date_of_birth')
+        fields = ('id', 'username', 'email', 'phone', 'role', 'first_name', 'last_name', 'email_verified', 'phone_verified', 'is_superuser', 'is_staff', 'date_of_birth', 'password', 'ghl_location_id')
         read_only_fields = ('id', 'email_verified', 'phone_verified', 'is_superuser', 'is_staff', 'username')
         extra_kwargs = {
             'email': {'required': True},
             'phone': {'required': True},
             'first_name': {'required': True},
             'last_name': {'required': True},
+            'ghl_location_id': {'required': False, 'allow_blank': True},
+            'date_of_birth': {'required': False, 'allow_null': True},
         }
     
+    def to_internal_value(self, data):
+        """Handle empty strings for date_of_birth before validation"""
+        # Convert empty string to None for date_of_birth
+        if 'date_of_birth' in data and (data['date_of_birth'] == '' or data['date_of_birth'] is None):
+            data['date_of_birth'] = None
+        return super().to_internal_value(data)
+    
     def create(self, validated_data):
+        # Extract password if provided
+        password = validated_data.pop('password', None)
+        
         # Auto-generate username from email (before @ symbol)
         email = validated_data.get('email')
         if email:
@@ -71,12 +85,16 @@ class StaffSerializer(serializers.ModelSerializer):
         
         validated_data['username'] = username
         
-        # Create user without password (admin can set it later if needed)
+        # Create user
         user = User.objects.create(**validated_data)
         
-        # Set a default password (can be changed later)
-        # Using phone as default password for now, but should be changed on first login
-        user.set_password(validated_data.get('phone', 'default123'))
+        # Set password only if provided, otherwise set a random password
+        if password:
+            user.set_password(password)
+        else:
+            # Set a random password that won't be used (OTP-based login)
+            import secrets
+            user.set_password(secrets.token_urlsafe(32))
         user.save()
         
         return user
@@ -87,9 +105,9 @@ class StaffSerializer(serializers.ModelSerializer):
         return super().update(instance, validated_data)
 
 class SignupSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(write_only=True, required=True, validators=[validate_password])
-    password_confirm = serializers.CharField(write_only=True, required=True)
-    ghl_location_id = serializers.CharField(write_only=True, required=False, allow_blank=True, allow_null=True)
+    password = serializers.CharField(write_only=True, required=False, allow_blank=True, validators=[validate_password])
+    password_confirm = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    ghl_location_id = serializers.CharField(write_only=True, required=True, allow_blank=False)
     date_of_birth = serializers.DateField(required=False, allow_null=True)
     
     class Meta:
@@ -109,8 +127,21 @@ class SignupSerializer(serializers.ModelSerializer):
         return super().to_internal_value(data)
     
     def validate(self, attrs):
-        if attrs['password'] != attrs['password_confirm']:
-            raise serializers.ValidationError({"password": "Password fields didn't match."})
+        # Only validate password if both are provided
+        password = attrs.get('password', '')
+        password_confirm = attrs.get('password_confirm', '')
+        
+        if password or password_confirm:
+            # If one is provided, both must be provided
+            if not password or not password_confirm:
+                raise serializers.ValidationError({"password": "Both password fields are required if password is set."})
+            if password != password_confirm:
+                raise serializers.ValidationError({"password": "Password fields didn't match."})
+        
+        # Validate location_id is provided and exists
+        location_id = attrs.get('ghl_location_id')
+        if not location_id:
+            raise serializers.ValidationError({"ghl_location_id": "Location is required."})
         
         # Check if email already exists
         if User.objects.filter(email=attrs['email']).exists():
@@ -123,8 +154,8 @@ class SignupSerializer(serializers.ModelSerializer):
         return attrs
     
     def create(self, validated_data):
-        validated_data.pop('password_confirm')
-        password = validated_data.pop('password')
+        password_confirm = validated_data.pop('password_confirm', None)
+        password = validated_data.pop('password', None)
         
         # Auto-generate username from email (before @ symbol)
         email = validated_data.get('email')
@@ -139,7 +170,15 @@ class SignupSerializer(serializers.ModelSerializer):
         
         validated_data['username'] = username
         user = User.objects.create(**validated_data)
-        user.set_password(password)
+        
+        # Set password only if provided, otherwise set a random password (user won't use it with OTP login)
+        if password:
+            user.set_password(password)
+        else:
+            # Set a random password that won't be used (OTP-based login)
+            import secrets
+            user.set_password(secrets.token_urlsafe(32))
+        
         user.save()
         return user
 

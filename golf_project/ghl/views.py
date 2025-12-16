@@ -14,12 +14,12 @@ from rest_framework import status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.exceptions import PermissionDenied
 
 from .models import GHLLocation
 from .serializers import GHLLocationSerializer, GHLOnboardSerializer
 from .services import GHLClient, debug_contact_custom_fields, set_contact_custom_values
-from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import AllowAny
 
 logger = logging.getLogger(__name__)
 
@@ -417,4 +417,93 @@ def test_purchase_custom_field(request):
         return Response({"error": "Failed to sync with GHL"}, status=500)
 
 
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def list_all_ghl_locations(request):
+    """
+    List all GHL locations for superadmin.
+    GET /api/ghlpage/admin/locations/
+    """
+    # Only superadmin can access this
+    if request.user.role != 'superadmin':
+        raise PermissionDenied("Only superadmin can access this endpoint.")
+    
+    locations = GHLLocation.objects.all().order_by('company_name', 'location_id')
+    serializer = GHLLocationSerializer(locations, many=True)
+    return Response({
+        'locations': serializer.data,
+        'count': locations.count(),
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['PUT', 'PATCH'])
+@permission_classes([IsAuthenticated])
+def update_ghl_location_company_name(request, location_id):
+    """
+    Update company name for a GHL location.
+    Only superadmin can update company names.
+    PUT/PATCH /api/ghlpage/admin/locations/<location_id>/company-name/
+    Body: {"company_name": "New Company Name"}
+    """
+    # Only superadmin can access this
+    if request.user.role != 'superadmin':
+        raise PermissionDenied("Only superadmin can update company names.")
+    
+    try:
+        location = GHLLocation.objects.get(location_id=location_id)
+    except GHLLocation.DoesNotExist:
+        return Response(
+            {'error': f'Location with location_id {location_id} does not exist.'},
+            status=status.HTTP_404_NOT_FOUND
+        )
+    
+    company_name = request.data.get('company_name', '').strip()
+    location.company_name = company_name
+    location.save(update_fields=['company_name', 'updated_at'])
+    
+    serializer = GHLLocationSerializer(location)
+    return Response({
+        'message': 'Company name updated successfully.',
+        'location': serializer.data
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def set_ghl_location_company_name(request):
+    """
+    Set company name for a GHL location.
+    Only superadmin can set company names.
+    POST /api/ghlpage/admin/locations/set-company-name/
+    Body: {"location_id": "...", "company_name": "Company Name"}
+    """
+    # Only superadmin can access this
+    if request.user.role != 'superadmin':
+        raise PermissionDenied("Only superadmin can set company names.")
+    
+    location_id = request.data.get('location_id')
+    company_name = request.data.get('company_name', '').strip()
+    
+    if not location_id:
+        return Response(
+            {'error': 'location_id is required.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    try:
+        location = GHLLocation.objects.get(location_id=location_id)
+    except GHLLocation.DoesNotExist:
+        return Response(
+            {'error': f'Location with location_id {location_id} does not exist.'},
+            status=status.HTTP_404_NOT_FOUND
+        )
+    
+    location.company_name = company_name
+    location.save(update_fields=['company_name', 'updated_at'])
+    
+    serializer = GHLLocationSerializer(location)
+    return Response({
+        'message': 'Company name set successfully.',
+        'location': serializer.data
+    }, status=status.HTTP_200_OK)
 

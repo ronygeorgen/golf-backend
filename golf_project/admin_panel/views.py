@@ -68,9 +68,17 @@ class StaffViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """Filter staff by location_id"""
         queryset = User.objects.filter(role__in=['staff', 'admin'])
-        location_id = get_location_id_from_request(self.request)
-        if location_id:
-            queryset = queryset.filter(ghl_location_id=location_id)
+        # Superadmin can see all admins, regular admin can only see staff from their location
+        if self.request.user.role == 'superadmin':
+            # Superadmin can see all admins across all locations
+            pass
+        else:
+            # Regular admin can only see staff members (not other admins) from their location
+            location_id = get_location_id_from_request(self.request)
+            if location_id:
+                queryset = queryset.filter(ghl_location_id=location_id, role='staff')
+            else:
+                queryset = queryset.filter(role='staff')
         return queryset
     
     def get_serializer_class(self):
@@ -81,11 +89,50 @@ class StaffViewSet(viewsets.ModelViewSet):
         return StaffSerializer
     
     def perform_create(self, serializer):
-        """Set location_id when creating staff"""
-        location_id = get_location_id_from_request(self.request)
-        if location_id:
-            serializer.save(ghl_location_id=location_id)
+        """Set location_id when creating staff/admin"""
+        user = self.request.user
+        
+        # Superadmin can create admin and assign location_id
+        if user.role == 'superadmin':
+            location_id = self.request.data.get('ghl_location_id')
+            role = serializer.validated_data.get('role', 'admin')
+            # Superadmin can only create admin, not staff or client
+            if role != 'admin':
+                raise PermissionDenied("Superadmin can only create admin users.")
+            if location_id:
+                # Validate location exists
+                from ghl.models import GHLLocation
+                try:
+                    GHLLocation.objects.get(location_id=location_id)
+                    serializer.save(ghl_location_id=location_id, role='admin')
+                except GHLLocation.DoesNotExist:
+                    raise PermissionDenied(f"Location {location_id} does not exist.")
+            else:
+                raise PermissionDenied("Location ID is required when creating admin.")
         else:
+            # Regular admin can only create staff (not admin) for their location
+            role = serializer.validated_data.get('role', 'staff')
+            if role == 'admin':
+                raise PermissionDenied("Regular admins can only create staff members, not admin users.")
+            location_id = get_location_id_from_request(self.request)
+            if location_id:
+                serializer.save(ghl_location_id=location_id, role='staff')
+            else:
+                serializer.save(role='staff')
+    
+    def perform_update(self, serializer):
+        """Prevent regular admins from changing role to admin"""
+        user = self.request.user
+        
+        # If regular admin (not superadmin), ensure role is not changed to admin
+        if user.role != 'superadmin':
+            role = serializer.validated_data.get('role')
+            if role == 'admin':
+                raise PermissionDenied("Regular admins cannot change user role to admin.")
+            # Force role to staff if not superadmin
+            serializer.save(role='staff')
+        else:
+            # Superadmin can update freely
             serializer.save()
     
     @action(detail=True, methods=['get', 'put'])

@@ -23,8 +23,8 @@ class GHLLocationSerializer(serializers.ModelSerializer):
             'created_at',
         ]
         read_only_fields = [
-            'id', 'status', 'webhook_secret', 'access_token', 'refresh_token',
-            'token_expires_at', 'is_token_valid', 'metadata', 'onboarded_at', 'created_at'
+            'id', 'status', 'webhook_secret', 'token_expires_at', 
+            'is_token_valid', 'metadata', 'onboarded_at', 'created_at'
         ]
         extra_kwargs = {
             'access_token': {'write_only': True},

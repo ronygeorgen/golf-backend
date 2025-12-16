@@ -514,13 +514,12 @@ def signup(request):
             logger.warning("Failed to sync GHL for signup %s: %s", user.phone, exc)
             # Don't fail signup if GHL sync fails
         
-        # Create authentication token
-        token, created = Token.objects.get_or_create(user=user)
+        # Don't create token yet - user needs to verify OTP first
+        # Token will be created in verify_otp endpoint after OTP verification
         
         return Response({
-            'message': 'User created successfully',
-            'token': token.key,
-            'user': UserSerializer(user).data,
+            'message': 'User created successfully. Please verify OTP to complete signup.',
+            'phone': user.phone,
             'converted_purchases_count': len(converted_purchases)
         }, status=status.HTTP_201_CREATED)
     
