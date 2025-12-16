@@ -27,3 +27,4 @@ class Command(BaseCommand):
             self.stdout.write(
                 self.style.WARNING(f'Could not set role to superadmin: {e}')
             )
+

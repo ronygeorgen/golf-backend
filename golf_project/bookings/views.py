@@ -739,6 +739,7 @@ class BookingViewSet(viewsets.ModelViewSet):
     def coaching_sessions_by_coach(self, request):
         """Get coaching sessions where a specific coach is assigned"""
         coach_id = request.query_params.get('coach_id')
+        filter_type = request.query_params.get('filter', 'upcoming')  # 'upcoming' or 'completed'
         
         # If coach_id is provided, use it; otherwise use the current user (for staff viewing their own sessions)
         if coach_id:
@@ -758,21 +759,32 @@ class BookingViewSet(viewsets.ModelViewSet):
                 )
             target_coach_id = request.user.id
         
-        # Get upcoming coaching sessions where this coach is assigned
-        upcoming_sessions = Booking.objects.filter(
+        # Base queryset for coaching sessions
+        sessions = Booking.objects.filter(
             booking_type='coaching',
-            coach_id=target_coach_id,
-            start_time__gte=timezone.now()
-        ).exclude(status='cancelled').order_by('start_time')
+            coach_id=target_coach_id
+        ).exclude(status='cancelled')
+        
+        # Filter by upcoming or completed
+        if filter_type == 'completed':
+            # Completed sessions: status is 'completed' or start_time is in the past
+            sessions = sessions.filter(
+                Q(status='completed') | Q(start_time__lt=timezone.now())
+            ).order_by('-start_time')  # Most recent first
+        else:
+            # Upcoming sessions: start_time is in the future
+            sessions = sessions.filter(
+                start_time__gte=timezone.now()
+            ).order_by('start_time')  # Earliest first
         
         # Use 5 per page pagination
         paginator = FivePerPagePagination()
-        page = paginator.paginate_queryset(upcoming_sessions, request)
+        page = paginator.paginate_queryset(sessions, request)
         if page is not None:
             serializer = self.get_serializer(page, many=True)
             return paginator.get_paginated_response(serializer.data)
         
-        serializer = self.get_serializer(upcoming_sessions, many=True)
+        serializer = self.get_serializer(sessions, many=True)
         return Response(serializer.data)
     
     def _is_admin(self, user):
