@@ -44,6 +44,12 @@ def sync_user_contact_task(self, user_id, location_id=None, tags=None, custom_fi
             logger.error("User %s not found for GHL sync", user_id)
             return None
         
+        # If location_id not provided, use user's ghl_location_id from database
+        if not location_id:
+            location_id = getattr(user, 'ghl_location_id', None)
+            if location_id:
+                logger.info("Using user's ghl_location_id from database: %s", location_id)
+        
         result = sync_user_contact(
             user,
             location_id=location_id,
@@ -51,7 +57,12 @@ def sync_user_contact_task(self, user_id, location_id=None, tags=None, custom_fi
             custom_fields=custom_fields,
         )
         
-        logger.info("Successfully synced user %s with GHL", user_id)
+        # Only log success if result is not None (sync actually succeeded)
+        if result and result[0] is not None:
+            logger.info("Successfully synced user %s with GHL (location: %s)", user_id, location_id or user.ghl_location_id)
+        else:
+            logger.warning("GHL sync returned None for user %s (location: %s). Check if location exists and OAuth is complete.", 
+                         user_id, location_id or user.ghl_location_id)
         return result
     except Exception as exc:
         logger.error("Failed to sync user %s with GHL: %s", user_id, exc, exc_info=True)

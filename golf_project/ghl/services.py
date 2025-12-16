@@ -468,10 +468,11 @@ class GHLClient:
             # First, try to create/update the contact
             response = requests.post(endpoint, json=payload, headers=headers, timeout=30)
             
-            if response.status_code == 200:
+            # GHL returns 200 for updates and 201 for successful creation
+            if response.status_code in (200, 201):
                 contact_data = response.json()
                 contact_id = contact_data.get('contact', {}).get('id') or contact_data.get('id')
-                logger.info(f"Successfully synced contact {phone} with GHL (contact_id: {contact_id})")
+                logger.info(f"Successfully synced contact {phone} with GHL (contact_id: {contact_id}, status: {response.status_code})")
                 
                 # Ensure custom fields exist before setting values
                 if custom_fields and contact_id:
@@ -508,13 +509,16 @@ class GHLClient:
                         return update_response.json()
                     else:
                         logger.error(f"Failed to update contact {phone}: {update_response.text}")
-                        return None
+                        # If update fails, try to get the contact by phone
+                        return self._get_contact_by_phone_and_update(phone, location_id, payload, custom_fields)
                 else:
                     logger.error(f"Could not extract contact ID from duplicate error")
-                    return None
+                    # Try to get the contact by phone instead
+                    return self._get_contact_by_phone_and_update(phone, location_id, payload, custom_fields)
             else:
-                response.raise_for_status()
-                return None
+                logger.error(f"Failed to create contact {phone}: {response.status_code} - {response.text}")
+                # Try direct creation without locationId in payload for existing contacts
+                return self._create_or_update_contact_direct(phone, location_id, payload, custom_fields, headers)
                 
         except requests.exceptions.HTTPError as exc:
             logger.error(f"Failed to sync contact {phone}: {exc}")
@@ -523,6 +527,116 @@ class GHLClient:
             logger.error(f"Failed to sync contact {phone}: {exc}")
             return None
 
+    # Add these helper methods to the GHLClient class
+    def _get_existing_contact_id(self, phone, location_id):
+        """Get existing contact ID by phone number"""
+        try:
+            # Search for contact by phone
+            search_url = f"{self.base_url}/contacts/search"
+            search_payload = {
+                "query": {
+                    "locationId": location_id,
+                    "phone": phone
+                }
+            }
+            
+            headers = self._headers()
+            if 'Location' in headers:
+                del headers['Location']
+            
+            search_response = requests.post(search_url, json=search_payload, headers=headers, timeout=30)
+            if search_response.status_code == 200:
+                search_data = search_response.json()
+                contacts = search_data.get('contacts', [])
+                if contacts:
+                    contact = contacts[0]
+                    contact_id = contact.get('id')
+                    logger.info(f"Found existing contact {phone} with ID: {contact_id}")
+                    return contact_id
+            
+            return None
+        except Exception as exc:
+            logger.error(f"Failed to search for contact {phone}: {exc}")
+            return None
+    
+    def _get_contact_by_phone_and_update(self, phone, location_id, payload, custom_fields):
+        """Get contact by phone and update it"""
+        try:
+            # Search for contact by phone
+            search_url = f"{self.base_url}/contacts/search"
+            search_payload = {
+                "query": {
+                    "locationId": location_id,
+                    "phone": phone
+                }
+            }
+            
+            headers = self._headers()
+            if 'Location' in headers:
+                del headers['Location']
+            
+            search_response = requests.post(search_url, json=search_payload, headers=headers, timeout=30)
+            if search_response.status_code == 200:
+                search_data = search_response.json()
+                contacts = search_data.get('contacts', [])
+                if contacts:
+                    contact = contacts[0]
+                    contact_id = contact.get('id')
+                    
+                    # Update the contact
+                    update_payload = {k: v for k, v in payload.items() if k != 'locationId'}
+                    update_endpoint = f"{self.base_url}/contacts/{contact_id}"
+                    
+                    update_response = requests.put(update_endpoint, json=update_payload, headers=headers, timeout=30)
+                    if update_response.status_code == 200:
+                        logger.info(f"✅ Successfully updated contact {phone} (contact_id: {contact_id})")
+                        
+                        # Set custom values
+                        if custom_fields and contact_id:
+                            get_contact_custom_field_mapping(location_id)
+                            set_contact_custom_values(contact_id, location_id, custom_fields)
+                        
+                        return update_response.json()
+            
+            # If we get here, try direct creation
+            return self._create_or_update_contact_direct(phone, location_id, payload, custom_fields, headers)
+            
+        except Exception as exc:
+            logger.error(f"Failed to search/update contact {phone}: {exc}")
+            return None
+
+    def _create_or_update_contact_direct(self, phone, location_id, payload, custom_fields, headers):
+        """Direct creation/update with fallback logic"""
+        try:
+            # Remove locationId from payload for update/creation
+            create_payload = payload.copy()
+            if 'locationId' in create_payload:
+                del create_payload['locationId']
+            
+            endpoint = f"{self.base_url}/contacts/"
+            
+            # Try to create contact
+            response = requests.post(endpoint, json=create_payload, headers=headers, timeout=30)
+            
+            # GHL returns 200 for updates and 201 for successful creation
+            if response.status_code in (200, 201):
+                contact_data = response.json()
+                contact_id = contact_data.get('contact', {}).get('id') or contact_data.get('id')
+                logger.info(f"Successfully created contact {phone} with GHL (contact_id: {contact_id}, status: {response.status_code})")
+                
+                # Set custom values
+                if custom_fields and contact_id:
+                    get_contact_custom_field_mapping(location_id)
+                    set_contact_custom_values(contact_id, location_id, custom_fields)
+                
+                return contact_data
+            else:
+                logger.error(f"Direct creation also failed for {phone}: {response.status_code} - {response.text}")
+                return None
+                
+        except Exception as exc:
+            logger.error(f"Failed in direct creation for {phone}: {exc}")
+            return None
 
 def purchase_custom_fields(purchase_name, amount):
     """
@@ -553,7 +667,7 @@ def sync_user_contact(user, *, location_id: Optional[str] = None,
     try:
         client = GHLClient(location_id=resolved_location)
         
-        # Map custom_fields keys to field names if needed
+        # Ensure custom fields are properly formatted
         mapped_custom_fields = {}
         if custom_fields:
             # Field name mapping: key -> field name
@@ -577,13 +691,12 @@ def sync_user_contact(user, *, location_id: Optional[str] = None,
                     # Use key as-is (might be a field name already)
                     mapped_custom_fields[key] = value
         
-        # REMOVED: All tag creation logic
-        
         # Format date_of_birth for GHL (YYYY-MM-DD format)
         date_of_birth = None
         if hasattr(user, 'date_of_birth') and user.date_of_birth:
             date_of_birth = user.date_of_birth.strftime('%Y-%m-%d')
         
+        # Try to sync contact
         response = client.upsert_contact(
             phone=user.phone,
             email=getattr(user, 'email', None),
@@ -591,7 +704,7 @@ def sync_user_contact(user, *, location_id: Optional[str] = None,
             last_name=getattr(user, 'last_name', None),
             date_of_birth=date_of_birth,
             location_id=resolved_location,
-            tags=None,  # REMOVED: tags parameter
+            tags=None,
             custom_fields=mapped_custom_fields,
         )
         
@@ -604,6 +717,22 @@ def sync_user_contact(user, *, location_id: Optional[str] = None,
             user.save(update_fields=['ghl_contact_id'])
             logger.info("Saved GHL contact_id %s for user %s", contact_id, user.id)
 
+        # If contact_id is None, try one more approach - search and update
+        if not contact_id:
+            logger.warning(f"Contact ID not found for user {user.id}, trying alternative approach...")
+            # Try to get existing contact by phone
+            contact_id = client._get_existing_contact_id(user.phone, resolved_location)
+            if contact_id:
+                user.ghl_contact_id = contact_id
+                user.save(update_fields=['ghl_contact_id'])
+                logger.info("Found existing contact ID %s for user %s", contact_id, user.id)
+                
+                # If we found the contact but didn't set custom fields yet, set them now
+                if mapped_custom_fields and contact_id:
+                    get_contact_custom_field_mapping(resolved_location)
+                    set_contact_custom_values(contact_id, resolved_location, mapped_custom_fields)
+                    logger.info("Set custom fields for existing contact %s", contact_id)
+
         logger.info("Successfully synced user %s to GHL location %s", user.id, resolved_location)
         return response, contact_id
         
@@ -611,7 +740,6 @@ def sync_user_contact(user, *, location_id: Optional[str] = None,
         logger.error("GHL sync failed for user %s (location: %s): %s", 
                    user.id, resolved_location, exc, exc_info=True)
         return None, None
-
 
 def calculate_total_coaching_sessions(user):
     """

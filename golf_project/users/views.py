@@ -105,25 +105,36 @@ def request_otp(request):
         user.otp_code = otp
         user.otp_created_at = timezone.now()
         
-        # Use user's existing ghl_location_id if set, otherwise don't change it
-        resolved_location = user.ghl_location_id or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+        # Get user's ghl_location_id from database (priority) - this is what we use for GHL sync
+        # Only update user's location if they don't have one and we get one from request
+        resolved_location = user.ghl_location_id
+        if not resolved_location:
+            # If user doesn't have location_id, try to get from request or use default
+            request_location_id = get_location_id_from_request(request)
+            resolved_location = request_location_id or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            # Update user's ghl_location_id if we got one from request
+            if request_location_id:
+                user.ghl_location_id = request_location_id
         
-        user.save(update_fields=['otp_code', 'otp_created_at'])
+        user.save(update_fields=['otp_code', 'otp_created_at', 'ghl_location_id'])
         
         # Sync with GHL when OTP is requested (create/update contact with OTP code) - via Celery
+        # Always use user's ghl_location_id from database for sync
         if resolved_location:
+            logger.info("GHL sync for OTP request - User ID: %s, User's ghl_location_id from DB: %s, Resolved location: %s", 
+                       user.id, user.ghl_location_id, resolved_location)
             try:
                 if CELERY_AVAILABLE and sync_user_contact_task:
-                    # Queue async task to sync with GHL
+                    # Queue async task to sync with GHL - use user's ghl_location_id from database
                     sync_user_contact_task.delay(
                         user.id,
-                        location_id=resolved_location,
+                        location_id=resolved_location,  # This is user's ghl_location_id from DB
                         tags=None,  # REMOVED: tags
                         custom_fields={
                             'login_otp': otp,  # Store the OTP code in GHL
                         },
                     )
-                    logger.info("Queued GHL sync task for user %s (OTP request)", user.id)
+                    logger.info("Queued GHL sync task for user %s (OTP request) with location_id: %s", user.id, resolved_location)
                 else:
                     # Fallback to synchronous call if Celery not available
                     from ghl.services import sync_user_contact
@@ -183,47 +194,66 @@ def verify_otp(request):
                 user.otp_created_at and 
                 timezone.now() - user.otp_created_at < timedelta(minutes=5)):
                 
+                # Capture the OTP before clearing it (needed for GHL sync)
+                verified_otp = otp
+                
                 user.otp_code = None
                 user.otp_created_at = None
                 user.phone_verified = True
                 
-                # Use user's existing ghl_location_id if set
-                resolved_location = user.ghl_location_id or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+                # Get user's ghl_location_id from database (priority) - this is what we use for GHL sync
+                # Only update user's location if they don't have one and we get one from request
+                resolved_location = user.ghl_location_id
+                if not resolved_location:
+                    # If user doesn't have location_id, try to get from request or use default
+                    request_location_id = get_location_id_from_request(request)
+                    resolved_location = request_location_id or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+                    # Update user's ghl_location_id if we got one from request
+                    if request_location_id:
+                        user.ghl_location_id = request_location_id
                 
-                user.save(update_fields=['otp_code', 'otp_created_at', 'phone_verified'])
+                user.save(update_fields=['otp_code', 'otp_created_at', 'phone_verified', 'ghl_location_id'])
                 
                 logger.info("OTP verification for user %s (phone: %s)", user.id, user.phone)
                 
                 # Get or create authentication token
                 token, created = Token.objects.get_or_create(user=user)
                 
-                logger.info("Resolved GHL location for sync: %s", resolved_location)
+                # Log location resolution for debugging
+                logger.info("GHL sync for login - User ID: %s, User's ghl_location_id from DB: %s, Resolved location: %s", 
+                           user.id, user.ghl_location_id, resolved_location)
                 if resolved_location:
                     try:
+                        # Store the OTP that was used for login in GHL custom field (like signup does)
+                        # This ensures contact is created/updated in GHL during login (same as signup)
                         if CELERY_AVAILABLE and sync_user_contact_task:
-                            # Queue async task to update last_login_at
-                            # Don't pass location_id - let sync_user_contact use user's ghl_location_id
+                            # Queue async task to sync with GHL - create contact if doesn't exist, update if exists
+                            # Store both OTP and last_login_at in custom fields (follows signup pattern)
                             sync_user_contact_task.delay(
                                 user.id,
-                                location_id=None,  # Will use user's ghl_location_id
+                                location_id=resolved_location,  # This is user's ghl_location_id from DB
                                 tags=None,  # REMOVED: tags
                                 custom_fields={
+                                    'login_otp': verified_otp,  # Store the OTP code used for login (like signup)
                                     'last_login_at': timezone.now().isoformat(),
                                 },
                             )
-                            logger.info("Queued GHL sync task for user %s (OTP verification)", user.id)
+                            logger.info("Queued GHL sync task for user %s (OTP verification/login) with location_id: %s, OTP: %s", 
+                                      user.id, resolved_location, verified_otp)
                         else:
                             # Fallback to synchronous call if Celery not available
                             from ghl.services import sync_user_contact
                             sync_user_contact(
                                 user,
-                                location_id=None,  # Will use user's ghl_location_id
+                                location_id=resolved_location,  # Use resolved location
                                 tags=None,  # REMOVED: tags
                                 custom_fields={
+                                    'login_otp': verified_otp,  # Store the OTP code used for login (like signup)
                                     'last_login_at': timezone.now().isoformat(),
                                 },
                             )
-                            logger.info("Successfully updated last_login_at for user %s in GHL location %s", user.phone, resolved_location)
+                            logger.info("Successfully synced user %s to GHL location %s during login (OTP: %s)", 
+                                      user.phone, resolved_location, verified_otp)
                     except Exception as exc:
                         logger.warning("Failed to update GHL for OTP verification %s: %s", user.phone, exc)
                         # Don't fail the login if GHL sync fails
