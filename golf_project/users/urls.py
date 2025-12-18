@@ -21,5 +21,8 @@ urlpatterns = [
     
     # Profile endpoints
     path('update-dob/', views.update_dob, name='update_dob'),
+    
+    # Member list endpoint (staff only)
+    path('member-list/', views.member_list, name='member_list'),
 ] + router.urls
 

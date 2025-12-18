@@ -9,6 +9,7 @@ from rest_framework.authtoken.models import Token
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.pagination import PageNumberPagination
 from .utils import get_location_id_from_request, filter_by_location, get_users_by_location
 
 try:
@@ -27,6 +28,23 @@ from .serializers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class MemberListPagination(PageNumberPagination):
+    page_size = 10
+    page_size_query_param = 'page_size'
+    max_page_size = 100
+    
+    def get_paginated_response(self, data):
+        return Response({
+            'count': self.page.paginator.count,
+            'total_pages': self.page.paginator.num_pages,
+            'current_page': self.page.number,
+            'page_size': self.page_size,
+            'next': self.get_next_link(),
+            'previous': self.get_previous_link(),
+            'members': data
+        })
 
 
 @api_view(['GET'])
@@ -758,4 +776,99 @@ def auto_login(request):
         logger.error(f"Error in auto_login: {e}")
         return Response({
             'error': 'An error occurred during auto-login'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def member_list(request):
+    """
+    Get list of clients (members) for staff's location with custom fields.
+    Only accessible by staff users.
+    Returns clients with name, email, phone, and custom fields.
+    """
+    # Check if user is staff
+    if request.user.role != 'staff':
+        return Response({
+            'error': 'Only staff members can access member list'
+        }, status=status.HTTP_403_FORBIDDEN)
+    
+    # Get staff's location_id
+    location_id = request.user.ghl_location_id
+    if not location_id:
+        return Response({
+            'error': 'Staff member must have a location_id assigned'
+        }, status=status.HTTP_400_BAD_REQUEST)
+    
+    try:
+        from ghl.services import (
+            calculate_total_coaching_sessions,
+            calculate_total_simulator_hours,
+            get_last_active_package
+        )
+        from coaching.models import CoachingPackagePurchase, TempPurchase
+        
+        # Get all clients for this location
+        clients = User.objects.filter(
+            role='client',
+            ghl_location_id=location_id,
+            is_active=True
+        ).order_by('first_name', 'last_name', 'email')
+        
+        # Apply pagination
+        paginator = MemberListPagination()
+        page = paginator.paginate_queryset(clients, request)
+        
+        if page is None:
+            # If pagination is not applied, return all (shouldn't happen with pagination)
+            page = clients
+        
+        member_list_data = []
+        staff_user_id = request.user.id
+        
+        for client in page:
+            # Calculate custom fields
+            total_sessions = calculate_total_coaching_sessions(client)
+            total_hours = calculate_total_simulator_hours(client)
+            last_package = get_last_active_package(client)
+            
+            # Get staff-referred purchases
+            from coaching.models import CoachingPackagePurchase
+            staff_referred_purchases = CoachingPackagePurchase.objects.filter(
+                referral_id=staff_user_id,
+                client=client,
+                package_status='active'
+            ).values('id', 'package__title', 'purchase_name', 'purchased_at')
+            
+            staff_referred_purchases = [
+                {
+                    'id': p['id'],
+                    'package_name': p['package__title'],
+                    'purchase_name': p['purchase_name'] or p['package__title'],
+                    'purchased_at': p['purchased_at'].isoformat() if p['purchased_at'] else None
+                }
+                for p in staff_referred_purchases
+            ]
+            
+            member_list_data.append({
+                'id': client.id,
+                'first_name': client.first_name or '',
+                'last_name': client.last_name or '',
+                'email': client.email or '',
+                'phone': client.phone,
+                'custom_fields': {
+                    'total_coaching_session': str(total_sessions),
+                    'total_simulator_hour': str(total_hours),
+                    'last_active_package': last_package or ''
+                },
+                'staff_referred_purchases': staff_referred_purchases
+            })
+        
+        # Return paginated response
+        return paginator.get_paginated_response(member_list_data)
+        
+    except Exception as e:
+        logger.error(f"Error in member_list: {e}", exc_info=True)
+        return Response({
+            'error': 'Failed to fetch member list'
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

@@ -19,6 +19,12 @@ from django.conf import settings
 from .services import (
     sync_user_contact,
     purchase_custom_fields,
+    get_first_upcoming_simulator_booking,
+    get_first_upcoming_coaching_booking,
+    format_booking_datetime,
+    get_contact_custom_field_value,
+    get_contact_custom_field_mapping,
+    set_contact_custom_values,
 )
 
 logger = logging.getLogger(__name__)
@@ -161,5 +167,160 @@ def refresh_ghl_tokens_task():
         }
     except Exception as exc:
         logger.error("Failed to run token refresh task: %s", exc, exc_info=True)
+        raise
+
+
+@shared_task
+def update_upcoming_booking_dates_task():
+    """
+    Periodic task to update upcoming booking dates in GHL custom fields.
+    Runs every minute to check and update:
+    - 'upcoming simulator booking date'
+    - 'upcoming coaching session booking date'
+    
+    For each client at each onboarded location, finds the first upcoming booking
+    of each type and updates the custom fields if the value has changed.
+    """
+    try:
+        from .models import GHLLocation
+        from users.models import User
+        from django.utils import timezone
+        
+        # Get all onboarded locations
+        onboarded_locations = GHLLocation.objects.filter(
+            access_token__isnull=False
+        ).exclude(access_token='')
+        
+        updated_count = 0
+        skipped_count = 0
+        error_count = 0
+        
+        for location in onboarded_locations:
+            try:
+                location_id = location.location_id
+                
+                # Get all clients for this location
+                clients = User.objects.filter(
+                    role='client',
+                    ghl_location_id=location_id,
+                    is_active=True,
+                    phone__isnull=False
+                ).exclude(phone='')
+                
+                logger.info(f"Processing {clients.count()} clients for location {location_id}")
+                
+                for client in clients:
+                    try:
+                        # Skip if client doesn't have a GHL contact ID
+                        if not client.ghl_contact_id:
+                            logger.debug(f"Client {client.id} has no GHL contact ID, skipping")
+                            continue
+                        
+                        contact_id = client.ghl_contact_id
+                        custom_fields_to_update = {}
+                        
+                        # Get first upcoming simulator booking
+                        simulator_booking = get_first_upcoming_simulator_booking(
+                            client, 
+                            location_id=location_id
+                        )
+                        simulator_date_str = format_booking_datetime(simulator_booking) if simulator_booking else ''
+                        
+                        # Get current value from GHL
+                        current_simulator_date = get_contact_custom_field_value(
+                            contact_id,
+                            location_id,
+                            'upcoming_simulator_booking_date'
+                        ) or ''
+                        
+                        # Only update if value is different
+                        if simulator_date_str != current_simulator_date:
+                            custom_fields_to_update['upcoming simulator booking date'] = simulator_date_str
+                            logger.info(
+                                f"Client {client.id}: Simulator booking date changed from "
+                                f"'{current_simulator_date}' to '{simulator_date_str}'"
+                            )
+                        
+                        # Get first upcoming coaching booking
+                        coaching_booking = get_first_upcoming_coaching_booking(
+                            client,
+                            location_id=location_id
+                        )
+                        coaching_date_str = format_booking_datetime(coaching_booking) if coaching_booking else ''
+                        
+                        # Get current value from GHL
+                        current_coaching_date = get_contact_custom_field_value(
+                            contact_id,
+                            location_id,
+                            'upcoming_coaching_session_booking_date'
+                        ) or ''
+                        
+                        # Only update if value is different
+                        if coaching_date_str != current_coaching_date:
+                            custom_fields_to_update['upcoming coaching session booking date'] = coaching_date_str
+                            logger.info(
+                                f"Client {client.id}: Coaching booking date changed from "
+                                f"'{current_coaching_date}' to '{coaching_date_str}'"
+                            )
+                        
+                        # Update custom fields if there are changes
+                        if custom_fields_to_update:
+                            # Ensure field mappings exist
+                            get_contact_custom_field_mapping(location_id)
+                            
+                            # Update the custom fields
+                            success = set_contact_custom_values(
+                                contact_id,
+                                location_id,
+                                custom_fields_to_update
+                            )
+                            
+                            if success:
+                                updated_count += 1
+                                logger.info(
+                                    f"Successfully updated booking dates for client {client.id} "
+                                    f"(contact {contact_id})"
+                                )
+                            else:
+                                error_count += 1
+                                logger.error(
+                                    f"Failed to update booking dates for client {client.id} "
+                                    f"(contact {contact_id})"
+                                )
+                        else:
+                            skipped_count += 1
+                            logger.debug(
+                                f"Skipped client {client.id}: no changes to booking dates"
+                            )
+                            
+                    except Exception as exc:
+                        error_count += 1
+                        logger.error(
+                            f"Error processing client {client.id} for location {location_id}: {exc}",
+                            exc_info=True
+                        )
+                        continue
+                
+            except Exception as exc:
+                logger.error(
+                    f"Error processing location {location.location_id}: {exc}",
+                    exc_info=True
+                )
+                continue
+        
+        logger.info(
+            f"Upcoming booking dates update completed: "
+            f"{updated_count} updated, {skipped_count} skipped, {error_count} errors"
+        )
+        
+        return {
+            'updated': updated_count,
+            'skipped': skipped_count,
+            'errors': error_count,
+            'locations_processed': onboarded_locations.count()
+        }
+        
+    except Exception as exc:
+        logger.error(f"Failed to run upcoming booking dates update task: {exc}", exc_info=True)
         raise
 

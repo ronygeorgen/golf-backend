@@ -1031,6 +1031,7 @@ class CreateTempPurchaseView(APIView):
         buyer_phone = request.data.get('buyer_phone')
         purchase_type = request.data.get('purchase_type', 'normal')
         recipients = request.data.get('recipients', [])
+        referral_id = request.data.get('referral_id')  # Optional: staff user ID who referred this purchase
         
         # Validate required fields
         if not package_id:
@@ -1118,6 +1119,18 @@ class CreateTempPurchaseView(APIView):
         elif purchase_type == 'normal':
             recipients = []  # Normal purchases don't have recipients
         
+        # Validate referral_id if provided
+        referral_user = None
+        if referral_id:
+            try:
+                from users.models import User
+                referral_user = User.objects.get(id=referral_id, role='staff')
+            except User.DoesNotExist:
+                return Response(
+                    {'error': f'Referral user with ID {referral_id} not found or is not a staff member.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        
         # Create temp purchase
         try:
             if package_type == 'simulator':
@@ -1126,7 +1139,8 @@ class CreateTempPurchaseView(APIView):
                     buyer_phone=buyer_phone,
                     purchase_type=purchase_type,
                     package_type='simulator',  # Explicitly store package type
-                    recipients=recipients if recipients else []
+                    recipients=recipients if recipients else [],
+                    referral_id=referral_user
                 )
             else:
                 temp_purchase = TempPurchase(
@@ -1134,7 +1148,8 @@ class CreateTempPurchaseView(APIView):
                     buyer_phone=buyer_phone,
                     purchase_type=purchase_type,
                     package_type='coaching',  # Explicitly store package type
-                    recipients=recipients if recipients else []
+                    recipients=recipients if recipients else [],
+                    referral_id=referral_user
                 )
             
             # Ensure recipients is always a list (not None) for normal purchases
@@ -1157,6 +1172,19 @@ class CreateTempPurchaseView(APIView):
             logger.info(f"Verified temp purchase exists in DB: temp_id={verify_purchase.temp_id}")
             
             redirect_url = simulator_package.redirect_url if simulator_package else package.redirect_url
+            
+            # Add referral_id to redirect URL if provided
+            if referral_id:
+                from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
+                parsed = urlparse(redirect_url)
+                query_params = parse_qs(parsed.query)
+                query_params['referral_id'] = [str(referral_id)]
+                new_query = urlencode(query_params, doseq=True)
+                redirect_url = urlunparse((
+                    parsed.scheme, parsed.netloc, parsed.path,
+                    parsed.params, new_query, parsed.fragment
+                ))
+            
             return Response({
                 'temp_id': str(temp_purchase.temp_id),
                 'redirect_url': redirect_url,
@@ -1516,7 +1544,8 @@ class PackagePurchaseWebhookView(APIView):
                         simulator_hours_total=simulator_hours,
                         simulator_hours_remaining=simulator_hours,
                         package_status='active',
-                        gift_status=None
+                        gift_status=None,
+                        referral_id=temp_purchase.referral_id  # Copy referral_id from temp_purchase
                     )
                     
                     # Sync with GHL if available

@@ -105,7 +105,9 @@ def get_contact_custom_field_mapping(location_id):
         {"name": "Purchase Amount", "type": "TEXT", "key": "purchase_amount"},
         {"name": "Total Coaching Session", "type": "TEXT", "key": "total_coaching_session"},
         {"name": "Total Simulator Hour", "type": "TEXT", "key": "total_simulator_hour"},
-        {"name": "Last Active Package", "type": "TEXT", "key": "last_active_package"}
+        {"name": "Last Active Package", "type": "TEXT", "key": "last_active_package"},
+        {"name": "upcoming simulator booking date", "type": "TEXT", "key": "upcoming_simulator_booking_date"},
+        {"name": "upcoming coaching session booking date", "type": "TEXT", "key": "upcoming_coaching_session_booking_date"}
     ]
     
     field_mapping = {}
@@ -221,7 +223,9 @@ def set_contact_custom_values(contact_id, location_id, custom_fields_dict):
                     'purchase_amount': 'Purchase Amount',
                     'total_coaching_session': 'Total Coaching Session',
                     'total_simulator_hour': 'Total Simulator Hour',
-                    'last_active_package': 'Last Active Package'
+                    'last_active_package': 'Last Active Package',
+                    'upcoming_simulator_booking_date': 'upcoming simulator booking date',
+                    'upcoming_coaching_session_booking_date': 'upcoming coaching session booking date'
                 }
                 if field_name_mapping.get(key) == field_name:
                     field_id = f_id
@@ -678,6 +682,8 @@ def sync_user_contact(user, *, location_id: Optional[str] = None,
                 'total_coaching_session': 'Total Coaching Session',
                 'total_simulator_hour': 'Total Simulator Hour',
                 'last_active_package': 'Last Active Package',
+                'upcoming_simulator_booking_date': 'upcoming simulator booking date',
+                'upcoming_coaching_session_booking_date': 'upcoming coaching session booking date',
             }
             
             for key, value in custom_fields.items():
@@ -937,6 +943,149 @@ def update_user_ghl_custom_fields(user, location_id=None):
     except Exception as exc:
         logger.error(f"Error updating GHL custom fields for user {user.id}: {exc}", exc_info=True)
         return False
+
+
+def get_contact_custom_field_value(contact_id, location_id, field_key):
+    """
+    Get the current value of a specific custom field for a contact.
+    
+    Args:
+        contact_id: GHL contact ID
+        location_id: GHL location ID
+        field_key: Internal key for the field (e.g., 'upcoming_simulator_booking_date')
+    
+    Returns:
+        The current field value as string, or None if not found
+    """
+    from .models import GHLLocation
+    import requests
+    
+    try:
+        location = GHLLocation.objects.get(location_id=location_id)
+        access_token = location.access_token
+    except GHLLocation.DoesNotExist:
+        logger.error(f"Location {location_id} not found")
+        return None
+
+    url = f"https://services.leadconnectorhq.com/contacts/{contact_id}"
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Version': '2021-07-28',
+        'Accept': 'application/json'
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=30)
+        if response.status_code == 200:
+            contact_data = response.json().get('contact', {})
+            custom_fields = contact_data.get('customFields', [])
+            
+            # Get field mapping to find the field ID
+            field_mapping = get_contact_custom_field_mapping(location_id)
+            field_id = field_mapping.get(field_key)
+            
+            if field_id:
+                # Find the field in the custom fields list
+                for field in custom_fields:
+                    if field.get('id') == field_id:
+                        return field.get('value')
+            
+            return None
+        else:
+            logger.error(f"Failed to get contact {contact_id}: {response.status_code} - {response.text}")
+            return None
+    except Exception as e:
+        logger.error(f"Error getting custom field value for contact {contact_id}: {e}")
+        return None
+
+
+def get_first_upcoming_simulator_booking(user, location_id=None):
+    """
+    Get the first upcoming simulator booking for a user.
+    
+    Args:
+        user: User instance
+        location_id: Optional location ID to filter by
+    
+    Returns:
+        Booking instance or None
+    """
+    from bookings.models import Booking
+    from django.utils import timezone
+    from django.db.models import Q
+    
+    query = Booking.objects.filter(
+        client=user,
+        booking_type='simulator',
+        status='confirmed',
+        start_time__gt=timezone.now()
+    )
+    
+    if location_id:
+        # Include bookings that match the location_id or have no location_id set
+        query = query.filter(Q(location_id=location_id) | Q(location_id__isnull=True) | Q(location_id=''))
+    
+    return query.order_by('start_time').first()
+
+
+def get_first_upcoming_coaching_booking(user, location_id=None):
+    """
+    Get the first upcoming coaching session booking for a user.
+    
+    Args:
+        user: User instance
+        location_id: Optional location ID to filter by
+    
+    Returns:
+        Booking instance or None
+    """
+    from bookings.models import Booking
+    from django.utils import timezone
+    from django.db.models import Q
+    
+    query = Booking.objects.filter(
+        client=user,
+        booking_type='coaching',
+        status='confirmed',
+        start_time__gt=timezone.now()
+    )
+    
+    if location_id:
+        # Include bookings that match the location_id or have no location_id set
+        query = query.filter(Q(location_id=location_id) | Q(location_id__isnull=True) | Q(location_id=''))
+    
+    return query.order_by('start_time').first()
+
+
+def format_booking_datetime(booking):
+    """
+    Format booking start_time to a readable date and time string.
+    
+    Args:
+        booking: Booking instance
+    
+    Returns:
+        Formatted string like "21-OCT-2021 08:30 AM" or empty string if no booking
+    """
+    if not booking or not booking.start_time:
+        return ''
+    
+    from django.utils import timezone
+    
+    # Convert to local timezone if needed
+    start_time = booking.start_time
+    if timezone.is_aware(start_time):
+        # You might want to convert to a specific timezone here
+        pass
+    
+    # Format: "DD-MMM-YYYY HH:MM AM/PM" (e.g., "21-OCT-2021 08:30 AM")
+    day = start_time.strftime("%d")
+    month = start_time.strftime("%b").upper()  # Uppercase 3-letter month abbreviation
+    year = start_time.strftime("%Y")
+    time_str = start_time.strftime("%I:%M %p")  # 12-hour format with AM/PM
+    
+    formatted_date = f"{day}-{month}-{year} {time_str}"
+    return formatted_date
 
 
 def debug_contact_custom_fields(contact_id, location_id):

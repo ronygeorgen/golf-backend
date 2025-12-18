@@ -224,6 +224,10 @@ if crontab:
             # 'schedule': crontab(minute='*/30'),  # Every 30 minutes
             # 'schedule': crontab(hour=0, minute=0),  # Daily at midnight
         },
+        'update-upcoming-booking-dates': {
+            'task': 'ghl.tasks.update_upcoming_booking_dates_task',
+            'schedule': crontab(hour='9,13,15,21,0', minute=0),  # Run at 9 AM, 1 PM, 3 PM, 9 PM, and midnight (end of day)
+        },
     }
 else:
     CELERY_BEAT_SCHEDULE = {}

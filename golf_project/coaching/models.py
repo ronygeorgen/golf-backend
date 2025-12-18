@@ -96,6 +96,14 @@ class CoachingPackagePurchase(models.Model):
     purchased_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     gift_expires_at = models.DateTimeField(null=True, blank=True, help_text="Expiration date for gift claim")
+    referral_id = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='referred_purchases',
+        help_text="Staff member who referred this purchase (optional)"
+    )
     
     class Meta:
         ordering = ['-purchased_at']
@@ -293,6 +301,14 @@ class TempPurchase(models.Model):
         null=True,
         blank=True,
         help_text="Expiration time for temp purchase (default 24 hours)"
+    )
+    referral_id = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='referred_temp_purchases',
+        help_text="Staff member who referred this purchase (optional)"
     )
     
     class Meta:
