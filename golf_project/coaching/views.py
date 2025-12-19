@@ -236,10 +236,15 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def my(self, request):
         # Get personal/gifted purchases (exclude organization packages)
+        # Only include purchases where user is the client or received as gift
+        # The filter by client=request.user ensures staff don't see packages they referred to clients
+        # (where they are the referrer but not the client)
         purchases = self.get_queryset().filter(
             Q(client=request.user) | 
             Q(recipient_phone=request.user.phone, gift_status='accepted')
-        ).exclude(purchase_type='organization').order_by('-purchased_at')
+        ).exclude(
+            purchase_type='organization'
+        ).order_by('-purchased_at')
         
         # Apply pagination
         paginator = TenPerPagePagination()
