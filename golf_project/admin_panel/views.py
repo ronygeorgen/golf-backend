@@ -338,6 +338,123 @@ class StaffViewSet(viewsets.ModelViewSet):
             # Return updated availability list
             serializer = StaffDayAvailabilitySerializer(updated_availability, many=True, context={'location_id': location_id})
             return Response(serializer.data)
+    
+    @action(detail=True, methods=['get'], url_path='referrals')
+    def referrals(self, request, pk=None):
+        """
+        Get all clients and packages referred by a specific staff member.
+        Returns clients with their details and staff-referred packages.
+        """
+        staff = self.get_object()
+        
+        # Verify staff belongs to admin's location
+        location_id = get_location_id_from_request(request)
+        if location_id and staff.ghl_location_id != location_id:
+            raise PermissionDenied("You can only view referrals for staff in your location.")
+        
+        try:
+            from ghl.services import (
+                calculate_total_coaching_sessions,
+                calculate_total_simulator_hours,
+                get_last_active_package
+            )
+            from coaching.models import CoachingPackagePurchase
+            from rest_framework.pagination import PageNumberPagination
+            from rest_framework.response import Response as DRFResponse
+            
+            # Custom paginator for referrals
+            class ReferralsPagination(PageNumberPagination):
+                page_size = 10
+                page_size_query_param = 'page_size'
+                max_page_size = 100
+                
+                def get_paginated_response(self, data):
+                    return DRFResponse({
+                        'count': self.page.paginator.count,
+                        'total_pages': self.page.paginator.num_pages,
+                        'current_page': self.page.number,
+                        'page_size': self.page_size,
+                        'next': self.get_next_link(),
+                        'previous': self.get_previous_link(),
+                        'total_referrals': self.page.paginator.count,
+                        'members': data
+                    })
+            
+            # Get all clients who have packages referred by this staff member
+            referred_purchases = CoachingPackagePurchase.objects.filter(
+                referral_id=staff.id,
+                package_status='active'
+            ).select_related('client', 'package').order_by('-purchased_at')
+            
+            # Get unique clients
+            unique_clients = {}
+            for purchase in referred_purchases:
+                client = purchase.client
+                if client and client.id not in unique_clients:
+                    # Calculate custom fields for this client
+                    total_sessions = calculate_total_coaching_sessions(client)
+                    total_hours = calculate_total_simulator_hours(client)
+                    last_package = get_last_active_package(client)
+                    
+                    # Get all staff-referred purchases for this client
+                    client_referred_purchases = CoachingPackagePurchase.objects.filter(
+                        referral_id=staff.id,
+                        client=client,
+                        package_status='active'
+                    ).values('id', 'package__title', 'purchase_name', 'purchased_at')
+                    
+                    staff_referred_purchases = [
+                        {
+                            'id': p['id'],
+                            'package_name': p['package__title'],
+                            'purchase_name': p['purchase_name'] or p['package__title'],
+                            'purchased_at': p['purchased_at'].isoformat() if p['purchased_at'] else None
+                        }
+                        for p in client_referred_purchases
+                    ]
+                    
+                    unique_clients[client.id] = {
+                        'id': client.id,
+                        'first_name': client.first_name or '',
+                        'last_name': client.last_name or '',
+                        'email': client.email or '',
+                        'phone': client.phone,
+                        'custom_fields': {
+                            'total_coaching_session': str(total_sessions),
+                            'total_simulator_hour': str(total_hours),
+                            'last_active_package': last_package or ''
+                        },
+                        'staff_referred_purchases': staff_referred_purchases
+                    }
+            
+            # Convert to list and sort by first name
+            clients_list = list(unique_clients.values())
+            clients_list.sort(key=lambda x: (x['first_name'], x['last_name']))
+            
+            # Apply pagination
+            paginator = ReferralsPagination()
+            page = paginator.paginate_queryset(clients_list, request)
+            
+            if page is not None:
+                return paginator.get_paginated_response(page)
+            
+            return Response({
+                'count': len(clients_list),
+                'total_pages': 1,
+                'current_page': 1,
+                'page_size': 10,
+                'total_referrals': len(clients_list),
+                'members': clients_list
+            })
+            
+        except Exception as e:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Error fetching staff referrals: {e}", exc_info=True)
+            return Response(
+                {'error': 'Failed to fetch staff referrals'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
 
 class AdminOverrideViewSet(viewsets.ViewSet):

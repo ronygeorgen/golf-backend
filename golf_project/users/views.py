@@ -808,20 +808,66 @@ def member_list(request):
         )
         from coaching.models import CoachingPackagePurchase, TempPurchase
         
+        # Get search query parameter
+        search_query = request.query_params.get('search', '').strip()
+        
         # Get all clients for this location
         clients = User.objects.filter(
             role='client',
             ghl_location_id=location_id,
             is_active=True
-        ).order_by('first_name', 'last_name', 'email')
+        )
         
-        # Apply pagination
-        paginator = MemberListPagination()
-        page = paginator.paginate_queryset(clients, request)
+        # Apply search filter if provided
+        if search_query:
+            from django.db.models import Q
+            # Split search query to handle full name searches (e.g., "John Doe")
+            search_terms = search_query.split()
+            
+            if len(search_terms) > 1:
+                # Multiple terms: try to match as full name (first + last)
+                # Also search individual terms in all fields
+                first_term = search_terms[0]
+                last_term = ' '.join(search_terms[1:])
+                
+                q_objects = Q(
+                    Q(first_name__icontains=first_term) & Q(last_name__icontains=last_term)
+                ) | Q(
+                    Q(first_name__icontains=last_term) & Q(last_name__icontains=first_term)
+                )
+                
+                # Also search each term individually in all fields
+                for term in search_terms:
+                    q_objects |= (
+                        Q(first_name__icontains=term) |
+                        Q(last_name__icontains=term) |
+                        Q(email__icontains=term) |
+                        Q(phone__icontains=term)
+                    )
+                
+                clients = clients.filter(q_objects)
+            else:
+                # Single term: search in all fields
+                clients = clients.filter(
+                    Q(first_name__icontains=search_query) |
+                    Q(last_name__icontains=search_query) |
+                    Q(email__icontains=search_query) |
+                    Q(phone__icontains=search_query)
+                )
         
-        if page is None:
-            # If pagination is not applied, return all (shouldn't happen with pagination)
+        clients = clients.order_by('first_name', 'last_name', 'email')
+        
+        # Apply pagination only if no search query
+        if search_query:
+            # No pagination for search results
             page = clients
+        else:
+            paginator = MemberListPagination()
+            page = paginator.paginate_queryset(clients, request)
+            
+            if page is None:
+                # If pagination is not applied, return all (shouldn't happen with pagination)
+                page = clients
         
         member_list_data = []
         staff_user_id = request.user.id
@@ -864,8 +910,18 @@ def member_list(request):
                 'staff_referred_purchases': staff_referred_purchases
             })
         
-        # Return paginated response
-        return paginator.get_paginated_response(member_list_data)
+        # Return response (paginated if no search, otherwise all results)
+        if search_query:
+            return Response({
+                'count': len(member_list_data),
+                'total_pages': 1,
+                'current_page': 1,
+                'page_size': len(member_list_data),
+                'members': member_list_data
+            })
+        else:
+            # Return paginated response
+            return paginator.get_paginated_response(member_list_data)
         
     except Exception as e:
         logger.error(f"Error in member_list: {e}", exc_info=True)
