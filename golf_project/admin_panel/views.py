@@ -1,3 +1,4 @@
+import logging
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -5,9 +6,12 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.pagination import PageNumberPagination
 from django.db.models import Count, Sum, Q, F
-from django.utils import timezone
-from datetime import datetime, timedelta
+from django.utils import timezone as django_timezone
+from datetime import datetime, timedelta, timezone as dt_timezone
+from decimal import Decimal
 from users.models import User, StaffAvailability, StaffDayAvailability
+
+logger = logging.getLogger(__name__)
 from users.utils import get_location_id_from_request, filter_by_location
 from simulators.models import Simulator, SimulatorCredit
 from bookings.models import Booking
@@ -21,7 +25,7 @@ class AdminDashboardViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'])
     def stats(self, request):
         location_id = get_location_id_from_request(request)
-        today = timezone.now().date()
+        today = django_timezone.now().date()
         
         # Filter by location
         bookings_qs = Booking.objects.all()
@@ -376,15 +380,154 @@ class StaffViewSet(viewsets.ModelViewSet):
                         'page_size': self.page_size,
                         'next': self.get_next_link(),
                         'previous': self.get_previous_link(),
-                        'total_referrals': self.page.paginator.count,
-                        'members': data
-                    })
+                    'total_referrals': self.page.paginator.count,
+                    'total_sales': str(getattr(self, 'total_sales', Decimal('0.00'))),
+                    'members': data
+                })
+            
+            # Get date filter parameters (expecting UTC ISO strings from frontend)
+            from_date = request.query_params.get('from_date')
+            to_date = request.query_params.get('to_date')
+            
+            # Helper function to parse UTC date string
+            def parse_utc_date(date_str, is_end_of_day=False):
+                """Parse UTC ISO date string to timezone-aware datetime"""
+                if not date_str:
+                    return None
+                
+                try:
+                    original_date_str = date_str
+                    
+                    # Handle ISO format with 'Z' suffix (UTC) - e.g., "2025-11-01T00:00:00.000Z"
+                    if date_str.endswith('Z'):
+                        # Remove 'Z' and microseconds, then add '+00:00' for fromisoformat
+                        # Python's fromisoformat can be finicky with microseconds and timezone
+                        if '.' in date_str:
+                            # Has microseconds: "2025-11-01T00:00:00.000Z"
+                            date_part = date_str.split('.')[0]  # "2025-11-01T00:00:00"
+                            date_str = date_part + '+00:00'  # "2025-11-01T00:00:00+00:00"
+                        else:
+                            # No microseconds: "2025-11-01T00:00:00Z"
+                            date_str = date_str[:-1] + '+00:00'
+                    elif 'T' in date_str:
+                        # ISO format with time but no timezone - assume UTC
+                        if '+' not in date_str and not date_str.endswith('Z'):
+                            # Remove microseconds if present before adding timezone
+                            if '.' in date_str:
+                                date_part = date_str.split('.')[0]
+                                date_str = date_part + '+00:00'
+                            else:
+                                date_str = date_str + '+00:00'
+                    
+                    # Parse the date string
+                    if 'T' in date_str:
+                        # ISO format with time - use fromisoformat
+                        try:
+                            dt = datetime.fromisoformat(date_str)
+                        except ValueError as e:
+                            logger.warning(f"fromisoformat failed for {date_str}, trying alternative: {e}")
+                            # Fallback: try parsing without microseconds
+                            if '.' in date_str:
+                                date_part = date_str.split('.')[0]
+                                if '+' in date_str:
+                                    timezone_part = date_str.split('+')[1] if '+' in date_str else '+00:00'
+                                    date_str = date_part + '+' + timezone_part
+                                else:
+                                    date_str = date_part + '+00:00'
+                            dt = datetime.fromisoformat(date_str)
+                    else:
+                        # Simple date format (YYYY-MM-DD)
+                        dt = datetime.strptime(date_str, '%Y-%m-%d')
+                        if is_end_of_day:
+                            dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+                        else:
+                            dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+                    
+                    # Ensure timezone-aware and in UTC
+                    if dt.tzinfo is None:
+                        dt = django_timezone.make_aware(dt, dt_timezone.utc)
+                    else:
+                        # Convert to UTC if in different timezone
+                        dt = dt.astimezone(dt_timezone.utc)
+                    
+                    logger.info(f"Successfully parsed date: {original_date_str} -> {dt} (UTC)")
+                    return dt
+                except (ValueError, AttributeError, TypeError) as e:
+                    logger.error(f"Error parsing date {date_str}: {e}", exc_info=True)
+                    # Return None to indicate parsing failure - this will prevent filter from being applied
+                    return None
             
             # Get all clients who have packages referred by this staff member
             referred_purchases = CoachingPackagePurchase.objects.filter(
                 referral_id=staff.id,
                 package_status='active'
-            ).select_related('client', 'package').order_by('-purchased_at')
+            ).select_related('client', 'package')
+            
+            # Apply date filter if provided (dates are in UTC ISO format from frontend)
+            from_date_obj = parse_utc_date(from_date, is_end_of_day=False) if from_date else None
+            to_date_obj = parse_utc_date(to_date, is_end_of_day=True) if to_date else None
+            
+            # Validate that if dates are provided, they must be parsed successfully
+            if from_date and from_date_obj is None:
+                logger.error(f"Failed to parse from_date: {from_date}")
+                return Response({
+                    'error': f'Invalid from_date format: {from_date}',
+                    'count': 0,
+                    'total_pages': 0,
+                    'current_page': 1,
+                    'page_size': 10,
+                    'total_referrals': 0,
+                    'total_sales': '0.00',
+                    'members': []
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            if to_date and to_date_obj is None:
+                logger.error(f"Failed to parse to_date: {to_date}")
+                return Response({
+                    'error': f'Invalid to_date format: {to_date}',
+                    'count': 0,
+                    'total_pages': 0,
+                    'current_page': 1,
+                    'page_size': 10,
+                    'total_referrals': 0,
+                    'total_sales': '0.00',
+                    'members': []
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Log parsed dates for debugging
+            if from_date or to_date:
+                logger.info(f"Date filter - from_date: {from_date} -> {from_date_obj}, to_date: {to_date} -> {to_date_obj}")
+            
+            # Log count before filtering for debugging
+            count_before_filter = referred_purchases.count()
+            logger.info(f"Referrals count BEFORE date filter: {count_before_filter}")
+            
+            # Apply date filters - these MUST be applied if dates are provided
+            if from_date_obj is not None:
+                referred_purchases = referred_purchases.filter(purchased_at__gte=from_date_obj)
+                logger.info(f"Applied from_date filter: {from_date_obj} (UTC), type: {type(from_date_obj)}")
+            
+            if to_date_obj is not None:
+                referred_purchases = referred_purchases.filter(purchased_at__lte=to_date_obj)
+                logger.info(f"Applied to_date filter: {to_date_obj} (UTC), type: {type(to_date_obj)}")
+            
+            referred_purchases = referred_purchases.order_by('-purchased_at')
+            
+            # Log count after filtering for debugging
+            if from_date or to_date:
+                count_after_filter = referred_purchases.count()
+                logger.info(f"Referrals count AFTER date filter: {count_after_filter} (from_date: {from_date_obj}, to_date: {to_date_obj})")
+                
+                # Log a sample of purchase dates to verify filtering
+                sample_purchases = list(referred_purchases[:5])
+                for p in sample_purchases:
+                    logger.info(f"Sample purchase - ID: {p.id}, purchased_at: {p.purchased_at}, tzinfo: {p.purchased_at.tzinfo if hasattr(p.purchased_at, 'tzinfo') else 'N/A'}")
+            
+            # Calculate total sales amount
+            total_sales = Decimal('0.00')
+            for purchase in referred_purchases:
+                if purchase.package and purchase.package.price:
+                    total_sales += Decimal(str(purchase.package.price))
             
             # Get unique clients
             unique_clients = {}
@@ -396,12 +539,21 @@ class StaffViewSet(viewsets.ModelViewSet):
                     total_hours = calculate_total_simulator_hours(client)
                     last_package = get_last_active_package(client)
                     
-                    # Get all staff-referred purchases for this client
-                    client_referred_purchases = CoachingPackagePurchase.objects.filter(
+                    # Get all staff-referred purchases for this client (with date filter)
+                    client_referred_purchases_qs = CoachingPackagePurchase.objects.filter(
                         referral_id=staff.id,
                         client=client,
                         package_status='active'
-                    ).values('id', 'package__title', 'purchase_name', 'purchased_at')
+                    )
+                    
+                    # Apply same date filter (reuse parsed dates from above)
+                    if from_date_obj:
+                        client_referred_purchases_qs = client_referred_purchases_qs.filter(purchased_at__gte=from_date_obj)
+                    
+                    if to_date_obj:
+                        client_referred_purchases_qs = client_referred_purchases_qs.filter(purchased_at__lte=to_date_obj)
+                    
+                    client_referred_purchases = client_referred_purchases_qs.values('id', 'package__title', 'purchase_name', 'purchased_at')
                     
                     staff_referred_purchases = [
                         {
@@ -433,6 +585,7 @@ class StaffViewSet(viewsets.ModelViewSet):
             
             # Apply pagination
             paginator = ReferralsPagination()
+            paginator.total_sales = total_sales  # Store total sales in paginator
             page = paginator.paginate_queryset(clients_list, request)
             
             if page is not None:
@@ -444,12 +597,11 @@ class StaffViewSet(viewsets.ModelViewSet):
                 'current_page': 1,
                 'page_size': 10,
                 'total_referrals': len(clients_list),
+                'total_sales': str(total_sales),
                 'members': clients_list
             })
             
         except Exception as e:
-            import logging
-            logger = logging.getLogger(__name__)
             logger.error(f"Error fetching staff referrals: {e}", exc_info=True)
             return Response(
                 {'error': 'Failed to fetch staff referrals'},
@@ -483,7 +635,7 @@ class AdminOverrideViewSet(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        now = timezone.now()
+        now = django_timezone.now()
         lock_window = timedelta(hours=24)
         
         # Get bookings that:
@@ -546,7 +698,7 @@ class AdminOverrideViewSet(viewsets.ViewSet):
                     reason=SimulatorCredit.Reason.MANUAL,
                     hours=simulator_hours,
                     hours_remaining=simulator_hours,
-                    notes=note[:255] if note else f"Simulator hours added via coaching session restore on {timezone.now().date()}"
+                    notes=note[:255] if note else f"Simulator hours added via coaching session restore on {django_timezone.now().date()}"
                 )
         
         if note:
@@ -605,7 +757,7 @@ class AdminOverrideViewSet(viewsets.ViewSet):
             reason=reason,
             hours=hours,
             hours_remaining=hours,
-            notes=note[:255] if note else f"Manual credit issued on {timezone.now().date()} ({hours} hours)"
+            notes=note[:255] if note else f"Manual credit issued on {django_timezone.now().date()} ({hours} hours)"
         )
         
         credit_data = SimulatorCreditSerializer(credit).data
@@ -835,7 +987,7 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
             )
         
         try:
-            check_datetime = timezone.make_aware(datetime.fromisoformat(datetime_str.replace('Z', '+00:00')))
+            check_datetime = django_timezone.make_aware(datetime.fromisoformat(datetime_str.replace('Z', '+00:00')), dt_timezone.utc)
         except (ValueError, TypeError):
             return Response(
                 {'error': 'Invalid datetime format. Use YYYY-MM-DDTHH:MM:SS'},
