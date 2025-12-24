@@ -20,6 +20,11 @@ class SpecialEvent(models.Model):
     # For one-time events: use date and time directly
     # For recurring events: use date as the start date, and calculate occurrences
     date = models.DateField()  # Start date for recurring events
+    recurring_end_date = models.DateField(
+        null=True, 
+        blank=True,
+        help_text="End date for recurring events. Recurring occurrences will stop on this date."
+    )
     start_time = models.TimeField()
     end_time = models.TimeField()
     
@@ -81,7 +86,7 @@ class SpecialEvent(models.Model):
         """
         Get all occurrences of this event within a date range.
         For one-time events, returns just the single date if it's in range.
-        For recurring events, calculates all occurrences.
+        For recurring events, calculates all occurrences up to recurring_end_date if set.
         """
         if start_date is None:
             start_date = timezone.now().date()
@@ -90,18 +95,23 @@ class SpecialEvent(models.Model):
         
         occurrences = []
         
+        # For recurring events, use recurring_end_date as the limit if set
+        recurring_limit = self.recurring_end_date if self.recurring_end_date else end_date
+        # Use the earlier of recurring_limit or end_date
+        effective_end_date = min(recurring_limit, end_date) if recurring_limit else end_date
+        
         if self.event_type == 'one_time':
             if start_date <= self.date <= end_date:
                 occurrences.append(self.date)
         elif self.event_type == 'weekly':
             current_date = self.date
-            while current_date <= end_date:
+            while current_date <= effective_end_date:
                 if current_date >= start_date:
                     occurrences.append(current_date)
                 current_date += timedelta(weeks=1)
         elif self.event_type == 'monthly':
             current_date = self.date
-            while current_date <= end_date:
+            while current_date <= effective_end_date:
                 if current_date >= start_date:
                     occurrences.append(current_date)
                 # Move to next month (handle month-end edge cases)
@@ -111,7 +121,7 @@ class SpecialEvent(models.Model):
                     current_date = current_date.replace(month=current_date.month + 1)
         elif self.event_type == 'yearly':
             current_date = self.date
-            while current_date <= end_date:
+            while current_date <= effective_end_date:
                 if current_date >= start_date:
                     occurrences.append(current_date)
                 current_date = current_date.replace(year=current_date.year + 1)

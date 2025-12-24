@@ -19,7 +19,7 @@ class SpecialEventSerializer(serializers.ModelSerializer):
     class Meta:
         model = SpecialEvent
         fields = [
-            'id', 'title', 'description', 'event_type', 'date', 
+            'id', 'title', 'description', 'event_type', 'date', 'recurring_end_date',
             'start_time', 'end_time', 'max_capacity', 'is_active',
             'price', 'show_price', 'location_id',
             'registered_count', 'showed_up_count', 'available_spots',
@@ -112,6 +112,12 @@ class SpecialEventSerializer(serializers.ModelSerializer):
                 representation['date'] = representation['date']
             else:
                 representation['date'] = representation['date'].strftime('%Y-%m-%d')
+        # Format recurring_end_date as YYYY-MM-DD
+        if representation.get('recurring_end_date'):
+            if isinstance(representation['recurring_end_date'], str):
+                representation['recurring_end_date'] = representation['recurring_end_date']
+            else:
+                representation['recurring_end_date'] = representation['recurring_end_date'].strftime('%Y-%m-%d')
         # Format next_occurrence_date if present
         if representation.get('next_occurrence_date'):
             if isinstance(representation['next_occurrence_date'], str):
@@ -141,9 +147,18 @@ class SpecialEventSerializer(serializers.ModelSerializer):
         return super().to_internal_value(data)
     
     def validate(self, attrs):
-        """Check if the event date/time is on a closed day"""
+        """Check if the event date/time is on a closed day and validate recurring_end_date"""
         date = attrs.get('date')
+        recurring_end_date = attrs.get('recurring_end_date')
+        event_type = attrs.get('event_type', self.instance.event_type if self.instance else 'one_time')
         start_time = attrs.get('start_time')
+        
+        # Validate recurring_end_date for recurring events
+        if event_type != 'one_time' and recurring_end_date:
+            if date and recurring_end_date < date:
+                raise serializers.ValidationError({
+                    'recurring_end_date': "Recurring end date must be on or after the start date."
+                })
         
         if date and start_time:
             from admin_panel.models import ClosedDay
