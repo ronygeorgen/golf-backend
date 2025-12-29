@@ -521,10 +521,12 @@ class SimulatorPackageSerializer(serializers.ModelSerializer):
         """
         return 'simulator'
     
-    def validate_expiry_date(self, value):
-        """Convert empty string to None for expiry_date"""
+    def validate_validity_days(self, value):
+        """Convert empty string to None for validity_days"""
         if value == '' or value is None:
             return None
+        if value is not None and value < 1:
+            raise serializers.ValidationError("Validity days must be at least 1.")
         return value
     
     def __init__(self, *args, **kwargs):
@@ -642,16 +644,25 @@ class SimulatorPackagePurchaseSerializer(serializers.ModelSerializer):
             attrs['gift_status'] = None
             attrs['package_status'] = 'active'
         
-        # Copy expiry_date from package if not explicitly set
+        # Calculate expiry_date from validity_days if package has it
         if 'expiry_date' not in attrs or attrs.get('expiry_date') is None:
             package = attrs.get('package')
-            if package and hasattr(package, 'expiry_date') and package.expiry_date:
-                attrs['expiry_date'] = package.expiry_date
+            if package and hasattr(package, 'validity_days') and package.validity_days:
+                # Expiry will be calculated when purchase is created (in create method)
+                # Store validity_days for later calculation
+                attrs['_validity_days'] = package.validity_days
         
         return attrs
     
     def create(self, validated_data):
         purchase_type = validated_data.get('purchase_type', 'normal')
+        
+        # Calculate expiry_date from validity_days if set
+        validity_days = validated_data.pop('_validity_days', None)
+        if validity_days:
+            from datetime import timedelta
+            expiry_date = timezone.now().date() + timedelta(days=validity_days)
+            validated_data['expiry_date'] = expiry_date
         
         # Generate gift token if it's a gift purchase
         if purchase_type == 'gift':

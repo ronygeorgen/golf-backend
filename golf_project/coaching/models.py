@@ -421,7 +421,11 @@ class SimulatorPackage(models.Model):
     )
     redirect_url = models.URLField(max_length=500, blank=True, null=True, help_text="URL to redirect to after package purchase")
     is_active = models.BooleanField(default=True)
-    expiry_date = models.DateField(blank=True, null=True, help_text="Expiry date for this package. After this date, clients cannot use the package.")
+    validity_days = models.PositiveIntegerField(
+        blank=True, 
+        null=True, 
+        help_text="Number of days from purchase date that this package is valid. If set, clients cannot use the package after this period."
+    )
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
