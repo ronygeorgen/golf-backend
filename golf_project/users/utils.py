@@ -59,3 +59,4 @@ def get_users_by_location(location_id):
     if location_id:
         return User.objects.filter(ghl_location_id=location_id)
     return User.objects.none()
+

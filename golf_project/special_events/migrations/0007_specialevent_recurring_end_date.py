@@ -16,3 +16,4 @@ class Migration(migrations.Migration):
             field=models.DateField(blank=True, help_text='End date for recurring events. Recurring occurrences will stop on this date.', null=True),
         ),
     ]
+
