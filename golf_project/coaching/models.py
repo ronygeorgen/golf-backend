@@ -421,6 +421,7 @@ class SimulatorPackage(models.Model):
     )
     redirect_url = models.URLField(max_length=500, blank=True, null=True, help_text="URL to redirect to after package purchase")
     is_active = models.BooleanField(default=True)
+    expiry_date = models.DateField(blank=True, null=True, help_text="Expiry date for this package. After this date, clients cannot use the package.")
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -432,6 +433,131 @@ class SimulatorPackage(models.Model):
     
     def __str__(self):
         return self.title
+    
+    @property
+    def has_time_restrictions(self):
+        """Check if this package has any time restrictions"""
+        return self.time_restrictions.exists()
+    
+    def get_matching_restrictions(self, booking_datetime):
+        """
+        Get time restrictions that match the booking datetime.
+        
+        Args:
+            booking_datetime: datetime object for the booking start time
+            
+        Returns:
+            QuerySet of matching SimulatorPackageTimeRestriction objects
+        """
+        from django.utils import timezone
+        from datetime import datetime
+        
+        if not isinstance(booking_datetime, datetime):
+            return self.time_restrictions.none()
+        
+        booking_date = booking_datetime.date()
+        booking_time = booking_datetime.time()
+        booking_day_of_week = booking_datetime.weekday()  # 0=Monday, 6=Sunday
+        
+        matching_restrictions = []
+        
+        for restriction in self.time_restrictions.all():
+            # Check if time falls within the restriction window
+            # Note: end_time is exclusive (booking must start before end_time)
+            if booking_time < restriction.start_time or booking_time >= restriction.end_time:
+                continue
+            
+            if restriction.is_recurring:
+                # Check if day of week matches
+                if restriction.day_of_week is not None and restriction.day_of_week == booking_day_of_week:
+                    matching_restrictions.append(restriction)
+            else:
+                # Check if date matches
+                if restriction.date is not None and restriction.date == booking_date:
+                    matching_restrictions.append(restriction)
+        
+        # Return a queryset-like list (we'll filter by IDs)
+        if matching_restrictions:
+            restriction_ids = [r.id for r in matching_restrictions]
+            return self.time_restrictions.filter(id__in=restriction_ids)
+        return self.time_restrictions.none()
+
+
+class SimulatorPackageTimeRestriction(models.Model):
+    """
+    Time restrictions for simulator packages.
+    Supports both recurring (day of week) and non-recurring (specific date) restrictions.
+    """
+    DAY_CHOICES = (
+        (0, 'Monday'),
+        (1, 'Tuesday'),
+        (2, 'Wednesday'),
+        (3, 'Thursday'),
+        (4, 'Friday'),
+        (5, 'Saturday'),
+        (6, 'Sunday'),
+    )
+    
+    package = models.ForeignKey(
+        SimulatorPackage,
+        on_delete=models.CASCADE,
+        related_name='time_restrictions'
+    )
+    is_recurring = models.BooleanField(
+        default=True,
+        help_text="If True, this is a recurring restriction (day of week). If False, it's a specific date."
+    )
+    day_of_week = models.IntegerField(
+        choices=DAY_CHOICES,
+        null=True,
+        blank=True,
+        help_text="Day of week (0=Monday, 6=Sunday). Only used if is_recurring=True."
+    )
+    date = models.DateField(
+        null=True,
+        blank=True,
+        help_text="Specific date for non-recurring restriction. Only used if is_recurring=False."
+    )
+    start_time = models.TimeField(help_text="Start time for this restriction")
+    end_time = models.TimeField(help_text="End time for this restriction")
+    limit_hours = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        default=1.0,
+        help_text="Maximum number of hours this package can be used on this day/date within the time window"
+    )
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        ordering = ['package', 'is_recurring', 'day_of_week', 'date', 'start_time']
+        verbose_name = 'Simulator Package Time Restriction'
+        verbose_name_plural = 'Simulator Package Time Restrictions'
+        unique_together = [
+            ['package', 'is_recurring', 'day_of_week', 'start_time'],  # For recurring restrictions
+            ['package', 'is_recurring', 'date', 'start_time'],  # For non-recurring restrictions
+        ]
+    
+    def __str__(self):
+        if self.is_recurring:
+            day_name = self.get_day_of_week_display() if self.day_of_week is not None else 'Unknown'
+            return f"{self.package.title} - {day_name} ({self.start_time} - {self.end_time}) - Limit: {self.limit_hours} hrs"
+        else:
+            return f"{self.package.title} - {self.date} ({self.start_time} - {self.end_time}) - Limit: {self.limit_hours} hrs"
+    
+    def clean(self):
+        from django.core.exceptions import ValidationError
+        if self.is_recurring:
+            if self.day_of_week is None:
+                raise ValidationError("day_of_week is required for recurring restrictions.")
+            if self.date is not None:
+                raise ValidationError("date should not be set for recurring restrictions.")
+        else:
+            if self.date is None:
+                raise ValidationError("date is required for non-recurring restrictions.")
+            if self.day_of_week is not None:
+                raise ValidationError("day_of_week should not be set for non-recurring restrictions.")
 
 
 class SimulatorPackagePurchase(models.Model):
@@ -503,6 +629,7 @@ class SimulatorPackagePurchase(models.Model):
     purchased_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     gift_expires_at = models.DateTimeField(null=True, blank=True, help_text="Expiration date for gift claim")
+    expiry_date = models.DateField(null=True, blank=True, help_text="Expiry date for this purchase. After this date, the package cannot be used.")
     
     class Meta:
         ordering = ['-purchased_at']
@@ -538,6 +665,23 @@ class SimulatorPackagePurchase(models.Model):
             not self.is_gift_pending
         )
     
+    @property
+    def is_expired(self):
+        """Check if the package purchase has expired"""
+        from django.utils import timezone
+        if self.expiry_date:
+            return timezone.now().date() > self.expiry_date
+        return False
+    
+    @property
+    def can_be_used(self):
+        """Check if package can be used (not expired, not depleted, active status)"""
+        return (
+            self.package_status == 'active' and
+            self.hours_remaining > 0 and
+            not self.is_expired
+        )
+    
     def consume_hours(self, hours):
         """
         Consume simulator hours from this purchase.
@@ -555,6 +699,49 @@ class SimulatorPackagePurchase(models.Model):
         if self.hours_remaining <= 0:
             self.package_status = 'completed'
         self.save(update_fields=['hours_remaining', 'package_status', 'updated_at'])
+
+
+class SimulatorPackageUsage(models.Model):
+    """
+    Track usage of time-restricted simulator packages.
+    Records each booking that uses a restricted package to enforce daily hour limits.
+    """
+    package_purchase = models.ForeignKey(
+        SimulatorPackagePurchase,
+        on_delete=models.CASCADE,
+        related_name='usage_records'
+    )
+    booking = models.ForeignKey(
+        'bookings.Booking',
+        on_delete=models.CASCADE,
+        related_name='package_usage_records',
+        null=True,
+        blank=True
+    )
+    restriction = models.ForeignKey(
+        SimulatorPackageTimeRestriction,
+        on_delete=models.CASCADE,
+        related_name='usage_records'
+    )
+    usage_date = models.DateField(help_text="Date when the package was used")
+    usage_time = models.TimeField(help_text="Time when the package was used")
+    hours_used = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        help_text="Number of hours used in this booking"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        ordering = ['-usage_date', '-usage_time']
+        verbose_name = 'Simulator Package Usage'
+        verbose_name_plural = 'Simulator Package Usages'
+        indexes = [
+            models.Index(fields=['package_purchase', 'usage_date', 'restriction']),
+        ]
+    
+    def __str__(self):
+        return f"{self.package_purchase.package.title} - {self.usage_date} {self.usage_time}"
 
 
 class SimulatorHoursTransfer(models.Model):

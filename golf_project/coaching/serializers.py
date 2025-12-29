@@ -3,7 +3,8 @@ from django.utils import timezone
 from datetime import timedelta
 from .models import (
     CoachingPackage, CoachingPackagePurchase, SessionTransfer, OrganizationPackageMember, 
-    TempPurchase, PendingRecipient, SimulatorPackage, SimulatorPackagePurchase, SimulatorHoursTransfer
+    TempPurchase, PendingRecipient, SimulatorPackage, SimulatorPackagePurchase, SimulatorHoursTransfer,
+    SimulatorPackageTimeRestriction
 )
 from users.serializers import UserSerializer
 from users.models import User
@@ -497,8 +498,18 @@ class PendingRecipientSerializer(serializers.ModelSerializer):
         read_only_fields = ['status', 'created_at', 'updated_at']
 
 
+class SimulatorPackageTimeRestrictionSerializer(serializers.ModelSerializer):
+    """Serializer for time restrictions on simulator packages"""
+    
+    class Meta:
+        model = SimulatorPackageTimeRestriction
+        fields = '__all__'
+        read_only_fields = ['created_at', 'updated_at']
+
+
 class SimulatorPackageSerializer(serializers.ModelSerializer):
     category = serializers.SerializerMethodField()
+    time_restrictions = SimulatorPackageTimeRestrictionSerializer(many=True, read_only=True)
     
     class Meta:
         model = SimulatorPackage
@@ -509,6 +520,12 @@ class SimulatorPackageSerializer(serializers.ModelSerializer):
         Simulator packages are always 'simulator' type.
         """
         return 'simulator'
+    
+    def validate_expiry_date(self, value):
+        """Convert empty string to None for expiry_date"""
+        if value == '' or value is None:
+            return None
+        return value
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -553,6 +570,7 @@ class SimulatorPackagePurchaseSerializer(serializers.ModelSerializer):
             'purchased_at',
             'updated_at',
             'gift_expires_at',
+            'expiry_date',
         ]
         read_only_fields = [
             'client', 'hours_remaining', 'purchased_at', 'updated_at',
@@ -623,6 +641,12 @@ class SimulatorPackagePurchaseSerializer(serializers.ModelSerializer):
         else:
             attrs['gift_status'] = None
             attrs['package_status'] = 'active'
+        
+        # Copy expiry_date from package if not explicitly set
+        if 'expiry_date' not in attrs or attrs.get('expiry_date') is None:
+            package = attrs.get('package')
+            if package and hasattr(package, 'expiry_date') and package.expiry_date:
+                attrs['expiry_date'] = package.expiry_date
         
         return attrs
     

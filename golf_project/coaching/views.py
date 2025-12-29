@@ -1518,7 +1518,8 @@ class PackagePurchaseWebhookView(APIView):
                         hours_total=simulator_package.hours,
                         hours_remaining=simulator_package.hours,
                         package_status='active',
-                        gift_status=None
+                        gift_status=None,
+                        expiry_date=simulator_package.expiry_date
                     )
                     
                     logger.info(f"Simulator package purchase created via webhook: User {buyer.phone}, Package {simulator_package.id}, Purchase ID {purchase.id}")
@@ -1616,6 +1617,7 @@ class PackagePurchaseWebhookView(APIView):
                         gift_status='pending',
                         original_owner=buyer,
                         recipient_phone=recipient_phone,
+                        expiry_date=simulator_package.expiry_date,
                         gift_token=SimulatorPackagePurchase().generate_gift_token(),
                         gift_expires_at=timezone.now() + timedelta(days=30)
                     )
@@ -1900,13 +1902,87 @@ class SimulatorPackageViewSet(viewsets.ModelViewSet):
         return queryset
     
     def perform_create(self, serializer):
-        """Set location_id when creating simulator package"""
+        """Set location_id when creating simulator package and handle time restrictions"""
         from users.utils import get_location_id_from_request
+        from coaching.models import SimulatorPackageTimeRestriction
+        
         location_id = get_location_id_from_request(self.request)
+        time_restrictions_data = self.request.data.get('time_restrictions', [])
+        
         if location_id:
-            serializer.save(location_id=location_id)
+            package = serializer.save(location_id=location_id)
         else:
-            serializer.save()
+            package = serializer.save()
+        
+        # Handle time restrictions
+        if time_restrictions_data:
+            # Delete existing restrictions for this package
+            SimulatorPackageTimeRestriction.objects.filter(package=package).delete()
+            
+            # Create new restrictions
+            for restriction_data in time_restrictions_data:
+                # Convert empty strings to None for date fields
+                date_value = restriction_data.get('date')
+                if date_value == '':
+                    date_value = None
+                
+                day_of_week_value = restriction_data.get('day_of_week')
+                if day_of_week_value == '':
+                    day_of_week_value = None
+                elif day_of_week_value is not None:
+                    try:
+                        day_of_week_value = int(day_of_week_value)
+                    except (ValueError, TypeError):
+                        day_of_week_value = None
+                
+                SimulatorPackageTimeRestriction.objects.create(
+                    package=package,
+                    is_recurring=restriction_data.get('is_recurring', True),
+                    day_of_week=day_of_week_value,
+                    date=date_value,
+                    start_time=restriction_data.get('start_time'),
+                    end_time=restriction_data.get('end_time'),
+                    limit_hours=restriction_data.get('limit_hours', Decimal('1.0'))
+                )
+    
+    def perform_update(self, serializer):
+        """Handle time restrictions when updating simulator package"""
+        from users.utils import get_location_id_from_request
+        from coaching.models import SimulatorPackageTimeRestriction
+        
+        package = serializer.save()
+        time_restrictions_data = self.request.data.get('time_restrictions', None)
+        
+        # Handle time restrictions if provided
+        if time_restrictions_data is not None:
+            # Delete existing restrictions for this package
+            SimulatorPackageTimeRestriction.objects.filter(package=package).delete()
+            
+            # Create new restrictions
+            for restriction_data in time_restrictions_data:
+                # Convert empty strings to None for date fields
+                date_value = restriction_data.get('date')
+                if date_value == '':
+                    date_value = None
+                
+                day_of_week_value = restriction_data.get('day_of_week')
+                if day_of_week_value == '':
+                    day_of_week_value = None
+                elif day_of_week_value is not None:
+                    try:
+                        day_of_week_value = int(day_of_week_value)
+                    except (ValueError, TypeError):
+                        day_of_week_value = None
+                
+                SimulatorPackageTimeRestriction.objects.create(
+                    package=package,
+                    is_recurring=restriction_data.get('is_recurring', True),
+                    day_of_week=day_of_week_value,
+                    date=date_value,
+                    start_time=restriction_data.get('start_time'),
+                    end_time=restriction_data.get('end_time'),
+                    limit_hours=restriction_data.get('limit_hours', Decimal('1.0'))
+                )
     
     @action(detail=False, methods=['get'], url_path='active')
     def active_packages(self, request):

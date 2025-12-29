@@ -18,6 +18,7 @@ from users.models import User
 from users.utils import get_location_id_from_request
 from simulators.models import Simulator, SimulatorCredit
 from coaching.models import (
+    SimulatorPackagePurchase,
     CoachingPackagePurchase, OrganizationPackageMember, 
     SimulatorPackagePurchase
 )
@@ -370,19 +371,26 @@ class BookingViewSet(viewsets.ModelViewSet):
         
         return total
     
-    def _consume_package_simulator_hours(self, duration_minutes, use_organization=False):
+    def _consume_package_simulator_hours(self, duration_minutes, use_organization=False, booking_start_time=None):
         """
         Consume simulator hours from packages (combo or simulator-only).
-        Priority: combo packages first, then simulator-only packages.
+        Priority: combo packages first, then non-restricted simulator packages, then restricted packages.
         
         Args:
             duration_minutes: Duration of the booking in minutes
             use_organization: If True, also check organization packages where user is a member
+            booking_start_time: datetime object for the booking start time (required for checking restrictions)
             
         Returns:
             Purchase object (CoachingPackagePurchase or SimulatorPackagePurchase) if hours were consumed, None otherwise
+            
+        Raises:
+            serializers.ValidationError: If a restricted package limit has been exceeded
         """
         from decimal import Decimal
+        from coaching.models import SimulatorPackageUsage
+        from django.utils import timezone
+        
         hours_needed = Decimal(str(duration_minutes)) / Decimal('60')
         
         # First, try combo packages (coaching packages with simulator hours)
@@ -410,18 +418,119 @@ class BookingViewSet(viewsets.ModelViewSet):
             return purchase
         
         # If no combo package or not enough hours, try simulator-only packages
+        # Prioritize packages without restrictions
         sim_base_qs = SimulatorPackagePurchase.objects.select_for_update().filter(
             hours_remaining__gt=0,
             package_status='active'
-        ).exclude(gift_status='pending')
+        ).exclude(gift_status='pending').filter(client=self.request.user)
         
-        sim_purchase = sim_base_qs.filter(
-            client=self.request.user
-        ).order_by('purchased_at').first()
+        # Check expiry date
+        today = timezone.now().date()
+        sim_base_qs = sim_base_qs.filter(
+            Q(expiry_date__isnull=True) | Q(expiry_date__gte=today)
+        )
         
-        if sim_purchase and sim_purchase.hours_remaining >= hours_needed:
-            sim_purchase.consume_hours(hours_needed)
-            return sim_purchase
+        # Separate packages with and without restrictions
+        packages_without_restrictions = []
+        packages_with_restrictions = []
+        
+        for sim_purchase in sim_base_qs.order_by('purchased_at'):
+            if not sim_purchase.package.has_time_restrictions:
+                packages_without_restrictions.append(sim_purchase)
+            else:
+                packages_with_restrictions.append(sim_purchase)
+        
+        # First, try packages without restrictions
+        for sim_purchase in packages_without_restrictions:
+            if sim_purchase.hours_remaining >= hours_needed:
+                sim_purchase.consume_hours(hours_needed)
+                return sim_purchase
+        
+        # If no unrestricted packages available, try restricted packages
+        # Only if booking_start_time is provided
+        if booking_start_time:
+            for sim_purchase in packages_with_restrictions:
+                if sim_purchase.hours_remaining < hours_needed:
+                    continue
+                
+                # Check if booking time matches any restrictions
+                matching_restrictions = sim_purchase.package.get_matching_restrictions(booking_start_time)
+                
+                if not matching_restrictions.exists():
+                    # No matching restrictions, can't use this package
+                    continue
+                
+                # Check each matching restriction for limit
+                can_use = True
+                restriction_to_use = None
+                
+                for restriction in matching_restrictions:
+                    # Sum existing hours used for this restriction on this day
+                    from decimal import Decimal
+                    usage_date = booking_start_time.date()
+                    if restriction.is_recurring:
+                        # For recurring, sum all hours used on this day of week
+                        existing_usage_hours = SimulatorPackageUsage.objects.filter(
+                            package_purchase=sim_purchase,
+                            restriction=restriction,
+                            usage_date=usage_date
+                        ).aggregate(total=Sum('hours_used'))['total']
+                        existing_usage_hours = Decimal(str(existing_usage_hours)) if existing_usage_hours else Decimal('0')
+                    else:
+                        # For non-recurring, sum hours used on the specific date
+                        existing_usage_hours = SimulatorPackageUsage.objects.filter(
+                            package_purchase=sim_purchase,
+                            restriction=restriction,
+                            usage_date=restriction.date
+                        ).aggregate(total=Sum('hours_used'))['total']
+                        existing_usage_hours = Decimal(str(existing_usage_hours)) if existing_usage_hours else Decimal('0')
+                    
+                    # Check if adding these hours would exceed the limit
+                    if existing_usage_hours + hours_needed > restriction.limit_hours:
+                        can_use = False
+                        restriction_to_use = restriction
+                        break
+                    else:
+                        restriction_to_use = restriction
+                
+                if can_use and restriction_to_use:
+                    # Consume hours and track usage
+                    sim_purchase.consume_hours(hours_needed)
+                    # Usage will be tracked when booking is created (in perform_create)
+                    # Store restriction info for later tracking
+                    sim_purchase._used_restriction = restriction_to_use
+                    return sim_purchase
+                elif restriction_to_use:
+                    # Limit exceeded
+                    restriction_name = restriction_to_use.get_day_of_week_display() if restriction_to_use.is_recurring else str(restriction_to_use.date)
+                    # Calculate how many hours are already used
+                    from decimal import Decimal
+                    usage_date = booking_start_time.date()
+                    if restriction_to_use.is_recurring:
+                        existing_usage_hours = SimulatorPackageUsage.objects.filter(
+                            package_purchase=sim_purchase,
+                            restriction=restriction_to_use,
+                            usage_date=usage_date
+                        ).aggregate(total=Sum('hours_used'))['total']
+                        existing_usage_hours = Decimal(str(existing_usage_hours)) if existing_usage_hours else Decimal('0')
+                    else:
+                        existing_usage_hours = SimulatorPackageUsage.objects.filter(
+                            package_purchase=sim_purchase,
+                            restriction=restriction_to_use,
+                            usage_date=restriction_to_use.date
+                        ).aggregate(total=Sum('hours_used'))['total']
+                        existing_usage_hours = Decimal(str(existing_usage_hours)) if existing_usage_hours else Decimal('0')
+                    
+                    remaining_hours = restriction_to_use.limit_hours - existing_usage_hours
+                    raise serializers.ValidationError(
+                        f"Package '{sim_purchase.package.title}' has reached its daily hour limit ({restriction_to_use.limit_hours} hrs) "
+                        f"for {restriction_name} ({restriction_to_use.start_time} - {restriction_to_use.end_time}). "
+                        f"Only {remaining_hours:.2f} hour(s) remaining. Please use a different package or book at a different time."
+                    )
+        else:
+            # No booking_start_time provided, can't use restricted packages
+            # Try unrestricted packages only (already tried above)
+            pass
         
         return None
     
@@ -476,7 +585,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                             # For multiple simulators, we need to consume hours for each simulator
                             # Calculate total duration in minutes for all simulators
                             total_duration_minutes = duration_minutes * simulator_count
-                            package_purchase = self._consume_package_simulator_hours(total_duration_minutes, use_organization=True)
+                            package_purchase = self._consume_package_simulator_hours(total_duration_minutes, use_organization=True, booking_start_time=start_time)
                             if not package_purchase:
                                 raise serializers.ValidationError("Insufficient pre-paid hours available")
                     elif use_prepaid_hours is False:
@@ -545,7 +654,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                         except serializers.ValidationError:
                             # Calculate total duration in minutes for all simulators
                             total_duration_minutes = duration_minutes * simulator_count
-                            package_purchase = self._consume_package_simulator_hours(total_duration_minutes, use_organization=True)
+                            package_purchase = self._consume_package_simulator_hours(total_duration_minutes, use_organization=True, booking_start_time=start_time)
                     
                     # Determine if package_purchase is a combo package or simulator-only package
                     simulator_package_purchase = None
@@ -603,6 +712,28 @@ class BookingViewSet(viewsets.ModelViewSet):
                         if simulator_package_purchase:
                             update_fields.append('simulator_package_purchase')
                         created_bookings[0].save(update_fields=update_fields)
+                        
+                        # Track usage for time-restricted packages
+                        if simulator_package_purchase and hasattr(simulator_package_purchase, '_used_restriction'):
+                            from coaching.models import SimulatorPackageUsage
+                            from decimal import Decimal
+                            restriction = simulator_package_purchase._used_restriction
+                            usage_date = start_time.date()
+                            usage_time = start_time.time()
+                            
+                            # Calculate hours used (for multiple simulators, this is total hours)
+                            hours_used = Decimal(str(duration_minutes)) / Decimal('60') * simulator_count
+                            
+                            # Create usage record for the first booking
+                            SimulatorPackageUsage.objects.create(
+                                package_purchase=simulator_package_purchase,
+                                booking=created_bookings[0],
+                                restriction=restriction,
+                                usage_date=usage_date,
+                                usage_time=usage_time,
+                                hours_used=hours_used
+                            )
+                        
                         # Set other bookings to 0 price as well
                         for booking in created_bookings[1:]:
                             booking.total_price = 0
