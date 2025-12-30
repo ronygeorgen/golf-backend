@@ -1060,7 +1060,7 @@ def get_first_upcoming_coaching_booking(user, location_id=None):
 def format_booking_datetime(booking):
     """
     Format booking start_time to a readable date and time string.
-    Converts UTC time to Canada timezone (America/Toronto - Eastern Time) before formatting.
+    Converts UTC time to Canada timezone (America/Halifax - Atlantic Time) before formatting.
     
     Args:
         booking: Booking instance
@@ -1077,11 +1077,11 @@ def format_booking_datetime(booking):
     # Convert to local timezone if needed
     start_time = booking.start_time
     
-    # Convert UTC to Canada timezone (America/Toronto handles EST/EDT automatically)
-    canada_tz = ZoneInfo('America/Toronto')
+    # Convert UTC to Canada timezone (America/Halifax handles AST/ADT automatically)
+    canada_tz = ZoneInfo('America/Halifax')
     
     if timezone.is_aware(start_time):
-        # Convert from UTC (or current timezone) to Canada Eastern Time
+        # Convert from UTC (or current timezone) to Canada Atlantic Time
         # Django stores datetimes in UTC when USE_TZ=True, so convert to UTC first if needed
         start_time = start_time.astimezone(timezone.utc)
         # Then convert from UTC to Canada timezone
