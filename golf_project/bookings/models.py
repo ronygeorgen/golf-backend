@@ -54,6 +54,7 @@ class Booking(models.Model):
         blank=True,
         related_name='redeemed_booking'
     )
+    is_tpi_assessment = models.BooleanField(default=False, help_text="If True, this booking was made using a TPI Assessment package")
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

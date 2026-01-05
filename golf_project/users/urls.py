@@ -7,6 +7,7 @@ router = DefaultRouter()
 urlpatterns = [
     # Authentication endpoints
     path('signup/', views.signup, name='signup'),
+    path('signup-without-otp/', views.signup_without_otp, name='signup_without_otp'),
     path('login/', views.login, name='login'),
     path('logout/', views.logout, name='logout'),
     path('profile/', views.profile, name='profile'),

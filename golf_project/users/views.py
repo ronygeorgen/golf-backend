@@ -545,6 +545,98 @@ def signup(request):
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
+def signup_without_otp(request):
+    """User registration endpoint without OTP verification - for guest users or simulator bookings"""
+    serializer = SignupSerializer(data=request.data)
+    if serializer.is_valid():
+        user = serializer.save()
+        
+        # Mark phone as verified (skip OTP verification)
+        user.phone_verified = True
+        
+        # Save location ID to user (from request or default)
+        location_id = request.data.get('ghl_location_id')
+        if location_id:
+            # Validate that the location exists and is active
+            from ghl.models import GHLLocation
+            try:
+                location = GHLLocation.objects.get(location_id=location_id, status='active')
+                user.ghl_location_id = location_id
+            except GHLLocation.DoesNotExist:
+                logger.warning("Invalid location_id %s provided during signup for user %s", location_id, user.id)
+                # Fallback to default if provided location is invalid
+                resolved_location = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+                if resolved_location:
+                    user.ghl_location_id = resolved_location
+        else:
+            # Fallback to default location if not provided
+            resolved_location = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            if resolved_location:
+                user.ghl_location_id = resolved_location
+        
+        user.save()
+        
+        # Convert pending recipients to actual purchases
+        converted_purchases = convert_pending_recipients(user)
+        if converted_purchases:
+            logger.info(f"Converted {len(converted_purchases)} pending recipients for new user {user.phone}")
+        else:
+            logger.info(f"No pending recipients found for new user {user.phone}")
+        
+        # Sync user to GHL (create contact if doesn't exist)
+        try:
+            # Use user's ghl_location_id if set, otherwise fallback to default
+            resolved_location = user.ghl_location_id or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            
+            if resolved_location:
+                if CELERY_AVAILABLE and sync_user_contact_task:
+                    # Queue async task to sync with GHL
+                    sync_user_contact_task.delay(
+                        user.id,
+                        location_id=resolved_location,
+                        tags=None,
+                        custom_fields=None,
+                    )
+                    logger.info("Queued GHL sync task for user %s (signup without OTP)", user.id)
+                else:
+                    # Fallback to synchronous call if Celery not available
+                    from ghl.services import sync_user_contact
+                    sync_user_contact(
+                        user,
+                        location_id=resolved_location,
+                        tags=None,
+                        custom_fields=None,
+                    )
+                    logger.info("Successfully synced user %s to GHL location %s during signup without OTP", user.phone, resolved_location)
+            else:
+                logger.warning("No GHL location available for user %s during signup without OTP", user.id)
+        except Exception as exc:
+            logger.warning("Failed to sync GHL for signup without OTP %s: %s", user.phone, exc)
+            # Don't fail signup if GHL sync fails
+        
+        # Check if this is for simulator booking - if so, create token and log them in
+        booking_type = request.data.get('booking_type')  # 'simulator' or 'coaching'
+        response_data = {
+            'message': 'User created successfully.',
+            'converted_purchases_count': len(converted_purchases)
+        }
+        
+        if booking_type == 'simulator':
+            # For simulator bookings, create token and log them in
+            token, created = Token.objects.get_or_create(user=user)
+            response_data['token'] = token.key
+            response_data['user'] = UserSerializer(user).data
+            response_data['message'] = 'Registration successful. You can now book a simulator session.'
+        else:
+            # For coaching/TPI, user remains a guest (no token)
+            response_data['message'] = 'User created successfully. Please login to continue.'
+        
+        return Response(response_data, status=status.HTTP_201_CREATED)
+    
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
 def login(request):
     """User login endpoint"""
     serializer = LoginSerializer(data=request.data)

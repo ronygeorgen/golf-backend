@@ -87,7 +87,11 @@ class BookingViewSet(viewsets.ModelViewSet):
         # Apply filters
         status_filter = self.request.query_params.get('status')
         if status_filter:
-            queryset = queryset.filter(status=status_filter)
+            if status_filter == 'tpi_assessment':
+                # Filter for TPI assessment bookings
+                queryset = queryset.filter(is_tpi_assessment=True, booking_type='coaching')
+            else:
+                queryset = queryset.filter(status=status_filter)
         
         booking_type = self.request.query_params.get('booking_type')
         if booking_type:
@@ -767,11 +771,14 @@ class BookingViewSet(viewsets.ModelViewSet):
                 
                 location_id = get_location_id_from_request(self.request)
                 purchase = self._consume_package_session(package, use_organization=use_organization_package)
+                # Check if package is TPI assessment
+                is_tpi_assessment = package.is_tpi_assessment if hasattr(package, 'is_tpi_assessment') else False
                 booking_instance = serializer.save(
                     client=self.request.user,
                     location_id=location_id,
                     package_purchase=purchase,
-                    total_price=booking_data.get('total_price', 0)
+                    total_price=booking_data.get('total_price', 0),
+                    is_tpi_assessment=is_tpi_assessment
                 )
                 # Ensure location_id is saved (in case serializer didn't include it)
                 if location_id and not booking_instance.location_id:

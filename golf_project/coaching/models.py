@@ -21,6 +21,7 @@ class CoachingPackage(models.Model):
     )
     redirect_url = models.URLField(max_length=500, blank=True, null=True, help_text="URL to redirect to after package purchase")
     is_active = models.BooleanField(default=True)
+    is_tpi_assessment = models.BooleanField(default=False, help_text="If True, this package is categorized as a TPI Assessment package (non-transferable, personal use only)")
     
     def __str__(self):
         return self.title
