@@ -2091,3 +2091,72 @@ class SimulatorPackagePurchaseViewSet(viewsets.ModelViewSet):
             serializer.save(client=self.request.user)
         else:
             serializer.save()
+
+
+class GuestPackagesView(APIView):
+    """
+    Get TPI assessment packages for a guest user by phone number.
+    Returns packages and purchases with sessions remaining.
+    """
+    permission_classes = [AllowAny]
+    
+    def get_authenticators(self):
+        """Override to disable authentication for guest packages"""
+        return []
+    
+    def get(self, request):
+        phone = request.query_params.get('phone')
+        
+        if not phone:
+            return Response(
+                {'error': 'Phone number is required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        phone = phone.strip()
+        
+        # Get user by phone (if exists)
+        try:
+            user = User.objects.get(phone=phone)
+            location_id = user.ghl_location_id
+        except User.DoesNotExist:
+            # User doesn't exist yet, but might have purchases
+            # Try to get location from a purchase
+            from coaching.models import CoachingPackagePurchase
+            purchase = CoachingPackagePurchase.objects.filter(
+                client__phone=phone
+            ).select_related('client').first()
+            if purchase and purchase.client:
+                location_id = purchase.client.ghl_location_id
+            else:
+                location_id = None
+        
+        # Get TPI assessment packages (active only)
+        from coaching.models import CoachingPackage, CoachingPackagePurchase
+        tpi_packages = CoachingPackage.objects.filter(
+            is_tpi_assessment=True,
+            is_active=True
+        ).prefetch_related('staff_members')
+        
+        # Filter by location if available
+        if location_id:
+            tpi_packages = tpi_packages.filter(location_id=location_id)
+        
+        # Get purchases for this phone number with sessions remaining
+        purchases = CoachingPackagePurchase.objects.filter(
+            client__phone=phone,
+            package__is_tpi_assessment=True,
+            sessions_remaining__gt=0,
+            package_status='active'
+        ).select_related('package', 'client').order_by('-purchased_at')
+        
+        # Serialize packages and purchases
+        from coaching.serializers import CoachingPackageSerializer, CoachingPackagePurchaseSerializer
+        packages_data = CoachingPackageSerializer(tpi_packages, many=True).data
+        purchases_data = CoachingPackagePurchaseSerializer(purchases, many=True).data
+        
+        return Response({
+            'packages': packages_data,
+            'purchases': purchases_data,
+            'location_id': location_id
+        }, status=status.HTTP_200_OK)

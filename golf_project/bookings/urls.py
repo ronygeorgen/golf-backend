@@ -6,7 +6,8 @@ router = DefaultRouter()
 router.register(r'', views.BookingViewSet, basename='booking')
 
 urlpatterns = [
-    path('', include(router.urls)),
     path('temp-booking/', views.CreateTempBookingView.as_view(), name='create-temp-booking'),
     path('webhook/booking/', views.BookingWebhookView.as_view(), name='booking-webhook'),
+    path('guest-create/', views.GuestBookingCreateView.as_view(), name='guest-booking-create'),
+    path('', include(router.urls)),
 ]

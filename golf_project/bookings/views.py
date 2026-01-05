@@ -43,6 +43,22 @@ class BookingViewSet(viewsets.ModelViewSet):
     lock_window = timedelta(hours=24)
     pagination_class = TenPerPagePagination
     
+    def get_permissions(self):
+        """
+        Override permissions to allow unauthenticated access for check_coaching_availability
+        when phone parameter is provided (for guest users).
+        """
+        # Check if this is the check_coaching_availability action
+        # Check both action name and path to be safe
+        phone = self.request.query_params.get('phone')
+        is_check_availability = (
+            self.action == 'check_coaching_availability' or 
+            'check_coaching_availability' in str(self.request.path)
+        )
+        if phone and is_check_availability:
+            return [AllowAny()]
+        return [IsAuthenticated()]
+    
     def _check_special_event_conflict(self, check_datetime):
         """
         Check if a datetime conflicts with any active special event.
@@ -1655,7 +1671,19 @@ class BookingViewSet(viewsets.ModelViewSet):
         from users.models import StaffAvailability, StaffDayAvailability
         
         # Get location_id for filtering
-        location_id = get_location_id_from_request(request)
+        # Support guest users by phone parameter
+        phone = request.query_params.get('phone')
+        if phone and not request.user.is_authenticated:
+            # Guest user - get location from user by phone
+            try:
+                from users.models import User
+                guest_user = User.objects.get(phone=phone)
+                location_id = guest_user.ghl_location_id
+            except User.DoesNotExist:
+                # Try to get location from request param
+                location_id = request.query_params.get('location_id') or get_location_id_from_request(request)
+        else:
+            location_id = get_location_id_from_request(request)
         
         # Get coaching bay (bay 6) - filter by location if provided
         coaching_bay_qs = Simulator.objects.filter(is_coaching_bay=True, is_active=True)
@@ -2228,3 +2256,223 @@ class BookingWebhookView(APIView):
                 {'error': f'Failed to create booking: {str(e)}'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
+
+class GuestBookingCreateView(APIView):
+    """
+    Create a coaching booking for a guest user (by phone number).
+    Guest users can book using their TPI assessment packages without authentication.
+    """
+    permission_classes = [AllowAny]
+    authentication_classes = []  # Explicitly disable authentication for guest bookings
+    
+    def get_authenticators(self):
+        """Override to disable authentication for guest bookings"""
+        return []
+    
+    @transaction.atomic
+    def post(self, request):
+        phone = request.data.get('phone')
+        if not phone:
+            return Response(
+                {'error': 'Phone number is required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        phone = phone.strip()
+        
+        # Get user by phone
+        try:
+            from users.models import User
+            user = User.objects.get(phone=phone)
+        except User.DoesNotExist:
+            return Response(
+                {'error': 'User not found. Please ensure you have completed registration.'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        # Get booking data
+        booking_type = request.data.get('booking_type')
+        if booking_type != 'coaching':
+            return Response(
+                {'error': 'Only coaching bookings are supported for guest users.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        package_id = request.data.get('coaching_package')
+        if not package_id:
+            return Response(
+                {'error': 'A coaching package is required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get package and verify it's a TPI assessment package
+        from coaching.models import CoachingPackage, CoachingPackagePurchase
+        try:
+            package = CoachingPackage.objects.get(id=package_id, is_active=True)
+        except CoachingPackage.DoesNotExist:
+            return Response(
+                {'error': 'Package not found.'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        if not package.is_tpi_assessment:
+            return Response(
+                {'error': 'Only TPI assessment packages can be used for guest bookings.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Verify user has a purchase for this package with sessions remaining
+        purchase = CoachingPackagePurchase.objects.filter(
+            client=user,
+            package=package,
+            sessions_remaining__gt=0,
+            package_status='active'
+        ).first()
+        
+        if not purchase:
+            return Response(
+                {'error': 'No active purchase found for this package with remaining sessions.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get other booking details
+        start_time_str = request.data.get('start_time')
+        end_time_str = request.data.get('end_time')
+        coach_id = request.data.get('coach')
+        location_id = request.data.get('location_id') or user.ghl_location_id
+        
+        if not start_time_str or not end_time_str:
+            return Response(
+                {'error': 'start_time and end_time are required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            from datetime import datetime
+            start_time = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
+            end_time = datetime.fromisoformat(end_time_str.replace('Z', '+00:00'))
+        except (ValueError, AttributeError):
+            return Response(
+                {'error': 'Invalid date format for start_time or end_time.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Validate coach if provided
+        coach = None
+        if coach_id:
+            try:
+                coach = User.objects.get(id=coach_id, role__in=['staff', 'admin'], is_active=True)
+                if not package.staff_members.filter(id=coach_id).exists():
+                    return Response(
+                        {'error': 'Selected coach is not assigned to this package.'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+            except User.DoesNotExist:
+                return Response(
+                    {'error': 'Coach not found.'},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+        
+        # Check for booking conflicts
+        from .models import Booking
+        conflicting_bookings = Booking.objects.filter(
+            Q(start_time__lt=end_time, end_time__gt=start_time),
+            status__in=['confirmed', 'pending']
+        )
+        
+        if coach:
+            conflicting_bookings = conflicting_bookings.filter(coach=coach)
+        else:
+            # Check if any coach assigned to package has conflict
+            package_coaches = package.staff_members.filter(role__in=['staff', 'admin'], is_active=True)
+            if location_id:
+                package_coaches = package_coaches.filter(ghl_location_id=location_id)
+            conflicting_bookings = conflicting_bookings.filter(coach__in=package_coaches)
+        
+        # Check coaching bay availability
+        from simulators.models import Simulator
+        coaching_bay = Simulator.objects.filter(is_coaching_bay=True, is_active=True).first()
+        if location_id:
+            coaching_bay = Simulator.objects.filter(
+                is_coaching_bay=True, is_active=True, location_id=location_id
+            ).first()
+        
+        if not coaching_bay:
+            return Response(
+                {'error': 'Coaching bay not available.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Check if coaching bay is booked
+        bay_conflicts = Booking.objects.filter(
+            simulator=coaching_bay,
+            start_time__lt=end_time,
+            end_time__gt=start_time,
+            status__in=['confirmed', 'pending']
+        )
+        if bay_conflicts.exists():
+            return Response(
+                {'error': 'This time slot is already booked.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        if conflicting_bookings.exists():
+            return Response(
+                {'error': 'This time slot is already booked for the selected coach.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Calculate price
+        from decimal import Decimal, ROUND_HALF_UP
+        if package.session_count:
+            per_session = (Decimal(str(package.price)) / Decimal(str(package.session_count))).quantize(
+                Decimal('0.01'),
+                rounding=ROUND_HALF_UP
+            )
+        else:
+            per_session = Decimal(str(package.price)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        
+        # Consume session from purchase
+        if purchase.sessions_remaining <= 0:
+            return Response(
+                {'error': 'No sessions remaining in this package.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        purchase.sessions_remaining -= 1
+        purchase.save(update_fields=['sessions_remaining', 'updated_at'])
+        
+        # Create booking
+        booking = Booking.objects.create(
+            client=user,
+            location_id=location_id,
+            booking_type='coaching',
+            coaching_package=package,
+            coach=coach,
+            simulator=coaching_bay,
+            start_time=start_time,
+            end_time=end_time,
+            duration_minutes=package.session_duration_minutes,
+            total_price=per_session,
+            package_purchase=purchase,
+            is_tpi_assessment=True,
+            status='confirmed'
+        )
+        
+        logger.info(f"Guest coaching booking created: id={booking.id}, location_id={location_id}, client={user.phone}")
+        
+        # Update GHL custom fields
+        try:
+            from ghl.services import update_user_ghl_custom_fields
+            update_user_ghl_custom_fields(user, location_id=location_id)
+        except Exception as exc:
+            logger.warning("Failed to update GHL custom fields after guest booking creation: %s", exc)
+        
+        from .serializers import BookingSerializer
+        serializer = BookingSerializer(booking)
+        
+        return Response({
+            'message': 'Booking created successfully.',
+            'booking': serializer.data
+        }, status=status.HTTP_201_CREATED)

@@ -14,6 +14,7 @@ from .views import (
     ListPendingRecipientsView,
     SimulatorPackageViewSet,
     SimulatorPackagePurchaseViewSet,
+    GuestPackagesView,
 )
 
 router = DefaultRouter()
@@ -32,6 +33,7 @@ urlpatterns = [
     path('temp-purchases/', ListTempPurchasesView.as_view(), name='list-temp-purchases'),
     path('pending-recipients/', ListPendingRecipientsView.as_view(), name='list-pending-recipients'),
     path('webhook/purchase/', PackagePurchaseWebhookView.as_view(), name='package-purchase-webhook'),
+    path('guest-packages/', GuestPackagesView.as_view(), name='guest-packages'),
 ]
 
 
