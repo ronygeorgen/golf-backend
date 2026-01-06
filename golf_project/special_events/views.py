@@ -22,11 +22,22 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
         if location_id:
             queryset = queryset.filter(location_id=location_id)
         
-        # Admin/staff can see all events, clients see only future events
-        if self.request.user.role not in ['admin', 'staff']:
-            # For clients, show events that have at least one future occurrence
-            today = timezone.now().date()
-            queryset = queryset.filter(date__gte=today)
+        # Check if user is admin (including superuser)
+        is_admin = (
+            self.request.user.role == 'admin' or 
+            getattr(self.request.user, 'is_superuser', False)
+        )
+        
+        # Only admins can see private events
+        # Staff and clients see only non-private events
+        if not is_admin:
+            # For staff and clients, exclude private events
+            queryset = queryset.filter(is_private=False)
+            
+            # For clients, also filter to show only future events
+            if self.request.user.role not in ['admin', 'staff']:
+                today = timezone.now().date()
+                queryset = queryset.filter(date__gte=today)
         
         return queryset.order_by('date', 'start_time')
     
@@ -51,7 +62,13 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
         view_type = request.query_params.get('view_type', 'upcoming')
         today = timezone.now().date()
         
-        if request.user.role in ['admin', 'staff'] and view_type == 'upcoming':
+        # Check if user is admin (including superuser)
+        is_admin = (
+            request.user.role == 'admin' or 
+            getattr(request.user, 'is_superuser', False)
+        )
+        
+        if is_admin and view_type == 'upcoming':
             # For upcoming view, calculate next occurrence for each event
             result = []
             for event in queryset:
@@ -77,7 +94,7 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
             # Sort by occurrence date
             result.sort(key=lambda x: (x['date'], x['start_time']))
             return Response(result)
-        elif request.user.role in ['admin', 'staff'] and view_type == 'conducted':
+        elif is_admin and view_type == 'conducted':
             # For conducted view, show all past occurrences
             result = []
             for event in queryset:
@@ -117,9 +134,10 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
     
     @action(detail=False, methods=['get'])
     def upcoming(self, request):
-        """Get all upcoming events - for recurring events, only show the first upcoming date"""
+        """Get all upcoming events - for recurring events, only show the first upcoming date.
+        Private events are excluded for non-admin/staff users."""
         today = timezone.now().date()
-        events = self.get_queryset()
+        events = self.get_queryset()  # This already filters out private events for clients
         
         result = []
         for event in events:
@@ -143,6 +161,19 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
         """Register the current user for the next occurrence of this event"""
         event = self.get_object()
         user = request.user
+        
+        # Check if user is admin (including superuser)
+        is_admin = (
+            request.user.role == 'admin' or 
+            getattr(request.user, 'is_superuser', False)
+        )
+        
+        # Prevent staff and clients from registering for private events
+        if event.is_private and not is_admin:
+            return Response(
+                {'error': 'This is a private event. Only admins can register clients for private events.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
         
         # Get the next occurrence date
         today = timezone.now().date()
@@ -251,7 +282,7 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
     
     @action(detail=True, methods=['get'])
     def registrations(self, request, pk=None):
-        """Get all registrations for this event (admin/staff only) - show all registrations including cancelled"""
+        """Get all registrations for this event (admin only) - show all registrations including cancelled"""
         event = self.get_object()
         
         # Verify event belongs to admin's location
@@ -260,7 +291,13 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
             from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("You can only view registrations for events in your location.")
         
-        if request.user.role not in ['admin', 'staff']:
+        # Check if user is admin (including superuser)
+        is_admin = (
+            request.user.role == 'admin' or 
+            getattr(request.user, 'is_superuser', False)
+        )
+        
+        if not is_admin:
             return Response(
                 {'error': 'Permission denied'},
                 status=status.HTTP_403_FORBIDDEN
@@ -289,10 +326,16 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
     
     @action(detail=True, methods=['patch'])
     def update_registration_status(self, request, pk=None):
-        """Update a user's registration status (admin/staff only)"""
+        """Update a user's registration status (admin only)"""
         event = self.get_object()
         
-        if request.user.role not in ['admin', 'staff']:
+        # Check if user is admin (including superuser)
+        is_admin = (
+            request.user.role == 'admin' or 
+            getattr(request.user, 'is_superuser', False)
+        )
+        
+        if not is_admin:
             return Response(
                 {'error': 'Permission denied'},
                 status=status.HTTP_403_FORBIDDEN
@@ -331,10 +374,16 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
     
     @action(detail=True, methods=['post'])
     def register_user(self, request, pk=None):
-        """Register a user for an event (admin/staff only)"""
+        """Register a user for an event (admin only)"""
         event = self.get_object()
         
-        if request.user.role not in ['admin', 'staff']:
+        # Check if user is admin (including superuser)
+        is_admin = (
+            request.user.role == 'admin' or 
+            getattr(request.user, 'is_superuser', False)
+        )
+        
+        if not is_admin:
             return Response(
                 {'error': 'Permission denied'},
                 status=status.HTTP_403_FORBIDDEN
@@ -435,8 +484,14 @@ class SpecialEventRegistrationViewSet(viewsets.ReadOnlyModelViewSet):
     
     def get_queryset(self):
         # Users can see their own registrations
-        # Admin/staff can see all registrations
-        if self.request.user.role in ['admin', 'staff']:
+        # Only admins can see all registrations
+        # Check if user is admin (including superuser)
+        is_admin = (
+            self.request.user.role == 'admin' or 
+            getattr(self.request.user, 'is_superuser', False)
+        )
+        
+        if is_admin:
             return SpecialEventRegistration.objects.all().select_related('user', 'event')
         else:
             return SpecialEventRegistration.objects.filter(

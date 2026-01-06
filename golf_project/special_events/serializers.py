@@ -21,7 +21,7 @@ class SpecialEventSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'title', 'description', 'event_type', 'date', 'recurring_end_date',
             'start_time', 'end_time', 'max_capacity', 'is_active',
-            'price', 'show_price', 'location_id',
+            'price', 'show_price', 'is_private', 'location_id',
             'registered_count', 'showed_up_count', 'available_spots',
             'is_full', 'user_registered', 'user_registration_status',
             'next_occurrence_date', 'created_at', 'updated_at'

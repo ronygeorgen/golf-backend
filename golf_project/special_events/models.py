@@ -42,6 +42,10 @@ class SpecialEvent(models.Model):
         default=False,
         help_text="Toggle to show/hide price on user-facing page"
     )
+    is_private = models.BooleanField(
+        default=False,
+        help_text="If True, this event is private and only visible to admins. Clients cannot see or register for private events."
+    )
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
