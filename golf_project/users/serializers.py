@@ -63,6 +63,38 @@ class StaffSerializer(serializers.ModelSerializer):
             data['date_of_birth'] = None
         return super().to_internal_value(data)
     
+    def validate(self, attrs):
+        """Validate that email and phone are unique"""
+        email = attrs.get('email')
+        phone = attrs.get('phone')
+        
+        # Get instance if updating
+        instance = self.instance
+        
+        # Check for duplicate email
+        if email:
+            email_query = User.objects.filter(email=email)
+            if instance:
+                email_query = email_query.exclude(pk=instance.pk)
+            if email_query.exists():
+                existing_user = email_query.first()
+                raise serializers.ValidationError({
+                    'email': f'A user with this email already exists. (Existing user: {existing_user.first_name} {existing_user.last_name} - {existing_user.phone})'
+                })
+        
+        # Check for duplicate phone
+        if phone:
+            phone_query = User.objects.filter(phone=phone)
+            if instance:
+                phone_query = phone_query.exclude(pk=instance.pk)
+            if phone_query.exists():
+                existing_user = phone_query.first()
+                raise serializers.ValidationError({
+                    'phone': f'A user with this phone number already exists. (Existing user: {existing_user.first_name} {existing_user.last_name} - {existing_user.email})'
+                })
+        
+        return attrs
+    
     def create(self, validated_data):
         # Extract password if provided
         password = validated_data.pop('password', None)
@@ -85,8 +117,24 @@ class StaffSerializer(serializers.ModelSerializer):
         
         validated_data['username'] = username
         
-        # Create user
-        user = User.objects.create(**validated_data)
+        # Create user with error handling
+        try:
+            user = User.objects.create(**validated_data)
+        except Exception as e:
+            # Catch any database integrity errors and provide better messages
+            error_msg = str(e)
+            if 'phone' in error_msg.lower() or 'unique constraint' in error_msg.lower():
+                raise serializers.ValidationError({
+                    'phone': 'A user with this phone number already exists. Please use a different phone number.'
+                })
+            elif 'email' in error_msg.lower():
+                raise serializers.ValidationError({
+                    'email': 'A user with this email already exists. Please use a different email address.'
+                })
+            else:
+                raise serializers.ValidationError({
+                    'non_field_errors': [f'Error creating user: {error_msg}']
+                })
         
         # Set password only if provided, otherwise set a random password
         if password:
@@ -102,7 +150,25 @@ class StaffSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         # Don't allow username updates through this serializer
         validated_data.pop('username', None)
-        return super().update(instance, validated_data)
+        
+        # Update with error handling
+        try:
+            return super().update(instance, validated_data)
+        except Exception as e:
+            # Catch any database integrity errors and provide better messages
+            error_msg = str(e)
+            if 'phone' in error_msg.lower() or 'unique constraint' in error_msg.lower():
+                raise serializers.ValidationError({
+                    'phone': 'A user with this phone number already exists. Please use a different phone number.'
+                })
+            elif 'email' in error_msg.lower():
+                raise serializers.ValidationError({
+                    'email': 'A user with this email already exists. Please use a different email address.'
+                })
+            else:
+                raise serializers.ValidationError({
+                    'non_field_errors': [f'Error updating user: {error_msg}']
+                })
 
 class SignupSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=False, allow_blank=True, validators=[validate_password])
