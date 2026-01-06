@@ -46,6 +46,10 @@ class SpecialEvent(models.Model):
         default=False,
         help_text="If True, this event is private and only visible to admins. Clients cannot see or register for private events."
     )
+    is_auto_enroll = models.BooleanField(
+        default=False,
+        help_text="If True, registered customers will be automatically enrolled for the next occurrence. Only applicable for weekly and monthly recurring events."
+    )
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -159,6 +163,76 @@ class SpecialEvent(models.Model):
         else:
             # Normal case
             return event_start <= check_time < event_end
+    
+    def auto_enroll_users_for_next_occurrence(self):
+        """
+        Auto-enroll users who were registered for the previous occurrence.
+        Only works for weekly and monthly recurring events with is_auto_enroll=True.
+        """
+        # Only for weekly and monthly recurring events
+        if self.event_type not in ['weekly', 'monthly']:
+            return
+        
+        # Only if auto-enroll is enabled
+        if not self.is_auto_enroll:
+            return
+        
+        today = timezone.now().date()
+        
+        # Get all occurrences
+        occurrences = self.get_occurrences(
+            start_date=self.date,
+            end_date=today + timedelta(days=365)
+        )
+        
+        if len(occurrences) < 2:
+            # Need at least 2 occurrences (previous and next)
+            return
+        
+        # Find the most recent past occurrence and the next upcoming occurrence
+        previous_occurrence = None
+        next_occurrence = None
+        
+        # Find the most recent past occurrence
+        for occurrence in reversed(occurrences):
+            if occurrence < today:
+                previous_occurrence = occurrence
+                break
+        
+        # Find the next upcoming occurrence
+        for occurrence in occurrences:
+            if occurrence > today:
+                next_occurrence = occurrence
+                break
+        
+        if not previous_occurrence or not next_occurrence:
+            return
+        
+        # Get all users who were registered (not cancelled) for the previous occurrence
+        previous_registrations = self.registrations.filter(
+            occurrence_date=previous_occurrence,
+            status__in=['registered', 'showed_up']
+        )
+        
+        # Auto-enroll them for the next occurrence
+        for registration in previous_registrations:
+            # Check if already registered for next occurrence
+            existing_registration = self.registrations.filter(
+                user=registration.user,
+                occurrence_date=next_occurrence
+            ).first()
+            
+            if not existing_registration:
+                # Check if event is full for next occurrence
+                next_registered_count = self.get_registered_count(next_occurrence)
+                if next_registered_count < self.max_capacity:
+                    # Create auto-enrollment
+                    SpecialEventRegistration.objects.create(
+                        event=self,
+                        user=registration.user,
+                        occurrence_date=next_occurrence,
+                        status='registered'
+                    )
 
 
 class SpecialEventRegistration(models.Model):

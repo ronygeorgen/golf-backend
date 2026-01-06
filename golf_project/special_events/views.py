@@ -71,6 +71,10 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
             # For upcoming view, calculate next occurrence for each event
             result = []
             for event in queryset:
+                # Auto-enroll users for next occurrence if enabled
+                if event.is_auto_enroll and event.event_type in ['weekly', 'monthly']:
+                    event.auto_enroll_users_for_next_occurrence()
+                
                 if event.event_type == 'one_time':
                     # One-time events: only show if date is in future
                     if event.date >= today:
@@ -134,12 +138,17 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def upcoming(self, request):
         """Get all upcoming events - for recurring events, only show the first upcoming date.
-        Private events are excluded for non-admin/staff users."""
+        Private events are excluded for non-admin/staff users.
+        Auto-enrolls users for events with is_auto_enroll=True."""
         today = timezone.now().date()
         events = self.get_queryset()  # This already filters out private events for clients
         
         result = []
         for event in events:
+            # Auto-enroll users for next occurrence if enabled
+            if event.is_auto_enroll and event.event_type in ['weekly', 'monthly']:
+                event.auto_enroll_users_for_next_occurrence()
+            
             occurrences = event.get_occurrences(start_date=today, end_date=today + timedelta(days=365))
             if occurrences:
                 next_occurrence_date = occurrences[0]
@@ -365,6 +374,48 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
             
             serializer = SpecialEventRegistrationSerializer(registration)
             return Response(serializer.data)
+        except SpecialEventRegistration.DoesNotExist:
+            return Response(
+                {'error': 'Registration not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+    
+    @action(detail=True, methods=['delete'])
+    def remove_registration(self, request, pk=None):
+        """Remove a registration from an event (admin/staff only)"""
+        event = self.get_object()
+        
+        # Check if user is admin or staff (including superuser)
+        is_admin_or_staff = (
+            request.user.role in ['admin', 'staff'] or 
+            getattr(request.user, 'is_superuser', False)
+        )
+        
+        if not is_admin_or_staff:
+            return Response(
+                {'error': 'Permission denied'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+        
+        registration_id = request.data.get('registration_id')
+        
+        if not registration_id:
+            return Response(
+                {'error': 'registration_id is required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            registration = SpecialEventRegistration.objects.get(
+                id=registration_id,
+                event=event
+            )
+            registration.delete()
+            
+            return Response(
+                {'message': 'Registration removed successfully'},
+                status=status.HTTP_200_OK
+            )
         except SpecialEventRegistration.DoesNotExist:
             return Response(
                 {'error': 'Registration not found'},
