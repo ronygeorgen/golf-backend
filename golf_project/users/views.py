@@ -875,21 +875,26 @@ def auto_login(request):
 @permission_classes([IsAuthenticated])
 def member_list(request):
     """
-    Get list of clients (members) for staff's location with custom fields.
-    Only accessible by staff users.
+    Get list of clients (members) for staff/admin's location with custom fields.
+    Only accessible by staff or admin users.
     Returns clients with name, email, phone, and custom fields.
     """
-    # Check if user is staff
-    if request.user.role != 'staff':
+    # Check if user is staff or admin (including superuser)
+    is_admin_or_staff = (
+        request.user.role in ['staff', 'admin'] or 
+        getattr(request.user, 'is_superuser', False)
+    )
+    
+    if not is_admin_or_staff:
         return Response({
-            'error': 'Only staff members can access member list'
+            'error': 'Only staff members and admins can access member list'
         }, status=status.HTTP_403_FORBIDDEN)
     
-    # Get staff's location_id
+    # Get staff/admin's location_id
     location_id = request.user.ghl_location_id
     if not location_id:
         return Response({
-            'error': 'Staff member must have a location_id assigned'
+            'error': 'Staff member or admin must have a location_id assigned'
         }, status=status.HTTP_400_BAD_REQUEST)
     
     try:
@@ -962,7 +967,7 @@ def member_list(request):
                 page = clients
         
         member_list_data = []
-        staff_user_id = request.user.id
+        staff_or_admin_user_id = request.user.id
         
         for client in page:
             # Calculate custom fields
@@ -970,10 +975,10 @@ def member_list(request):
             total_hours = calculate_total_simulator_hours(client)
             last_package = get_last_active_package(client)
             
-            # Get staff-referred purchases
+            # Get staff/admin-referred purchases
             from coaching.models import CoachingPackagePurchase
             staff_referred_purchases = CoachingPackagePurchase.objects.filter(
-                referral_id=staff_user_id,
+                referral_id=staff_or_admin_user_id,
                 client=client,
                 package_status='active'
             ).values('id', 'package__title', 'purchase_name', 'purchased_at')

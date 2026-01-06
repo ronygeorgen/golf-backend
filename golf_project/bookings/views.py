@@ -833,16 +833,33 @@ class BookingViewSet(viewsets.ModelViewSet):
     
     @action(detail=False, methods=['get'])
     def upcoming(self, request):
-        """Get all upcoming bookings for the current user, filtered by location_id"""
+        """Get all upcoming bookings for the current user, filtered by location_id.
+        For clients: returns bookings where they are the client.
+        For admin/staff: returns bookings where they are the coach (coaching sessions).
+        """
         booking_type = request.query_params.get('booking_type')
         location_id = get_location_id_from_request(request)
         
-        logger.info(f"Upcoming bookings request: user={request.user.phone}, location_id={location_id}, booking_type={booking_type}")
+        logger.info(f"Upcoming bookings request: user={request.user.phone}, role={request.user.role}, location_id={location_id}, booking_type={booking_type}")
         
-        upcoming_bookings = Booking.objects.filter(
-            client=request.user,
-            start_time__gte=timezone.now()
-        ).exclude(status='cancelled')
+        # Check if user is admin or staff (including superuser)
+        is_admin_or_staff = (
+            request.user.role in ['admin', 'staff'] or 
+            getattr(request.user, 'is_superuser', False)
+        )
+        
+        # For admin/staff, show bookings where they are the coach
+        # For clients, show bookings where they are the client
+        if is_admin_or_staff:
+            upcoming_bookings = Booking.objects.filter(
+                coach=request.user,
+                start_time__gte=timezone.now()
+            ).exclude(status='cancelled')
+        else:
+            upcoming_bookings = Booking.objects.filter(
+                client=request.user,
+                start_time__gte=timezone.now()
+            ).exclude(status='cancelled')
         
         # Filter by location_id if provided
         if location_id:
@@ -895,18 +912,24 @@ class BookingViewSet(viewsets.ModelViewSet):
         coach_id = request.query_params.get('coach_id')
         filter_type = request.query_params.get('filter', 'upcoming')  # 'upcoming' or 'completed'
         
-        # If coach_id is provided, use it; otherwise use the current user (for staff viewing their own sessions)
+        # Check if user is admin or staff (including superuser)
+        is_admin_or_staff = (
+            request.user.role in ['admin', 'staff'] or 
+            getattr(request.user, 'is_superuser', False)
+        )
+        
+        # If coach_id is provided, use it; otherwise use the current user (for staff/admin viewing their own sessions)
         if coach_id:
-            # Admin can view any coach's sessions
-            if request.user.role not in ['admin', 'staff']:
+            # Admin/staff can view any coach's sessions
+            if not is_admin_or_staff:
                 return Response(
                     {'error': 'Permission denied'}, 
                     status=status.HTTP_403_FORBIDDEN
                 )
             target_coach_id = coach_id
         else:
-            # Staff viewing their own sessions
-            if request.user.role not in ['admin', 'staff']:
+            # Staff/admin viewing their own sessions
+            if not is_admin_or_staff:
                 return Response(
                     {'error': 'Permission denied'}, 
                     status=status.HTTP_403_FORBIDDEN
