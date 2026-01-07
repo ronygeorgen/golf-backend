@@ -13,6 +13,8 @@ def get_location_id_from_request(request):
     2. location_id from query params (GET)
     3. User's ghl_location_id (if authenticated)
     4. None
+    
+    Returns trimmed location_id (removes leading/trailing whitespace and '+' characters)
     """
     location_id = None
     
@@ -30,6 +32,13 @@ def get_location_id_from_request(request):
     # If still not found and user is authenticated, use user's location_id
     if not location_id and hasattr(request, 'user') and request.user.is_authenticated:
         location_id = getattr(request.user, 'ghl_location_id', None)
+    
+    # Trim location_id to remove leading/trailing whitespace and '+' characters
+    if location_id:
+        location_id = str(location_id).strip().rstrip('+').strip()
+        # Return None if location_id becomes empty after trimming
+        if not location_id:
+            location_id = None
     
     return location_id
 
@@ -59,4 +68,5 @@ def get_users_by_location(location_id):
     if location_id:
         return User.objects.filter(ghl_location_id=location_id)
     return User.objects.none()
+
 

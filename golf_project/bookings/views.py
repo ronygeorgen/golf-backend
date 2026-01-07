@@ -834,13 +834,21 @@ class BookingViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def upcoming(self, request):
         """Get all upcoming bookings for the current user, filtered by location_id.
-        For clients: returns bookings where they are the client.
-        For admin/staff: returns bookings where they are the coach (coaching sessions).
+        For clients: returns bookings where they are the client (both simulator and coaching).
+        For admin/staff: returns bookings where they are EITHER the coach OR the client
+        (staff can book sessions for themselves as clients).
+        Requires location_id to be provided.
         """
         booking_type = request.query_params.get('booking_type')
         location_id = get_location_id_from_request(request)
         
         logger.info(f"Upcoming bookings request: user={request.user.phone}, role={request.user.role}, location_id={location_id}, booking_type={booking_type}")
+        
+        # Require location_id - return empty if not provided
+        if not location_id:
+            logger.warning(f"No location_id provided for upcoming bookings request from user {request.user.phone}")
+            paginator = FivePerPagePagination()
+            return paginator.get_paginated_response([])
         
         # Check if user is admin or staff (including superuser)
         is_admin_or_staff = (
@@ -848,11 +856,12 @@ class BookingViewSet(viewsets.ModelViewSet):
             getattr(request.user, 'is_superuser', False)
         )
         
-        # For admin/staff, show bookings where they are the coach
-        # For clients, show bookings where they are the client
+        # For admin/staff, show bookings where they are EITHER the coach OR the client
+        # (staff can book sessions for themselves as clients)
+        # For clients, show bookings where they are the client (both simulator and coaching)
         if is_admin_or_staff:
             upcoming_bookings = Booking.objects.filter(
-                coach=request.user,
+                Q(coach=request.user) | Q(client=request.user),
                 start_time__gte=timezone.now()
             ).exclude(status='cancelled')
         else:
@@ -861,12 +870,9 @@ class BookingViewSet(viewsets.ModelViewSet):
                 start_time__gte=timezone.now()
             ).exclude(status='cancelled')
         
-        # Filter by location_id if provided
-        if location_id:
-            upcoming_bookings = upcoming_bookings.filter(location_id=location_id)
-            logger.info(f"Filtered by location_id={location_id}, count before type filter: {upcoming_bookings.count()}")
-        else:
-            logger.warning(f"No location_id provided for upcoming bookings request from user {request.user.phone}")
+        # Filter strictly by location_id - only show bookings with matching location_id
+        upcoming_bookings = upcoming_bookings.filter(location_id=location_id)
+        logger.info(f"Filtered by location_id={location_id}, count before type filter: {upcoming_bookings.count()}")
         
         # Filter by booking_type if provided
         if booking_type in ['simulator', 'coaching']:
