@@ -271,8 +271,8 @@ class BookingViewSet(viewsets.ModelViewSet):
         # Default to current user
         target_user = self.request.user
         
-        # If admin/staff, check if a client_id/customer_id is provided
-        if target_user.role in ['admin', 'staff'] and hasattr(self, 'request'):
+        # If admin/staff/superadmin, check if a client_id/customer_id is provided
+        if target_user.role in ['admin', 'staff', 'superadmin'] and hasattr(self, 'request'):
             client_id = self.request.data.get('client') or self.request.data.get('client_id')
             if client_id:
                 try:
@@ -856,8 +856,8 @@ class BookingViewSet(viewsets.ModelViewSet):
         use_organization = request.query_params.get('use_organization', 'false').lower() == 'true'
         target_user = request.user
         
-        # Admin/Staff can query for other users
-        if request.user.role in ['admin', 'staff']:
+        # Admin/Staff/Superadmin can query for other users
+        if request.user.role in ['admin', 'staff', 'superadmin']:
             user_id = request.query_params.get('user_id')
             if user_id:
                 try:
@@ -935,8 +935,8 @@ class BookingViewSet(viewsets.ModelViewSet):
     
     @action(detail=False, methods=['get'])
     def today(self, request):
-        """Get today's bookings (for admin/staff)"""
-        if request.user.role not in ['admin', 'staff']:
+        """Get today's bookings (for admin/staff/superadmin)"""
+        if request.user.role not in ['admin', 'staff', 'superadmin']:
             return Response(
                 {'error': 'Permission denied'}, 
                 status=status.HTTP_403_FORBIDDEN

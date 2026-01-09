@@ -258,8 +258,8 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def user_purchases(self, request):
-        """Get purchases for a specific user (Admin/Staff only)"""
-        if request.user.role not in ['admin', 'staff']:
+        """Get purchases for a specific user (Admin/Staff/Superadmin only)"""
+        if request.user.role not in ['admin', 'staff', 'superadmin']:
             return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
             
         user_id = request.query_params.get('user_id')
@@ -2125,8 +2125,8 @@ class SimulatorPackagePurchaseViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['get'])
     def user_purchases(self, request):
-        """Get purchases for a specific user (Admin/Staff only)"""
-        if request.user.role not in ['admin', 'staff']:
+        """Get purchases for a specific user (Admin/Staff/Superadmin only)"""
+        if request.user.role not in ['admin', 'staff', 'superadmin']:
             return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
             
         user_id = request.query_params.get('user_id')
