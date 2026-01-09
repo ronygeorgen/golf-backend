@@ -255,6 +255,37 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
         
         serializer = self.get_serializer(purchases, many=True)
         return Response(serializer.data)
+
+    @action(detail=False, methods=['get'])
+    def user_purchases(self, request):
+        """Get purchases for a specific user (Admin/Staff only)"""
+        if request.user.role not in ['admin', 'staff']:
+            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
+            
+        user_id = request.query_params.get('user_id')
+        if not user_id:
+            return Response({'error': 'user_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        target_user = get_object_or_404(User, id=user_id)
+        
+        # Get personal/gifted purchases (exclude organization packages)
+        # Only include purchases where user is the client or received as gift
+        purchases = self.get_queryset().filter(
+            Q(client=target_user) | 
+            Q(recipient_phone=target_user.phone, gift_status='accepted')
+        ).exclude(
+            purchase_type='organization'
+        ).order_by('-purchased_at')
+        
+        # Apply pagination
+        paginator = TenPerPagePagination()
+        page = paginator.paginate_queryset(purchases, request)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return paginator.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(purchases, many=True)
+        return Response(serializer.data)
     
     @action(detail=False, methods=['get'])
     def gifts_pending(self, request):
@@ -2091,6 +2122,36 @@ class SimulatorPackagePurchaseViewSet(viewsets.ModelViewSet):
             serializer.save(client=self.request.user)
         else:
             serializer.save()
+
+    @action(detail=False, methods=['get'])
+    def user_purchases(self, request):
+        """Get purchases for a specific user (Admin/Staff only)"""
+        if request.user.role not in ['admin', 'staff']:
+            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
+            
+        user_id = request.query_params.get('user_id')
+        if not user_id:
+            return Response({'error': 'user_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        target_user = get_object_or_404(User, id=user_id)
+        
+        # Get personal/gifted purchases
+        purchases = SimulatorPackagePurchase.objects.filter(
+            Q(client=target_user) | 
+            Q(recipient_phone=target_user.phone, gift_status='accepted')
+        ).exclude(
+            package_status='gifted'
+        ).order_by('-purchased_at')
+        
+        # Apply pagination
+        paginator = TenPerPagePagination()
+        page = paginator.paginate_queryset(purchases, request)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return paginator.get_paginated_response(serializer.data)
+        
+        serializer = self.get_serializer(purchases, many=True)
+        return Response(serializer.data)
 
 
 class GuestPackagesView(APIView):

@@ -952,7 +952,7 @@ def member_list(request):
                     Q(phone__icontains=search_query)
                 )
         
-        clients = clients.order_by('first_name', 'last_name', 'email')
+        clients = clients.order_by('-date_joined', 'first_name', 'last_name')
         
         # Apply pagination only if no search query
         if search_query:
