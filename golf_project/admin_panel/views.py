@@ -773,16 +773,25 @@ class UserPagination(PageNumberPagination):
     max_page_size = 100
 
 
-class UserViewSet(viewsets.ReadOnlyModelViewSet):
+class UserViewSet(viewsets.ModelViewSet):
     """
-    ViewSet for listing all users with pagination.
-    Only accessible by admin users.
+    ViewSet for listing and managing users.
+    Listing: Admin and Staff
+    Creating: Admin and Staff (Staff can only create clients)
+    Updating/Deleting: Admin only
     """
     queryset = User.objects.all().order_by('-date_joined')
     serializer_class = UserSerializer
     permission_classes = [IsAuthenticated]
     pagination_class = UserPagination
     
+    def get_serializer_class(self):
+        # Use StaffSerializer for create to handle password and username generation
+        # It's named StaffSerializer but handles generic user creation logic well
+        if self.action == 'create':
+            return StaffSerializer
+        return UserSerializer
+
     def get_queryset(self):
         """Filter users based on query parameters and location"""
         location_id = get_location_id_from_request(self.request)
@@ -818,11 +827,56 @@ class UserViewSet(viewsets.ReadOnlyModelViewSet):
     
     def list(self, request, *args, **kwargs):
         """List all users with pagination"""
-        # Check if user is admin
-        if not (request.user.role == 'admin' or request.user.is_superuser):
-            raise PermissionDenied("Administrator privileges are required.")
+        # Check if user is admin or staff
+        if not (request.user.role in ['admin', 'staff'] or request.user.is_superuser):
+            raise PermissionDenied("Administrator or Staff privileges are required.")
         
         return super().list(request, *args, **kwargs)
+    
+    def create(self, request, *args, **kwargs):
+        """Create a new user"""
+        # Check permissions
+        if not (request.user.role in ['admin', 'staff'] or request.user.is_superuser):
+             raise PermissionDenied("Administrator or Staff privileges are required.")
+        
+        # Enforce role logic
+        data = request.data.copy()
+        if request.user.role == 'staff':
+            # Staff can ONLY create clients
+            data['role'] = 'client'
+        
+        # If role is not provided, default to client (safe default for this endpoint)
+        if not data.get('role'):
+            data['role'] = 'client'
+            
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+    def perform_create(self, serializer):
+        """Set location_id when creating user"""
+        location_id = get_location_id_from_request(self.request)
+        if location_id:
+             serializer.save(ghl_location_id=location_id)
+        else:
+             serializer.save()
+
+    def update(self, request, *args, **kwargs):
+        if not (request.user.role == 'admin' or request.user.is_superuser):
+            raise PermissionDenied("Administrator privileges are required.")
+        return super().update(request, *args, **kwargs)
+    
+    def partial_update(self, request, *args, **kwargs):
+        if not (request.user.role == 'admin' or request.user.is_superuser):
+            raise PermissionDenied("Administrator privileges are required.")
+        return super().partial_update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        if not (request.user.role == 'admin' or request.user.is_superuser):
+            raise PermissionDenied("Administrator privileges are required.")
+        return super().destroy(request, *args, **kwargs)
     
     @action(detail=True, methods=['post'], url_path='toggle-pause')
     def toggle_pause(self, request, pk=None):
