@@ -89,8 +89,8 @@ class BookingViewSet(viewsets.ModelViewSet):
         user = self.request.user
         location_id = get_location_id_from_request(self.request)
         
-        # Admins and staff can see all bookings (filtered by location)
-        if user.role in ['admin', 'staff']:
+        # Admins, staff, and superadmins can see all bookings (filtered by location)
+        if user.role in ['admin', 'staff', 'superadmin']:
             queryset = Booking.objects.all()
             if location_id:
                 queryset = queryset.filter(location_id=location_id)
@@ -121,14 +121,27 @@ class BookingViewSet(viewsets.ModelViewSet):
                 start_time__date__lte=end_date
             )
         
+        # Search functionality - search by client name, phone, or email
+        search = self.request.query_params.get('search')
+        if search:
+            queryset = queryset.filter(
+                Q(client__first_name__icontains=search) |
+                Q(client__last_name__icontains=search) |
+                Q(client__phone__icontains=search) |
+                Q(client__email__icontains=search)
+            )
+        
         # For admin dashboard - recent bookings
         recent = self.request.query_params.get('recent')
         if recent:
             queryset = queryset.order_by('-created_at')[:10]
+        else:
+            # Default ordering: latest created bookings first (by created_at descending)
+            queryset = queryset.order_by('-created_at')
         
         return queryset.select_related(
             'client', 'simulator', 'coach', 'coaching_package'
-    ).prefetch_related()
+        ).prefetch_related()
     
     def get_serializer_context(self):
         context = super().get_serializer_context()
