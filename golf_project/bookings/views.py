@@ -1708,10 +1708,6 @@ class BookingViewSet(viewsets.ModelViewSet):
             first_simulator = available_simulators.first()
             hourly_price = float(first_simulator.hourly_price) if first_simulator.hourly_price else None
         
-        # Check if there's a special event blocking this entire date
-        booking_datetime = timezone.make_aware(datetime.combine(booking_date, datetime.min.time()))
-        has_special_event, event_title = self._check_special_event_conflict(booking_datetime)
-        
         response_data = {
             'date': date_str,
             'duration_minutes': duration_minutes,
@@ -1720,9 +1716,6 @@ class BookingViewSet(viewsets.ModelViewSet):
             'hourly_price': hourly_price,  # Always include hourly_price (can be None)
             'max_available_simulators': max_available_simulators
         }
-        
-        if has_special_event:
-            response_data['special_event_message'] = f'Bookings are not available due to a special event: {event_title}'
         
         return Response(response_data)
     
@@ -2011,19 +2004,12 @@ class BookingViewSet(viewsets.ModelViewSet):
         
         available_slots = sorted(available_slots_map.values(), key=lambda x: x['start_time'])
         
-        # Check if there's a special event blocking this entire date
-        booking_datetime = timezone.make_aware(datetime.combine(booking_date, datetime.min.time()))
-        has_special_event, event_title = self._check_special_event_conflict(booking_datetime)
-        
         response_data = {
             'date': date_str,
             'package_id': package_id,
             'coach_id': coach_id,
             'available_slots': available_slots
         }
-        
-        if has_special_event:
-            response_data['special_event_message'] = f'Bookings are not available due to a special event: {event_title}'
         
         return Response(response_data)
 

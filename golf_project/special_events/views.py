@@ -164,6 +164,39 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
         
         return Response(result)
     
+    @action(detail=False, methods=['get'])
+    def events_on_date(self, request):
+        """Get all events occurring on a specific date"""
+        date_str = request.query_params.get('date')
+        if not date_str:
+            return Response({'error': 'date parameter is required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        except ValueError:
+            return Response({'error': 'Invalid date format. Use YYYY-MM-DD'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        location_id = get_location_id_from_request(request)
+        active_events = SpecialEvent.objects.filter(is_active=True)
+        if location_id:
+            active_events = active_events.filter(location_id=location_id)
+            
+        events_on_date = []
+        for event in active_events:
+            occurrences = event.get_occurrences(start_date=target_date, end_date=target_date)
+            if target_date in occurrences:
+                # Mask title for private events
+                title = "Private Event" if event.is_private else event.title
+                data = {
+                    'title': title,
+                    'start_time': event.start_time.strftime('%H:%M:%S'),
+                    'end_time': event.end_time.strftime('%H:%M:%S'),
+                    'is_private': event.is_private,
+                }
+                events_on_date.append(data)
+                
+        return Response(events_on_date)
+
     @action(detail=True, methods=['post'])
     def register(self, request, pk=None):
         """Register the current user for the next occurrence of this event"""
