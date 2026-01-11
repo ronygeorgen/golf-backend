@@ -195,11 +195,13 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
                 result.append(data)
         
         return Response(result)
+    @action(detail=False, methods=['get'])
+    def upcoming(self, request):
         """Get all upcoming events - for recurring events, only show the first upcoming date.
-        Private events are excluded for non-admin/staff users.
+        Private events are excluded for non-admin/staff users via get_queryset().
         Auto-enrolls users for events with is_auto_enroll=True."""
         today = timezone.now().date()
-        events = self.get_queryset()  # This already filters out private events for clients
+        events = self.get_queryset()
         
         result = []
         for event in events:
@@ -212,7 +214,7 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
                 next_occurrence_date = occurrences[0]
                 # Pass occurrence_date to serializer context for accurate counting
                 serializer = self.get_serializer(event, context={
-                    'request': request,
+                    **self.get_serializer_context(),
                     'occurrence_date': next_occurrence_date
                 })
                 data = serializer.data
@@ -234,6 +236,16 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
         except ValueError:
             return Response({'error': 'Invalid date format. Use YYYY-MM-DD'}, status=status.HTTP_400_BAD_REQUEST)
             
+        # Use get_queryset to respect location and ROLE (admins see everything, clients see non-private)
+        # Note: If clients shouldn't see special events in the calendar at all, 
+        # get_queryset will handle filtering them if we let clients access this.
+        # However, calendar-events is 403 for clients, so we might want consistency here.
+        is_admin_or_staff = (
+            request.user.role in ['admin', 'staff'] or 
+            getattr(request.user, 'is_superuser', False)
+        )
+        
+        # We use filter on the base queryset but respect role for masking
         location_id = get_location_id_from_request(request)
         active_events = SpecialEvent.objects.filter(is_active=True)
         if location_id:
@@ -241,12 +253,18 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
             
         events_on_date = []
         for event in active_events:
+            # If it's private and user is not admin/staff, skip it entirely 
+            # (matches "not in calendar for normal clients")
+            if event.is_private and not is_admin_or_staff:
+                continue
+                
             occurrences = event.get_occurrences(start_date=target_date, end_date=target_date)
             if target_date in occurrences:
-                # Mask title for private events
-                title = "Private Event" if event.is_private else event.title
+                # Admins see real title, others see real title if it's not private
+                # Since we skip private for non-admins above, they only see public events here.
                 data = {
-                    'title': title,
+                    'id': event.id,
+                    'title': event.title,
                     'start_time': event.start_time.strftime('%H:%M:%S'),
                     'end_time': event.end_time.strftime('%H:%M:%S'),
                     'is_private': event.is_private,
