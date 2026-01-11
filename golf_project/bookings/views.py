@@ -1254,6 +1254,12 @@ class BookingViewSet(viewsets.ModelViewSet):
                     credit.status = SimulatorCredit.Status.AVAILABLE
                     credit.redeemed_at = None
                     credit.save(update_fields=['hours_remaining', 'status', 'redeemed_at'])
+                    
+                    # Remove the link from the booking to the credit so the credit can be reused
+                    # (Booking.simulator_credit_redemption is OneToOne, so valid for only one booking)
+                    booking.simulator_credit_redemption = None
+                    booking.save(update_fields=['simulator_credit_redemption'])
+                    
                     credit.refresh_from_db(fields=['hours_remaining', 'status'])
                     restitution['simulator_credit_hours_restored'] = float(credit.hours_remaining)
                 # Case 4: Booking was paid (no package, no credit) -> issue credit with exact hours
