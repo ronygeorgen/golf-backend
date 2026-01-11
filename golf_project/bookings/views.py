@@ -911,19 +911,13 @@ class BookingViewSet(viewsets.ModelViewSet):
             getattr(request.user, 'is_superuser', False)
         )
         
-        # For admin/staff, show bookings where they are EITHER the coach OR the client
-        # (staff can book sessions for themselves as clients)
-        # For clients, show bookings where they are the client (both simulator and coaching)
-        if is_admin_or_staff:
-            upcoming_bookings = Booking.objects.filter(
-                Q(coach=request.user) | Q(client=request.user),
-                start_time__gte=timezone.now()
-            ).exclude(status='cancelled')
-        else:
-            upcoming_bookings = Booking.objects.filter(
-                client=request.user,
-                start_time__gte=timezone.now()
-            ).exclude(status='cancelled')
+        # Show ONLY bookings where the user is the client (both simulator and coaching)
+        # Even for admin/staff, the portal view should show their personal bookings.
+        # Coaching sessions they manage as a coach are shown in the /coaching-sessions page.
+        upcoming_bookings = Booking.objects.filter(
+            client=request.user,
+            start_time__gte=timezone.now()
+        ).exclude(status='cancelled')
         
         # Filter strictly by location_id - only show bookings with matching location_id
         upcoming_bookings = upcoming_bookings.filter(location_id=location_id)
