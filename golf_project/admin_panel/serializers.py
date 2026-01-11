@@ -33,6 +33,7 @@ class CoachingSessionAdjustmentSerializer(serializers.Serializer, ClientLookupMi
     session_count = serializers.IntegerField(min_value=1, default=1)
     simulator_hours = serializers.DecimalField(max_digits=6, decimal_places=2, min_value=Decimal('0'), required=False, default=Decimal('0'))
     note = serializers.CharField(required=False, allow_blank=True)
+    create_if_missing = serializers.BooleanField(required=False, default=False)
     
     def validate(self, attrs):
         attrs = self._resolve_client(attrs)
@@ -40,6 +41,7 @@ class CoachingSessionAdjustmentSerializer(serializers.Serializer, ClientLookupMi
         purchase = None
         purchase_id = attrs.get('package_purchase_id')
         package_id = attrs.get('package_id')
+        create_if_missing = attrs.get('create_if_missing', False)
         
         if purchase_id:
             purchase = CoachingPackagePurchase.objects.filter(id=purchase_id, client=client).first()
@@ -49,15 +51,34 @@ class CoachingSessionAdjustmentSerializer(serializers.Serializer, ClientLookupMi
             purchase = CoachingPackagePurchase.objects.filter(
                 client=client,
                 package_id=package_id
-            ).order_by('-purchased_at').first()
+            ).exclude(package_status='completed').order_by('-purchased_at').first()
+            
             if not purchase:
-                raise serializers.ValidationError("The client does not have an active purchase for the selected package.")
+                if create_if_missing:
+                    from coaching.models import CoachingPackage
+                    try:
+                        package = CoachingPackage.objects.get(id=package_id)
+                        attrs['selected_package'] = package
+                    except CoachingPackage.DoesNotExist:
+                        raise serializers.ValidationError("Selected package does not exist.")
+                else:
+                    raise serializers.ValidationError(
+                        "The client does not have an active purchase for the selected package.",
+                        code='no_active_purchase'
+                    )
         else:
             purchase = CoachingPackagePurchase.objects.filter(
-                client=client
+                client=client,
+                package_status='active'
             ).order_by('-purchased_at').first()
+            
             if not purchase:
-                raise serializers.ValidationError("No purchases found for this client. Provide a package_id or purchase reference.")
+                if package_id and create_if_missing:
+                     # This block allows falling back to creation if no generic active purchase is found but package_id provided 
+                     # (Though logic flow makes this unreachable if package_id WAS provided, as it hits the elif above)
+                     pass
+                else:
+                     raise serializers.ValidationError("No active purchases found for this client. Provide a package_id or purchase reference.")
         
         attrs['purchase'] = purchase
         return attrs

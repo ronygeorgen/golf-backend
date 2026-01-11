@@ -668,7 +668,33 @@ class AdminOverrideViewSet(viewsets.ViewSet):
         location_id = get_location_id_from_request(request)
         serializer = CoachingSessionAdjustmentSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        purchase = serializer.validated_data['purchase']
+        purchase = serializer.validated_data.get('purchase')
+        
+        # Handle creation if missing
+        if not purchase and serializer.validated_data.get('create_if_missing') and serializer.validated_data.get('selected_package'):
+            from coaching.models import CoachingPackagePurchase
+            package = serializer.validated_data['selected_package']
+            client = serializer.validated_data['client']
+            
+            # Create new purchase with 0 balance, to be incremented below
+            purchase = CoachingPackagePurchase.objects.create(
+                client=client,
+                package=package,
+                sessions_total=0,
+                sessions_remaining=0,
+                simulator_hours_total=0, 
+                simulator_hours_remaining=0,
+                purchase_type='normal',
+                purchase_name=package.title,
+                package_status='active',
+                notes=f"Created via manual override on {django_timezone.now().date()}"
+            )
+            
+        if not purchase:
+             return Response(
+                 {'error': 'No active purchase found and creation not requested.'}, 
+                 status=status.HTTP_400_BAD_REQUEST
+             )
         
         # Verify purchase belongs to admin's location
         if location_id and purchase.package.location_id != location_id:
