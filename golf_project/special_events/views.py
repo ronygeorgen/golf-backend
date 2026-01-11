@@ -15,12 +15,17 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         from users.utils import get_location_id_from_request
+        from django.db.models import Q
         location_id = get_location_id_from_request(self.request)
         queryset = SpecialEvent.objects.filter(is_active=True)
         
-        # Filter by location_id
+        # Filter by location_id (allow global events or matching location)
         if location_id:
-            queryset = queryset.filter(location_id=location_id)
+            queryset = queryset.filter(
+                Q(location_id=location_id) | 
+                Q(location_id__isnull=True) | 
+                Q(location_id='')
+            )
         
         # Check if user is admin or staff (including superuser)
         is_admin_or_staff = (
@@ -29,13 +34,15 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
         )
         
         # Admin and staff can see all events (including private)
-        # Clients see only non-private future events
+        # Clients see only non-private active events with future occurrences
         if not is_admin_or_staff:
-            # For clients, exclude private events and show only future events
+            # For clients, exclude private events and show only events that aren't finished
             today = timezone.now().date()
             queryset = queryset.filter(
-                is_private=False,
-                date__gte=today
+                is_private=False
+            ).filter(
+                Q(date__gte=today) | 
+                (Q(event_type__in=['weekly', 'monthly', 'yearly']) & (Q(recurring_end_date__isnull=True) | Q(recurring_end_date__gte=today)))
             )
         
         return queryset.order_by('date', 'start_time')
