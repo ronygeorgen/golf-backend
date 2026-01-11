@@ -1039,13 +1039,8 @@ class BookingViewSet(viewsets.ModelViewSet):
     def _reserve_simulator_credit(self, hours_needed, user=None):
         """
         Reserve and consume hours from available simulator credits.
-        
-        Args:
-            hours_needed: Decimal or float representing hours needed
-            user: The user to consume credit from (defaults to request.user)
-            
-        Returns:
-            SimulatorCredit: The credit that was used (may be partially consumed)
+        Supports aggregating multiple small credits and splitting large credits
+        to satisfy the requested duration.
         """
         from decimal import Decimal
         hours_needed = Decimal(str(hours_needed))
@@ -1058,26 +1053,60 @@ class BookingViewSet(viewsets.ModelViewSet):
             hours_remaining__gt=0
         ).order_by('issued_at')
         
-        if not credits.exists():
-            raise serializers.ValidationError("No simulator credit hours available to redeem.")
-        
-        # Try to find a credit with enough hours
-        for credit in credits:
-            if credit.hours_remaining >= hours_needed:
-                # This credit has enough hours
-                credit.consume_hours(hours_needed)
-                return credit
-        
-        # No single credit has enough, use the first one (will be partially consumed)
-        # In the future, we could implement logic to combine multiple credits
-        credit = credits.first()
-        if credit.hours_remaining < hours_needed:
-            raise serializers.ValidationError(
-                f"Insufficient credit hours. Available: {credit.hours_remaining}, Needed: {hours_needed}"
+        # Calculate total available
+        total_available = sum(c.hours_remaining for c in credits)
+        if total_available < hours_needed:
+             raise serializers.ValidationError(
+                f"Insufficient credit hours. Available: {total_available}, Needed: {hours_needed}"
             )
+
+        # Collect credits to consume
+        consumed_credits = []
+        collected_amount = Decimal('0')
         
-        credit.consume_hours(hours_needed)
-        return credit
+        for credit in credits:
+            consumed_credits.append(credit)
+            collected_amount += credit.hours_remaining
+            if collected_amount >= hours_needed:
+                break
+        
+        # Mark collected credits as used (consolidated)
+        for credit in consumed_credits:
+            credit.status = SimulatorCredit.Status.REDEEMED
+            credit.notes = f"{credit.notes} (Consolidated)"[:255]
+            credit.hours_remaining = Decimal('0') 
+            credit.save(update_fields=['status', 'notes', 'hours_remaining'])
+            
+            # Note: We don't need to unlink from 'redeemed_booking' here because 
+            # we are not reusing these specific credit records for the new booking.
+            # We are creating a fresh one below.
+
+        # Handle the "Change" (Leftover)
+        change_amount = collected_amount - hours_needed
+        if change_amount > 0:
+            SimulatorCredit.objects.create(
+                client=user,
+                hours=change_amount,
+                hours_remaining=change_amount,
+                status=SimulatorCredit.Status.AVAILABLE,
+                reason=SimulatorCredit.Reason.MANUAL,
+                notes="Remaining balance from credit consolidation",
+                # Preserve issuer if possible, or leave blank (system)
+            )
+            
+        # Create the Payment Credit (Clean, unlinked)
+        payment_credit = SimulatorCredit.objects.create(
+            client=user,
+            hours=hours_needed,
+            hours_remaining=hours_needed, 
+            status=SimulatorCredit.Status.AVAILABLE,
+            reason=SimulatorCredit.Reason.MANUAL,
+            notes="Consolidated credit for booking"
+        )
+        
+        # Consume it immediately
+        payment_credit.consume_hours(hours_needed)
+        return payment_credit
 
     def _calculate_simulator_price(self, simulator, duration_minutes):
         if not simulator or not duration_minutes:
