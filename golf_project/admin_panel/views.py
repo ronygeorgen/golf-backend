@@ -70,19 +70,18 @@ class StaffViewSet(viewsets.ModelViewSet):
     serializer_class = StaffSerializer
     
     def get_queryset(self):
-        """Filter staff by location_id"""
+        """Filter staff/admin by location_id"""
         queryset = User.objects.filter(role__in=['staff', 'admin'])
-        # Superadmin can see all admins, regular admin can only see staff from their location
+        # Superadmin can see all admins and staff across all locations
         if self.request.user.role == 'superadmin':
-            # Superadmin can see all admins across all locations
-            pass
+            return queryset
         else:
-            # Regular admin can only see staff members (not other admins) from their location
+            # Regular admin can see staff members and other admins from their location
             location_id = get_location_id_from_request(self.request)
             if location_id:
-                queryset = queryset.filter(ghl_location_id=location_id, role='staff')
+                queryset = queryset.filter(ghl_location_id=location_id)
             else:
-                queryset = queryset.filter(role='staff')
+                queryset = queryset.filter(role__in=['staff', 'admin'])
         return queryset
     
     def get_serializer_class(self):
@@ -125,16 +124,18 @@ class StaffViewSet(viewsets.ModelViewSet):
                 serializer.save(role='staff')
     
     def perform_update(self, serializer):
-        """Prevent regular admins from changing role to admin"""
+        """Limit regular admins from elevating users to admin role"""
         user = self.request.user
         
-        # If regular admin (not superadmin), ensure role is not changed to admin
+        # If regular admin (not superadmin), ensure role is not changed to admin from something else
         if user.role != 'superadmin':
             role = serializer.validated_data.get('role')
-            if role == 'admin':
+            target_user = self.get_object()
+            
+            if role == 'admin' and target_user.role != 'admin':
                 raise PermissionDenied("Regular admins cannot change user role to admin.")
-            # Force role to staff if not superadmin
-            serializer.save(role='staff')
+            
+            serializer.save()
         else:
             # Superadmin can update freely
             serializer.save()

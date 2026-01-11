@@ -1467,7 +1467,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                 bookings = bookings.filter(location_id=location_id)
         
         # Filter by booking_type if provided
-        if booking_type:
+        if booking_type and booking_type != 'all':
             if booking_type not in ['simulator', 'coaching']:
                 return Response(
                     {'error': 'booking_type must be either "simulator" or "coaching"'}, 
