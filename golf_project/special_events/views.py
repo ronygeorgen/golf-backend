@@ -134,9 +134,67 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
         else:
             # Default behavior for clients or if no view_type specified
             return super().list(request, *args, **kwargs)
-    
-    @action(detail=False, methods=['get'])
-    def upcoming(self, request):
+    @action(detail=False, methods=['get'], url_path='calendar-events')
+    def calendar_events(self, request):
+        """
+        Get all event occurrences within a specific date range.
+        Query params: start_date, end_date (YYYY-MM-DD)
+        Only accessible by admin/staff/superuser.
+        """
+        # Check permissions
+        is_admin_or_staff = (
+            request.user.role in ['admin', 'staff'] or 
+            getattr(request.user, 'is_superuser', False)
+        )
+        
+        if not is_admin_or_staff:
+             return Response(
+                 {'error': 'Permission denied'},
+                 status=status.HTTP_403_FORBIDDEN
+             )
+
+        start_date_str = request.query_params.get('start_date')
+        end_date_str = request.query_params.get('end_date')
+
+        if not start_date_str or not end_date_str:
+            return Response(
+                {'error': 'start_date and end_date are required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+            end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+        except ValueError:
+            return Response(
+                {'error': 'Invalid date format. Use YYYY-MM-DD'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+            
+        location_id = get_location_id_from_request(request)
+        queryset = self.get_queryset() # This already filters by location and is_active
+        
+        result = []
+        for event in queryset:
+            occurrences = event.get_occurrences(start_date=start_date, end_date=end_date)
+            for occurrence_date in occurrences:
+                # Use serializer for the event data
+                serializer = self.get_serializer(event, context={
+                    **self.get_serializer_context(),
+                    'occurrence_date': occurrence_date
+                })
+                data = serializer.data
+                
+                # Override date with the specific occurrence date
+                data['date'] = occurrence_date.strftime('%Y-%m-%d')
+                data['display_id'] = f"{event.id}_{occurrence_date.strftime('%Y-%m-%d')}"
+                
+                # Add explicit start/end datetimes for calendar if needed (combined date + time)
+                # Note: start_time and end_time are already in the serializer data as strings
+                
+                result.append(data)
+        
+        return Response(result)
         """Get all upcoming events - for recurring events, only show the first upcoming date.
         Private events are excluded for non-admin/staff users.
         Auto-enrolls users for events with is_auto_enroll=True."""
