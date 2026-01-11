@@ -1026,13 +1026,13 @@ class BookingViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
     
     def _is_admin(self, user):
-        return getattr(user, 'role', None) == 'admin' or getattr(user, 'is_superuser', False)
+        return getattr(user, 'role', None) in ['admin', 'superadmin'] or getattr(user, 'is_superuser', False)
     
     def _lock_applies(self, booking):
         return booking.start_time - timezone.now() < self.lock_window
     
     def _user_can_manage_booking(self, user, booking):
-        if user.role in ['admin', 'staff']:
+        if user.role in ['admin', 'staff', 'superadmin']:
             return True
         return booking.client_id == user.id
     
@@ -1455,7 +1455,7 @@ class BookingViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def stats(self, request):
         """Get booking statistics (admin only)"""
-        if request.user.role not in ['admin', 'staff']:
+        if request.user.role not in ['admin', 'staff', 'superadmin']:
             return Response(
                 {'error': 'Permission denied'}, 
                 status=status.HTTP_403_FORBIDDEN
