@@ -225,7 +225,6 @@ class SimulatorCreditViewSet(viewsets.ReadOnlyModelViewSet):
         if getattr(user, 'role', None) in ['admin', 'staff'] or getattr(user, 'is_superuser', False):
             client_id = self.request.query_params.get('client_id')
             if client_id:
-                queryset = queryset.filter(client_id=client_id)
-            return queryset
+                return queryset.filter(client_id=client_id)
         
         return queryset.filter(client=user)
