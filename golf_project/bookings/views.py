@@ -1061,10 +1061,21 @@ class BookingViewSet(viewsets.ModelViewSet):
         if not credits.exists():
             raise serializers.ValidationError("No simulator credit hours available to redeem.")
         
+        # Helper to clean up ghost references from cancelled bookings
+        def ensure_credit_unlink(credit_obj):
+            if hasattr(credit_obj, 'redeemed_booking'):
+                old_booking = credit_obj.redeemed_booking
+                # If the booking linked to this credit is cancelled, we must unlink it
+                # to allow the credit to be reused (OneToOne constraint).
+                if old_booking.status == 'cancelled':
+                    old_booking.simulator_credit_redemption = None
+                    old_booking.save(update_fields=['simulator_credit_redemption'])
+
         # Try to find a credit with enough hours
         for credit in credits:
             if credit.hours_remaining >= hours_needed:
                 # This credit has enough hours
+                ensure_credit_unlink(credit)
                 credit.consume_hours(hours_needed)
                 return credit
         
@@ -1076,6 +1087,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                 f"Insufficient credit hours. Available: {credit.hours_remaining}, Needed: {hours_needed}"
             )
         
+        ensure_credit_unlink(credit)
         credit.consume_hours(hours_needed)
         return credit
 
