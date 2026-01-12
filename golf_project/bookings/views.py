@@ -1434,8 +1434,9 @@ class BookingViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Get coach_id filter if provided
+        # Get coach_id and status filters if provided
         coach_id = request.query_params.get('coach_id')
+        status_filter = request.query_params.get('status')
         
         # Get location_id for filtering
         location_id = get_location_id_from_request(request)
@@ -1456,9 +1457,18 @@ class BookingViewSet(viewsets.ModelViewSet):
                 start_time__gte=start_datetime,
                 end_time__lte=end_datetime
             )
+            
+            # Default behavior for admin/staff: exclude cancelled unless specifically requested
+            if not status_filter:
+                bookings = bookings.exclude(status='cancelled')
+            
             if location_id:
                 # Filter strictly by location_id - only show bookings with matching location_id
                 bookings = bookings.filter(location_id=location_id)
+        
+        # Filter by status if explicitly provided
+        if status_filter:
+            bookings = bookings.filter(status=status_filter)
         
         # Filter by booking_type if provided
         if booking_type and booking_type != 'all':
