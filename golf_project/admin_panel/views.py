@@ -971,7 +971,7 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
         
         return queryset
     
-    @django_timezone.atomic
+    @transaction.atomic
     def perform_create(self, serializer):
         """Set location_id when creating closed day and handle conflicts if forced"""
         location_id = get_location_id_from_request(self.request)
