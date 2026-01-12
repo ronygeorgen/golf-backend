@@ -1169,10 +1169,10 @@ class CreateTempPurchaseView(APIView):
         if referral_id:
             try:
                 from users.models import User
-                referral_user = User.objects.get(id=referral_id, role='staff')
+                referral_user = User.objects.get(id=referral_id, role__in=['superadmin', 'admin', 'staff'])
             except User.DoesNotExist:
                 return Response(
-                    {'error': f'Referral user with ID {referral_id} not found or is not a staff member.'},
+                    {'error': f'Referral user with ID {referral_id} not found or is not an administrative member.'},
                     status=status.HTTP_400_BAD_REQUEST
                 )
         
