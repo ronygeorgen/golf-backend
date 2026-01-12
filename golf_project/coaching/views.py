@@ -78,7 +78,7 @@ class CoachingPackageViewSet(viewsets.ModelViewSet):
         queryset = CoachingPackage.objects.all().order_by('-id')
         
         # Filter by location_id (skip for superadmins)
-        is_privileged = self.request.user.role == 'superadmin' or self.request.user.is_superuser
+        is_privileged = self.request.user.is_authenticated and (getattr(self.request.user, 'role', None) == 'superadmin' or self.request.user.is_superuser)
         if location_id and not is_privileged:
             queryset = queryset.filter(
                 Q(location_id=location_id) | 
@@ -156,11 +156,11 @@ class CoachingPackageViewSet(viewsets.ModelViewSet):
         # Get filtered queryset (includes location_id filtering from get_queryset)
         queryset = self.get_queryset()
         
-        # Only return packages that have a redirect_url (for client-side)
-        active_packages = queryset.filter(
-            is_active=True,
-            redirect_url__isnull=False
-        ).exclude(redirect_url='')
+        # Only return packages that have a redirect_url (for client-side) OR are TPI assessments
+        active_packages = queryset.filter(is_active=True).filter(
+            Q(is_tpi_assessment=True) |
+            (Q(redirect_url__isnull=False) & ~Q(redirect_url=''))
+        )
         
         serializer = self.get_serializer(active_packages, many=True)
         return Response(serializer.data)
@@ -1937,7 +1937,7 @@ class SimulatorPackageViewSet(viewsets.ModelViewSet):
         queryset = SimulatorPackage.objects.all().order_by('-id')
         
         # Filter by location_id (skip for superadmins)
-        is_privileged = self.request.user.role == 'superadmin' or self.request.user.is_superuser
+        is_privileged = self.request.user.is_authenticated and (getattr(self.request.user, 'role', None) == 'superadmin' or self.request.user.is_superuser)
         if location_id and not is_privileged:
             queryset = queryset.filter(
                 Q(location_id=location_id) | 
@@ -2040,7 +2040,8 @@ class SimulatorPackageViewSet(viewsets.ModelViewSet):
         from users.utils import get_location_id_from_request
         location_id = get_location_id_from_request(request)
         packages = SimulatorPackage.objects.filter(is_active=True)
-        is_privileged = request.user.role == 'superadmin' or request.user.is_superuser
+        user = request.user
+        is_privileged = user.is_authenticated and (getattr(user, 'role', None) == 'superadmin' or user.is_superuser)
         if location_id and not is_privileged:
             packages = packages.filter(
                 Q(location_id=location_id) | 
