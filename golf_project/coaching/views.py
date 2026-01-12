@@ -77,9 +77,13 @@ class CoachingPackageViewSet(viewsets.ModelViewSet):
         location_id = get_location_id_from_request(self.request)
         queryset = CoachingPackage.objects.all().order_by('-id')
         
-        # Filter by location_id
-        if location_id:
-            queryset = queryset.filter(location_id=location_id)
+        # Filter by location_id (skip for superadmins)
+        is_privileged = self.request.user.role == 'superadmin' or self.request.user.is_superuser
+        if location_id and not is_privileged:
+            queryset = queryset.filter(
+                Q(location_id=location_id) | 
+                Q(location_id__isnull=True)
+            )
         
         # Filter by active status if provided
         is_active = self.request.query_params.get('is_active')
@@ -174,11 +178,16 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
             'client', 'package', 'original_owner'
         ).prefetch_related('package__staff_members', 'organization_members')
         
-        if user.role in ['admin', 'staff']:
+        is_privileged = user.role in ['admin', 'staff', 'superadmin'] or user.is_superuser
+        
+        if is_privileged:
             # Filter by location_id for admin/staff
-            if location_id:
-                # Filter by package location_id
-                base_qs = base_qs.filter(package__location_id=location_id)
+            if location_id and not user.is_superuser and user.role != 'superadmin':
+                # Filter by package location_id (allow global packages)
+                base_qs = base_qs.filter(
+                    Q(package__location_id=location_id) | 
+                    Q(package__location_id__isnull=True)
+                )
             return base_qs
         
         # Clients see their own purchases, gifts received, and organization packages where they are members
@@ -1927,9 +1936,13 @@ class SimulatorPackageViewSet(viewsets.ModelViewSet):
         location_id = get_location_id_from_request(self.request)
         queryset = SimulatorPackage.objects.all().order_by('-id')
         
-        # Filter by location_id
-        if location_id:
-            queryset = queryset.filter(location_id=location_id)
+        # Filter by location_id (skip for superadmins)
+        is_privileged = self.request.user.role == 'superadmin' or self.request.user.is_superuser
+        if location_id and not is_privileged:
+            queryset = queryset.filter(
+                Q(location_id=location_id) | 
+                Q(location_id__isnull=True)
+            )
         
         # Filter by active status if provided
         is_active = self.request.query_params.get('is_active')
@@ -2027,8 +2040,12 @@ class SimulatorPackageViewSet(viewsets.ModelViewSet):
         from users.utils import get_location_id_from_request
         location_id = get_location_id_from_request(request)
         packages = SimulatorPackage.objects.filter(is_active=True)
-        if location_id:
-            packages = packages.filter(location_id=location_id)
+        is_privileged = request.user.role == 'superadmin' or request.user.is_superuser
+        if location_id and not is_privileged:
+            packages = packages.filter(
+                Q(location_id=location_id) | 
+                Q(location_id__isnull=True)
+            )
         packages = packages.order_by('title')
         serializer = self.get_serializer(packages, many=True)
         return Response(serializer.data)
@@ -2054,12 +2071,17 @@ class SimulatorPackagePurchaseViewSet(viewsets.ModelViewSet):
         location_id = get_location_id_from_request(self.request)
         queryset = SimulatorPackagePurchase.objects.all()
         
+        is_privileged = user.role in ['admin', 'staff', 'superadmin'] or user.is_superuser
+        
         # Regular users can only see their own purchases
-        if user.role not in ['admin', 'staff']:
+        if not is_privileged:
             queryset = queryset.filter(client=user)
-        elif location_id:
-            # Filter by location_id for admin/staff
-            queryset = queryset.filter(package__location_id=location_id)
+        elif location_id and not user.is_superuser and user.role != 'superadmin':
+            # Filter by location_id for admin/staff (not superadmin)
+            queryset = queryset.filter(
+                Q(package__location_id=location_id) | 
+                Q(package__location_id__isnull=True)
+            )
         
         # Filter by purchase type
         purchase_type = self.request.query_params.get('purchase_type')

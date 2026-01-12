@@ -708,7 +708,8 @@ class AdminOverrideViewSet(viewsets.ViewSet):
         
         # Add sessions back
         purchase.sessions_remaining = F('sessions_remaining') + session_count
-        purchase.save(update_fields=['sessions_remaining', 'updated_at'])
+        purchase.sessions_total = F('sessions_total') + session_count
+        purchase.save(update_fields=['sessions_remaining', 'sessions_total', 'updated_at'])
         
         # Handle simulator hours
         credit_created = None
@@ -717,7 +718,8 @@ class AdminOverrideViewSet(viewsets.ViewSet):
             if purchase.package.simulator_hours and purchase.package.simulator_hours > 0:
                 # Add hours back to the same package
                 purchase.simulator_hours_remaining = F('simulator_hours_remaining') + simulator_hours
-                purchase.save(update_fields=['simulator_hours_remaining', 'updated_at'])
+                purchase.simulator_hours_total = F('simulator_hours_total') + simulator_hours
+                purchase.save(update_fields=['simulator_hours_remaining', 'simulator_hours_total', 'updated_at'])
             else:
                 # Package doesn't have simulator hours, create a credit instead
                 credit_created = SimulatorCredit.objects.create(
@@ -734,7 +736,7 @@ class AdminOverrideViewSet(viewsets.ViewSet):
             purchase.notes = updated_note[:255]
             purchase.save(update_fields=['notes'])
         
-        purchase.refresh_from_db(fields=['sessions_remaining', 'simulator_hours_remaining', 'notes', 'updated_at'])
+        purchase.refresh_from_db(fields=['sessions_remaining', 'sessions_total', 'simulator_hours_remaining', 'simulator_hours_total', 'notes', 'updated_at'])
         
         message = f'{session_count} session(s) added back to the package.'
         if simulator_hours and simulator_hours > 0:
