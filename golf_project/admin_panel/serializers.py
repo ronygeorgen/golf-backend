@@ -303,13 +303,17 @@ class ClosedDaySerializer(serializers.ModelSerializer):
                 
                 current_date += timedelta(days=1)
             
-            # If there are conflicts, raise validation error with detailed message
+            # If there are conflicts, check for force override
             if conflicts:
-                conflict_message = "Cannot create closed day due to existing conflicts:\n\n" + "\n".join(conflicts)
-                conflict_message += "\n\nPlease remove or reschedule these items before creating a closed day."
-                raise serializers.ValidationError({
-                    'start_date': conflict_message
-                })
+                force_override = self.context.get('request').data.get('force_override', False)
+                
+                if not force_override:
+                    conflict_message = "Cannot create closed day due to existing conflicts:\n\n" + "\n".join(conflicts)
+                    conflict_message += "\n\nPlease remove or reschedule these items before creating a closed day."
+                    raise serializers.ValidationError({
+                        'start_date': conflict_message,
+                        'conflicts': True  # Custom flag for frontend to detect this specific error
+                    })
         
         return attrs
 

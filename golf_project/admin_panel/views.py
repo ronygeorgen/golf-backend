@@ -5,6 +5,7 @@ from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.pagination import PageNumberPagination
+from django.db import transaction
 from django.db.models import Count, Sum, Q, F
 from django.utils import timezone as django_timezone
 from datetime import datetime, timedelta, timezone as dt_timezone
@@ -970,9 +971,102 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
         
         return queryset
     
+    @django_timezone.atomic
     def perform_create(self, serializer):
-        """Set location_id when creating closed day"""
+        """Set location_id when creating closed day and handle conflicts if forced"""
         location_id = get_location_id_from_request(self.request)
+        
+        force_override = self.request.data.get('force_override', False)
+        
+        if force_override:
+            start_date = serializer.validated_data.get('start_date')
+            end_date = serializer.validated_data.get('end_date')
+            recurrence = serializer.validated_data.get('recurrence', 'one_time')
+            
+            # 1. Cancel conflicting bookings
+            # Filter bookings in the range
+            # Note: For recurring closed days, this is complex.
+            # Assuming 'force_override' mainly targets the immediate conflicts identified by the serializer.
+            # The serializer checks for conflicts on specific dates.
+            # We will cancel bookings that fall within the DATE RANGE of this created closed day instance.
+            # (Handling future recurring conflicts for creating a recurring closed day is a much larger scope, 
+            # usually we just handle the immediate ones or matching ones).
+            # Given the request, we will focus on the range [start_date, end_date].
+            
+            # Finding bookings in range
+            bookings = Booking.objects.filter(
+                start_time__date__gte=start_date,
+                start_time__date__lte=end_date,
+                status__in=['confirmed', 'completed']
+            )
+            
+            if location_id:
+                bookings = bookings.filter(location_id=location_id)
+
+            for booking in bookings:
+                booking.status = 'cancelled'
+                booking.save(update_fields=['status', 'updated_at'])
+                
+                # Restore credits/sessions (Logic duplicated from BookingViewSet.cancel)
+                if booking.booking_type == 'coaching':
+                    if booking.package_purchase:
+                        purchase = booking.package_purchase
+                        purchase.sessions_remaining = F('sessions_remaining') + 1
+                        purchase.save(update_fields=['sessions_remaining', 'updated_at'])
+                elif booking.booking_type == 'simulator':
+                    hours_to_restore = Decimal(str(booking.duration_minutes)) / Decimal('60')
+                    
+                    if booking.package_purchase and not booking.simulator_credit_redemption and not booking.simulator_package_purchase:
+                        purchase = booking.package_purchase
+                        purchase.simulator_hours_remaining = F('simulator_hours_remaining') + hours_to_restore
+                        purchase.save(update_fields=['simulator_hours_remaining', 'updated_at'])
+                    elif booking.simulator_package_purchase:
+                        SimulatorCredit.objects.create(
+                            client=booking.client,
+                            issued_by=self.request.user,
+                            reason=SimulatorCredit.Reason.CANCELLATION,
+                            hours=hours_to_restore,
+                            hours_remaining=hours_to_restore,
+                            notes=f"Credit from force-cancelled booking {booking.id} due to Closed Day creation"
+                        )
+                    elif booking.simulator_credit_redemption:
+                        credit = booking.simulator_credit_redemption
+                        credit.hours_remaining = F('hours_remaining') + hours_to_restore
+                        credit.status = SimulatorCredit.Status.AVAILABLE
+                        credit.redeemed_at = None
+                        credit.save(update_fields=['hours_remaining', 'status', 'redeemed_at'])
+                        booking.simulator_credit_redemption = None
+                        booking.save(update_fields=['simulator_credit_redemption'])
+                    else:
+                        SimulatorCredit.objects.create(
+                            client=booking.client,
+                            issued_by=self.request.user,
+                            reason=SimulatorCredit.Reason.CANCELLATION,
+                            hours=hours_to_restore,
+                            hours_remaining=hours_to_restore,
+                            notes=f"Credit from force-cancelled booking {booking.id} due to Closed Day creation"
+                        )
+
+            # 2. Cancel/Deactivate Special Events
+            from special_events.models import SpecialEvent
+            events = SpecialEvent.objects.filter(
+                date__gte=start_date,
+                date__lte=end_date,
+                is_active=True
+            )
+            if location_id:
+                events = events.filter(location_id=location_id)
+            
+            # For Recurring closed days, maybe we need to be more aggressive, but let's stick to the range
+            events.update(is_active=False)
+            
+            # 3. Remove Staff Day Availability
+            # We delete specific day overrides that might exist
+            StaffDayAvailability.objects.filter(
+                date__gte=start_date,
+                date__lte=end_date
+            ).delete()
+
         if location_id:
             serializer.save(location_id=location_id)
         else:
