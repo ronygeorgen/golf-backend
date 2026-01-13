@@ -55,6 +55,49 @@ class SimulatorViewSet(viewsets.ModelViewSet):
                 raise ValidationError({'bay_number': [f'Bay number {bay_number} already exists']})
             serializer.save()
     
+    def update(self, request, *args, **kwargs):
+        """Override update to handle partial updates even for PUT requests"""
+        partial = kwargs.pop('partial', False)
+        # If it's a PUT request but not all fields are provided, treat it as partial
+        if request.method == 'PUT' and not partial:
+            # Check if all required fields are in the request data
+            required_fields = ['name', 'bay_number']
+            has_all_required = all(field in request.data for field in required_fields)
+            if not has_all_required:
+                partial = True
+                kwargs['partial'] = True
+        
+        # Call parent update method with partial flag
+        return super().update(request, *args, **kwargs)
+    
+    def perform_update(self, serializer):
+        """Handle partial updates - allow updating only specific fields like is_active"""
+        from users.utils import get_location_id_from_request
+        location_id = get_location_id_from_request(self.request)
+        
+        # For partial updates, only validate fields that are being updated
+        instance = self.get_object()
+        
+        # If bay_number is being updated, check for duplicates
+        if 'bay_number' in serializer.validated_data:
+            bay_number = serializer.validated_data.get('bay_number')
+            if location_id:
+                existing = Simulator.objects.filter(bay_number=bay_number, location_id=location_id).exclude(pk=instance.pk)
+                if existing.exists():
+                    from rest_framework.exceptions import ValidationError
+                    raise ValidationError({'bay_number': [f'Bay number {bay_number} already exists for this location']})
+            else:
+                existing = Simulator.objects.filter(bay_number=bay_number).exclude(pk=instance.pk)
+                if existing.exists():
+                    from rest_framework.exceptions import ValidationError
+                    raise ValidationError({'bay_number': [f'Bay number {bay_number} already exists']})
+        
+        # Save with location_id if provided
+        if location_id:
+            serializer.save(location_id=location_id)
+        else:
+            serializer.save()
+    
     @action(detail=True, methods=['post'])
     def toggle_active(self, request, pk=None):
         simulator = self.get_object()
@@ -108,35 +151,51 @@ class SimulatorViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
             
-            # Get existing availability entries for the days in request
-            requested_days = set()
-            for avail_data in availability_data:
-                day_of_week = avail_data.get('day_of_week')
-                if day_of_week is not None:
-                    requested_days.add(int(day_of_week))
+            # Get ALL existing availability entries for this simulator
+            all_existing = SimulatorAvailability.objects.filter(simulator=simulator)
             
-            # Delete availability entries for these days that are not in the request
-            if requested_days:
-                existing_for_days = SimulatorAvailability.objects.filter(
-                    simulator=simulator,
-                    day_of_week__in=requested_days
-                )
-                # Get IDs of entries to keep
-                entries_to_keep = set()
-                for avail_data in availability_data:
-                    day_of_week = avail_data.get('day_of_week')
-                    start_time_str = avail_data.get('start_time')
-                    if day_of_week is not None and start_time_str:
-                        entries_to_keep.add((int(day_of_week), start_time_str))
+            # Build sets of entries to keep (by ID and by day_of_week + start_time)
+            ids_to_keep = set()
+            entries_to_keep_by_key = set()
+            
+            for avail_data in availability_data:
+                # If entry has an ID, keep it by ID
+                entry_id = avail_data.get('id')
+                if entry_id:
+                    ids_to_keep.add(int(entry_id))
                 
-                # Delete entries not in the keep list
-                to_delete = existing_for_days.exclude(
-                    id__in=[
-                        av.id for av in existing_for_days
-                        if (av.day_of_week, str(av.start_time)[:5]) in entries_to_keep
-                    ]
+                # Also track by day_of_week + start_time for entries without IDs (new entries)
+                day_of_week = avail_data.get('day_of_week')
+                start_time_str = avail_data.get('start_time')
+                if day_of_week is not None and start_time_str:
+                    # Normalize start_time format (HH:MM)
+                    if ':' in start_time_str:
+                        start_time_normalized = start_time_str[:5] if len(start_time_str) >= 5 else start_time_str
+                        entries_to_keep_by_key.add((int(day_of_week), start_time_normalized))
+            
+            # Delete entries that are not in the keep list
+            # An entry is kept if:
+            # 1. Its ID is in ids_to_keep, OR
+            # 2. Its (day_of_week, start_time) matches an entry in entries_to_keep_by_key
+            to_delete = []
+            for existing_entry in all_existing:
+                entry_id = existing_entry.id
+                day_of_week = existing_entry.day_of_week
+                start_time_str = str(existing_entry.start_time)[:5]  # Format as HH:MM
+                entry_key = (day_of_week, start_time_str)
+                
+                # Check if this entry should be kept
+                should_keep = (
+                    entry_id in ids_to_keep or
+                    entry_key in entries_to_keep_by_key
                 )
-                deleted_count = to_delete.delete()
+                
+                if not should_keep:
+                    to_delete.append(existing_entry.id)
+            
+            # Delete entries that are not in the keep list
+            if to_delete:
+                deleted_count = SimulatorAvailability.objects.filter(id__in=to_delete).delete()
                 print(f"Deleted {deleted_count[0]} availability entries for simulator {simulator.id}")
             
             # Update or create each availability entry

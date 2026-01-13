@@ -355,7 +355,7 @@ class BookingViewSet(viewsets.ModelViewSet):
         purchase.consume_session(1)
         return purchase
     
-    def _get_total_available_simulator_hours(self, use_organization=False, user=None):
+    def _get_total_available_simulator_hours(self, use_organization=False, user=None, location_id=None):
         """
         Get total available simulator hours from all sources:
         - Simulator credits
@@ -365,20 +365,28 @@ class BookingViewSet(viewsets.ModelViewSet):
         Args:
             use_organization: If True, also include organization packages where user is a member
             user: The user to check hours for (defaults to request.user)
+            location_id: Location ID to filter by (defaults to request location_id)
             
         Returns:
             Decimal: Total available hours
         """
         from decimal import Decimal
+        from users.utils import get_location_id_from_request
         
         user = user or self.request.user
+        location_id = location_id or get_location_id_from_request(self.request)
         total = Decimal('0')
         
-        # 1. Simulator credits
-        credits = SimulatorCredit.objects.filter(
+        # 1. Simulator credits - filter by user's location_id
+        credits_qs = SimulatorCredit.objects.filter(
             client=user,
             status=SimulatorCredit.Status.AVAILABLE
-        ).aggregate(total=Sum('hours_remaining'))['total'] or Decimal('0')
+        )
+        # Filter credits by user's ghl_location_id matching the location_id
+        if location_id:
+            credits_qs = credits_qs.filter(client__ghl_location_id=location_id)
+        
+        credits = credits_qs.aggregate(total=Sum('hours_remaining'))['total'] or Decimal('0')
         total += credits
         
         # 2. Combo packages (coaching packages with simulator hours)
@@ -386,6 +394,13 @@ class BookingViewSet(viewsets.ModelViewSet):
             simulator_hours_remaining__gt=0,
             package_status='active'
         ).exclude(gift_status='pending')
+        
+        # Filter by package location_id
+        if location_id:
+            base_qs = base_qs.filter(
+                Q(package__location_id=location_id) | 
+                Q(package__location_id__isnull=True)
+            )
         
         if use_organization:
             org_purchase_ids = OrganizationPackageMember.objects.filter(
@@ -412,6 +427,13 @@ class BookingViewSet(viewsets.ModelViewSet):
             package_status='active'
         ).exclude(gift_status='pending')
         
+        # Filter by package location_id
+        if location_id:
+            sim_base_qs = sim_base_qs.filter(
+                Q(package__location_id=location_id) | 
+                Q(package__location_id__isnull=True)
+            )
+        
         if use_organization:
             # For simulator-only packages, check if user is the client
             sim_purchases = sim_base_qs.filter(client=user)
@@ -425,7 +447,7 @@ class BookingViewSet(viewsets.ModelViewSet):
         
         return total
     
-    def _consume_package_simulator_hours(self, duration_minutes, use_organization=False, booking_start_time=None, user=None):
+    def _consume_package_simulator_hours(self, duration_minutes, use_organization=False, booking_start_time=None, user=None, location_id=None):
         """
         Consume simulator hours from packages (combo or simulator-only).
         Priority: combo packages first, then non-restricted simulator packages, then restricted packages.
@@ -435,6 +457,7 @@ class BookingViewSet(viewsets.ModelViewSet):
             use_organization: If True, also check organization packages where user is a member
             booking_start_time: datetime object for the booking start time (required for checking restrictions)
             user: The user to consume hours from (defaults to request.user)
+            location_id: Location ID to filter by (defaults to request location_id)
             
         Returns:
             Purchase object (CoachingPackagePurchase or SimulatorPackagePurchase) if hours were consumed, None otherwise
@@ -447,6 +470,7 @@ class BookingViewSet(viewsets.ModelViewSet):
         from django.utils import timezone
         
         user = user or self.request.user
+        location_id = location_id or get_location_id_from_request(self.request)
         hours_needed = Decimal(str(duration_minutes)) / Decimal('60')
         
         # First, try combo packages (coaching packages with simulator hours)
@@ -454,6 +478,13 @@ class BookingViewSet(viewsets.ModelViewSet):
             simulator_hours_remaining__gt=0,
             package_status='active'
         ).exclude(gift_status='pending')
+        
+        # Filter by package location_id
+        if location_id:
+            base_qs = base_qs.filter(
+                Q(package__location_id=location_id) | 
+                Q(package__location_id__isnull=True)
+            )
         
         if use_organization:
             org_purchase_ids = OrganizationPackageMember.objects.filter(
@@ -479,6 +510,13 @@ class BookingViewSet(viewsets.ModelViewSet):
             hours_remaining__gt=0,
             package_status='active'
         ).exclude(gift_status='pending').filter(client=user)
+        
+        # Filter by package location_id
+        if location_id:
+            sim_base_qs = sim_base_qs.filter(
+                Q(package__location_id=location_id) | 
+                Q(package__location_id__isnull=True)
+            )
         
         # Check expiry date
         today = timezone.now().date()
@@ -601,6 +639,9 @@ class BookingViewSet(viewsets.ModelViewSet):
         # Determine target user
         target_user = self._determine_target_user()
         
+        # Get location_id for filtering prepaid hours
+        location_id = get_location_id_from_request(self.request)
+        
         with transaction.atomic():
             if booking_type == 'simulator':
                 start_time = booking_data.get('start_time')
@@ -638,13 +679,13 @@ class BookingViewSet(viewsets.ModelViewSet):
                         # Try credits first, then packages
                         try:
                             # Try to reserve credit for total hours needed
-                            redeemed_credit = self._reserve_simulator_credit(total_hours_needed, user=target_user)
+                            redeemed_credit = self._reserve_simulator_credit(total_hours_needed, user=target_user, location_id=location_id)
                         except serializers.ValidationError:
                             # No credits available, try package hours (combo or simulator-only)
                             # For multiple simulators, we need to consume hours for each simulator
                             # Calculate total duration in minutes for all simulators
                             total_duration_minutes = duration_minutes * simulator_count
-                            package_purchase = self._consume_package_simulator_hours(total_duration_minutes, use_organization=True, booking_start_time=start_time, user=target_user)
+                            package_purchase = self._consume_package_simulator_hours(total_duration_minutes, use_organization=True, booking_start_time=start_time, user=target_user, location_id=location_id)
                             if not package_purchase:
                                 raise serializers.ValidationError("Insufficient pre-paid hours available")
                     elif use_prepaid_hours is False:
@@ -709,12 +750,12 @@ class BookingViewSet(viewsets.ModelViewSet):
                         # Auto-detect: Try pre-paid hours first, fallback to payment
                         try:
                             # Try to reserve credit for total hours needed
-                            redeemed_credit = self._reserve_simulator_credit(total_hours_needed, user=target_user)
+                            redeemed_credit = self._reserve_simulator_credit(total_hours_needed, user=target_user, location_id=location_id)
                         except serializers.ValidationError:
                             # Calculate total duration in minutes for all simulators
                             total_duration_minutes = duration_minutes * simulator_count
                             try:
-                                package_purchase = self._consume_package_simulator_hours(total_duration_minutes, use_organization=True, booking_start_time=start_time, user=target_user)
+                                package_purchase = self._consume_package_simulator_hours(total_duration_minutes, use_organization=True, booking_start_time=start_time, user=target_user, location_id=location_id)
                             except serializers.ValidationError:
                                 # Fallback to payment if no package or credit available
                                 pass
@@ -866,8 +907,11 @@ class BookingViewSet(viewsets.ModelViewSet):
         - Combo packages (coaching packages with simulator hours)
         - Simulator-only packages
         """
+        from users.utils import get_location_id_from_request
+        
         use_organization = request.query_params.get('use_organization', 'false').lower() == 'true'
         target_user = request.user
+        location_id = get_location_id_from_request(request)
         
         # Admin/Staff/Superadmin can query for other users
         if request.user.role in ['admin', 'staff', 'superadmin']:
@@ -878,12 +922,17 @@ class BookingViewSet(viewsets.ModelViewSet):
                 except User.DoesNotExist:
                     return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
         
-        total_hours = self._get_total_available_simulator_hours(use_organization=use_organization, user=target_user)
+        total_hours = self._get_total_available_simulator_hours(
+            use_organization=use_organization, 
+            user=target_user,
+            location_id=location_id
+        )
         
         return Response({
             'total_available_hours': float(total_hours),
             'use_organization': use_organization,
-            'user_id': target_user.id
+            'user_id': target_user.id,
+            'location_id': location_id
         })
     
     @action(detail=False, methods=['get'])
@@ -1030,7 +1079,7 @@ class BookingViewSet(viewsets.ModelViewSet):
             return True
         return booking.client_id == user.id
     
-    def _reserve_simulator_credit(self, hours_needed, user=None):
+    def _reserve_simulator_credit(self, hours_needed, user=None, location_id=None):
         """
         Reserve and consume hours from available simulator credits.
         Supports aggregating multiple small credits and splitting large credits
@@ -1039,13 +1088,20 @@ class BookingViewSet(viewsets.ModelViewSet):
         from decimal import Decimal
         hours_needed = Decimal(str(hours_needed))
         user = user or self.request.user
+        location_id = location_id or get_location_id_from_request(self.request)
         
         # Find credits with available hours, ordered by oldest first
-        credits = SimulatorCredit.objects.select_for_update().filter(
+        credits_qs = SimulatorCredit.objects.select_for_update().filter(
             status=SimulatorCredit.Status.AVAILABLE,
             client=user,
             hours_remaining__gt=0
-        ).order_by('issued_at')
+        )
+        
+        # Filter credits by user's ghl_location_id matching the location_id
+        if location_id:
+            credits_qs = credits_qs.filter(client__ghl_location_id=location_id)
+        
+        credits = credits_qs.order_by('issued_at')
         
         # Calculate total available
         total_available = sum(c.hours_remaining for c in credits)
@@ -1667,7 +1723,11 @@ class BookingViewSet(viewsets.ModelViewSet):
                         continue
                     
                     slot_end = slot_start + timedelta(minutes=duration_minutes)
-                    slot_fits_duration = slot_end <= availability_end_datetime
+                    
+                    # ONLY include slots that fully fit within the availability window
+                    if slot_end > availability_end_datetime:
+                        # Since we generate slots in increasing order, we can break here for this window
+                        break
                     
                     # Check for conflicting bookings (use requested duration for conflict check)
                     conflicting_bookings = Booking.objects.filter(
@@ -1696,7 +1756,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                                 'end_time': slot_end.isoformat(),
                                 'duration_minutes': duration_minutes,
                                 'availability_end_time': availability_end_datetime.isoformat(),
-                                'fits_duration': slot_fits_duration,
+                                'fits_duration': True, # All generated slots now fit
                                 'bay_count': 1,
                             }
                             if show_bay_details:
@@ -1712,12 +1772,14 @@ class BookingViewSet(viewsets.ModelViewSet):
                                 }
                             available_slots.append(slot_payload)
                         else:
-                            # Keep the furthest availability end time and mark as fitting if any simulator fits
+                            # Update existing slot details
                             if availability_end_datetime.isoformat() > existing_slot.get('availability_end_time', ''):
                                 existing_slot['availability_end_time'] = availability_end_datetime.isoformat()
-                            if slot_fits_duration:
-                                existing_slot['fits_duration'] = True
-                            existing_slot['end_time'] = slot_end.isoformat()
+                            # fits_duration is already True if it's there
+                            existing_slot['fits_duration'] = True
+                            # We keep the end_time as max of all simulators
+                            if slot_end.isoformat() > existing_slot['end_time']:
+                                existing_slot['end_time'] = slot_end.isoformat()
                             existing_slot['bay_count'] = existing_slot.get('bay_count', 1) + 1
                             if show_bay_details:
                                 if simulator.id not in [s['id'] for s in existing_slot.get('available_simulators', [])]:
@@ -1951,7 +2013,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                         if current_time >= avail_end:
                             continue
                 
-                while current_time + timedelta(minutes=slot_interval) <= avail_end:
+                while current_time < avail_end:
                     slot_start = timezone.make_aware(current_time)
                     # Skip slots that have already passed (for today's bookings)
                     if booking_date == now.date() and slot_start < now:
@@ -1960,7 +2022,11 @@ class BookingViewSet(viewsets.ModelViewSet):
                     
                     slot_end = slot_start + timedelta(minutes=duration_minutes)
                     availability_end_datetime = timezone.make_aware(avail_end)
-                    slot_fits_duration = slot_end <= availability_end_datetime
+                    
+                    # ONLY include slots that fully fit within the availability window
+                    if slot_end > availability_end_datetime:
+                        # Since we generate slots in increasing order, we can break here for this window
+                        break
                     
                     # Check conflicts for coach
                     conflicting_bookings = Booking.objects.filter(
@@ -2019,17 +2085,21 @@ class BookingViewSet(viewsets.ModelViewSet):
                             'end_time': slot_end.isoformat(),
                             'duration_minutes': duration_minutes,
                             'availability_end_time': availability_end_datetime.isoformat(),
-                            'fits_duration': slot_fits_duration,
+                            'fits_duration': True,
                             'available_coaches': []
                         }
                         available_slots_map[slot_key] = slot_entry
                     else:
-                        # Keep the furthest availability end time and mark as fitting if any coach fits
+                        # Keep the furthest availability end time
                         if availability_end_datetime.isoformat() > slot_entry['availability_end_time']:
                             slot_entry['availability_end_time'] = availability_end_datetime.isoformat()
-                        if slot_fits_duration:
-                            slot_entry['fits_duration'] = True
-                        slot_entry['end_time'] = slot_end.isoformat()
+                        
+                        # fits_duration is already True if it's there
+                        slot_entry['fits_duration'] = True
+                        
+                        # We keep the end_time as max of all coaches
+                        if slot_end.isoformat() > slot_entry['end_time']:
+                            slot_entry['end_time'] = slot_end.isoformat()
                     
                     if coach.id not in [c['id'] for c in slot_entry['available_coaches']]:
                         slot_entry['available_coaches'].append({

@@ -77,9 +77,8 @@ class CoachingPackageViewSet(viewsets.ModelViewSet):
         location_id = get_location_id_from_request(self.request)
         queryset = CoachingPackage.objects.all().order_by('-id')
         
-        # Filter by location_id (skip for superadmins)
-        is_privileged = self.request.user.is_authenticated and (getattr(self.request.user, 'role', None) == 'superadmin' or self.request.user.is_superuser)
-        if location_id and not is_privileged:
+        # Filter by location_id (applies to all users including superadmins)
+        if location_id:
             queryset = queryset.filter(
                 Q(location_id=location_id) | 
                 Q(location_id__isnull=True)
@@ -1936,9 +1935,8 @@ class SimulatorPackageViewSet(viewsets.ModelViewSet):
         location_id = get_location_id_from_request(self.request)
         queryset = SimulatorPackage.objects.all().order_by('-id')
         
-        # Filter by location_id (skip for superadmins)
-        is_privileged = self.request.user.is_authenticated and (getattr(self.request.user, 'role', None) == 'superadmin' or self.request.user.is_superuser)
-        if location_id and not is_privileged:
+        # Filter by location_id (applies to all users including superadmins)
+        if location_id:
             queryset = queryset.filter(
                 Q(location_id=location_id) | 
                 Q(location_id__isnull=True)
@@ -2040,9 +2038,9 @@ class SimulatorPackageViewSet(viewsets.ModelViewSet):
         from users.utils import get_location_id_from_request
         location_id = get_location_id_from_request(request)
         packages = SimulatorPackage.objects.filter(is_active=True)
-        user = request.user
-        is_privileged = user.is_authenticated and (getattr(user, 'role', None) == 'superadmin' or user.is_superuser)
-        if location_id and not is_privileged:
+        
+        # Filter by location_id (applies to all users including superadmins)
+        if location_id:
             packages = packages.filter(
                 Q(location_id=location_id) | 
                 Q(location_id__isnull=True)
