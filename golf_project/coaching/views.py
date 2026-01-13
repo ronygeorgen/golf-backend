@@ -2186,6 +2186,17 @@ class GuestPackagesView(APIView):
         """Override to disable authentication for guest packages"""
         return []
     
+    def _normalize_phone(self, phone):
+        """Normalize phone number by removing common formatting characters"""
+        if not phone:
+            return ''
+        # Remove common formatting characters
+        cleaned = phone.replace('+', '').replace('-', '').replace(' ', '').replace('(', '').replace(')', '').replace('.', '').strip()
+        # If phone starts with country code '1' and has 11 digits, remove the leading '1'
+        if cleaned.startswith('1') and len(cleaned) == 11:
+            cleaned = cleaned[1:]
+        return cleaned
+    
     def get(self, request):
         phone = request.query_params.get('phone')
         
@@ -2195,23 +2206,51 @@ class GuestPackagesView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        phone = phone.strip()
+        # Normalize phone number to handle different formats
+        phone = self._normalize_phone(phone)
         
-        # Get user by phone (if exists)
+        if not phone:
+            return Response(
+                {'error': 'Invalid phone number format.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get user by phone (if exists) - try both normalized and original formats
+        user = None
+        location_id = None
         try:
             user = User.objects.get(phone=phone)
             location_id = user.ghl_location_id
         except User.DoesNotExist:
-            # User doesn't exist yet, but might have purchases
-            # Try to get location from a purchase
-            from coaching.models import CoachingPackagePurchase
-            purchase = CoachingPackagePurchase.objects.filter(
-                client__phone=phone
-            ).select_related('client').first()
-            if purchase and purchase.client:
-                location_id = purchase.client.ghl_location_id
-            else:
-                location_id = None
+            # Try to find user with different phone formats
+            # Try with leading '1' if it's a 10-digit number
+            if len(phone) == 10:
+                try:
+                    user = User.objects.get(phone=f'1{phone}')
+                    location_id = user.ghl_location_id
+                except User.DoesNotExist:
+                    pass
+            
+            # If still not found, try to get location from a purchase
+            if not user:
+                from coaching.models import CoachingPackagePurchase
+                phone_query = Q(client__phone=phone)
+                # If phone is 10 digits, also try with leading '1'
+                if len(phone) == 10:
+                    phone_query |= Q(client__phone=f'1{phone}')
+                # If phone is 11 digits starting with '1', also try without the '1'
+                elif len(phone) == 11 and phone.startswith('1'):
+                    phone_query |= Q(client__phone=phone[1:])
+                
+                purchase = CoachingPackagePurchase.objects.filter(
+                    phone_query
+                ).select_related('client').first()
+                
+                if purchase and purchase.client:
+                    user = purchase.client
+                    location_id = purchase.client.ghl_location_id
+                else:
+                    location_id = None
         
         # Get TPI assessment packages (active only)
         from coaching.models import CoachingPackage, CoachingPackagePurchase
@@ -2225,8 +2264,17 @@ class GuestPackagesView(APIView):
             tpi_packages = tpi_packages.filter(location_id=location_id)
         
         # Get purchases for this phone number with sessions remaining
+        # Try both normalized phone formats (with and without leading '1')
+        phone_query = Q(client__phone=phone)
+        # If phone is 10 digits, also try with leading '1'
+        if len(phone) == 10:
+            phone_query |= Q(client__phone=f'1{phone}')
+        # If phone is 11 digits starting with '1', also try without the '1'
+        elif len(phone) == 11 and phone.startswith('1'):
+            phone_query |= Q(client__phone=phone[1:])
+        
         purchases = CoachingPackagePurchase.objects.filter(
-            client__phone=phone,
+            phone_query,
             package__is_tpi_assessment=True,
             sessions_remaining__gt=0,
             package_status='active'
