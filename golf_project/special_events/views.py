@@ -274,6 +274,7 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
                     'title': event.title,
                     'start_time': event.start_time.strftime('%H:%M:%S'),
                     'end_time': event.end_time.strftime('%H:%M:%S'),
+                    'date': target_date.strftime('%Y-%m-%d'),
                     'is_private': event.is_private,
                 }
                 events_on_date.append(data)

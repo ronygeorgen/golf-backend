@@ -1737,15 +1737,15 @@ class BookingViewSet(viewsets.ModelViewSet):
                         status__in=['confirmed', 'completed']
                     )
                     
-                    # Check for special event conflicts
-                    has_special_event, event_title = self._check_special_event_conflict(slot_start)
+                    # Skip special event conflict check as per requirement
+                    # has_special_event, event_title = self._check_special_event_conflict(slot_start)
                     
                     # Check if facility is closed
                     from admin_panel.models import ClosedDay
                     location_id = get_location_id_from_request(request)
                     is_closed, closed_message = ClosedDay.check_if_closed(slot_start, location_id=location_id)
                     
-                    if not conflicting_bookings.exists() and not has_special_event and not is_closed:
+                    if not conflicting_bookings.exists() and not is_closed:
                         slot_start_str = slot_start.isoformat()
                         existing_slot = next((s for s in available_slots if s['start_time'] == slot_start_str), None)
                         
@@ -2036,15 +2036,15 @@ class BookingViewSet(viewsets.ModelViewSet):
                         status__in=['confirmed', 'completed']
                     )
                     
-                    # Check for special event conflicts
-                    has_special_event, event_title = self._check_special_event_conflict(slot_start)
+                    # Skip special event conflict check as per requirement
+                    # has_special_event, event_title = self._check_special_event_conflict(slot_start)
                     
                     # Check if facility is closed
                     from admin_panel.models import ClosedDay
                     location_id = get_location_id_from_request(request)
                     is_closed, closed_message = ClosedDay.check_if_closed(slot_start, location_id=location_id)
                     
-                    if conflicting_bookings.exists() or has_special_event or is_closed:
+                    if conflicting_bookings.exists() or is_closed:
                         current_time += timedelta(minutes=slot_interval)
                         continue
                     
