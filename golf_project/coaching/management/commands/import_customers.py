@@ -330,3 +330,4 @@ class Command(BaseCommand):
         except (InvalidOperation, ValueError, TypeError):
             return Decimal('0')
 
+

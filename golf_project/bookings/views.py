@@ -25,6 +25,60 @@ from coaching.models import (
 
 logger = logging.getLogger(__name__)
 
+
+def _normalize_phone_number(phone):
+    """Normalize phone number to digits only and handle leading '1'"""
+    if not phone:
+        return ''
+    # Remove all non-digit characters
+    cleaned = "".join(filter(str.isdigit, str(phone)))
+    # If it's a 11-digit number starting with '1', remove it to normalize to 10 digits
+    if len(cleaned) == 11 and cleaned.startswith('1'):
+        return cleaned[1:]
+    return cleaned
+
+
+def _get_user_by_phone(phone):
+    """Robustly find a user by phone number by trying multiple formats"""
+    if not phone:
+        return None
+    
+    from users.models import User
+    
+    # Try 1: Exact match as provided (minus leading/trailing spaces)
+    original_stripped = str(phone).strip()
+    user = User.objects.filter(phone=original_stripped).first()
+    if user:
+        return user
+        
+    # Try 2: Normalized (10 digits usually)
+    normalized = _normalize_phone_number(phone)
+    if not normalized:
+        return None
+        
+    user = User.objects.filter(phone=normalized).first()
+    if user:
+        return user
+        
+    # Try 3: With '+' prefix
+    user = User.objects.filter(phone='+' + normalized).first()
+    if user:
+        return user
+        
+    # Try 4: With '+1' prefix
+    user = User.objects.filter(phone='+1' + normalized).first()
+    if user:
+        return user
+
+    # Try 5: With '1' prefix
+    user = User.objects.filter(phone='1' + normalized).first()
+    if user:
+        return user
+        
+    return None
+
+
+
 class TenPerPagePagination(PageNumberPagination):
     page_size = 10
     page_query_param = 'page'
@@ -1856,11 +1910,10 @@ class BookingViewSet(viewsets.ModelViewSet):
         phone = request.query_params.get('phone')
         if phone and not request.user.is_authenticated:
             # Guest user - get location from user by phone
-            try:
-                from users.models import User
-                guest_user = User.objects.get(phone=phone)
+            guest_user = _get_user_by_phone(phone)
+            if guest_user:
                 location_id = guest_user.ghl_location_id
-            except User.DoesNotExist:
+            else:
                 # Try to get location from request param
                 location_id = request.query_params.get('location_id') or get_location_id_from_request(request)
         else:
@@ -2463,11 +2516,9 @@ class GuestBookingCreateView(APIView):
         
         phone = phone.strip()
         
-        # Get user by phone
-        try:
-            from users.models import User
-            user = User.objects.get(phone=phone)
-        except User.DoesNotExist:
+        # Get user by phone using robust lookup
+        user = _get_user_by_phone(phone)
+        if not user:
             return Response(
                 {'error': 'User not found. Please ensure you have completed registration.'},
                 status=status.HTTP_404_NOT_FOUND
