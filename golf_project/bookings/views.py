@@ -996,6 +996,66 @@ class BookingViewSet(viewsets.ModelViewSet):
                     raise serializers.ValidationError("A coaching package is required for coaching bookings.")
                 
                 location_id = get_location_id_from_request(self.request)
+                start_time = booking_data.get('start_time')
+                end_time = booking_data.get('end_time')
+                
+                # Find available bay (Coaching Bay first, then Simulator Bay)
+                # 1. Get Coaching Bays
+                coaching_bay_qs = Simulator.objects.filter(is_coaching_bay=True, is_active=True)
+                if location_id:
+                    coaching_bay_qs = coaching_bay_qs.filter(location_id=location_id)
+                coaching_bays = list(coaching_bay_qs)
+
+                assigned_simulator = None
+                
+                # Check coaching bays
+                for bay in coaching_bays:
+                    bay_has_booking = Booking.objects.filter(
+                        simulator=bay,
+                        start_time__lt=end_time,
+                        end_time__gt=start_time,
+                        status__in=['confirmed', 'completed']
+                    ).exists()
+                    
+                    bay_has_temp = TempBooking.objects.filter(
+                        simulator=bay,
+                        start_time__lt=end_time,
+                        end_time__gt=start_time,
+                        status='reserved',
+                        expires_at__gt=timezone.now()
+                    ).exists()
+                    
+                    if not bay_has_booking and not bay_has_temp:
+                         assigned_simulator = bay
+                         break
+                
+                if not assigned_simulator:
+                    # Fallback to Simulator Bays
+                    simulator_bays_qs = Simulator.objects.filter(is_active=True, is_coaching_bay=False)
+                    if location_id:
+                        simulator_bays_qs = simulator_bays_qs.filter(location_id=location_id)
+                    
+                    # Exclusion logic
+                    conflicting_sims = Booking.objects.filter(
+                        simulator__in=simulator_bays_qs,
+                        start_time__lt=end_time,
+                        end_time__gt=start_time,
+                        status__in=['confirmed', 'completed']
+                    ).values_list('simulator_id', flat=True)
+                    
+                    conflicting_temps = TempBooking.objects.filter(
+                        simulator__in=simulator_bays_qs,
+                        start_time__lt=end_time,
+                        end_time__gt=start_time,
+                        status='reserved',
+                        expires_at__gt=timezone.now()
+                    ).values_list('simulator_id', flat=True)
+                    
+                    assigned_simulator = simulator_bays_qs.exclude(id__in=conflicting_sims).exclude(id__in=conflicting_temps).first()
+                
+                if not assigned_simulator:
+                    raise serializers.ValidationError("No bay available for this coaching session (Coaching bays and Simulators are full).")
+
                 purchase = self._consume_package_session(package, use_organization=use_organization_package, user=target_user)
                 # Check if package is TPI assessment
                 is_tpi_assessment = package.is_tpi_assessment if hasattr(package, 'is_tpi_assessment') else False
@@ -1004,7 +1064,8 @@ class BookingViewSet(viewsets.ModelViewSet):
                     location_id=location_id,
                     package_purchase=purchase,
                     total_price=booking_data.get('total_price', 0),
-                    is_tpi_assessment=is_tpi_assessment
+                    is_tpi_assessment=is_tpi_assessment,
+                    simulator=assigned_simulator
                 )
                 # Ensure location_id is saved (in case serializer didn't include it)
                 if location_id and not booking_instance.location_id:
@@ -2000,12 +2061,15 @@ class BookingViewSet(viewsets.ModelViewSet):
         else:
             location_id = get_location_id_from_request(request)
         
-        # Get coaching bay (bay 6) - filter by location if provided
+        # Get ALL coaching bays - filter by location if provided
         coaching_bay_qs = Simulator.objects.filter(is_coaching_bay=True, is_active=True)
         if location_id:
             coaching_bay_qs = coaching_bay_qs.filter(location_id=location_id)
-        coaching_bay = coaching_bay_qs.first()
-        if not coaching_bay:
+        
+        # Store all coaching bays (not just first)
+        coaching_bays = list(coaching_bay_qs)
+        
+        if not coaching_bays:
             return Response({
                 'available_slots': [],
                 'message': 'Coaching bay not available'
@@ -2183,32 +2247,77 @@ class BookingViewSet(viewsets.ModelViewSet):
                         continue
                     
                     # Check conflicts for coaching bay
-                    bay_conflicts = Booking.objects.filter(
-                        simulator=coaching_bay,
-                        start_time__lt=slot_end,
-                        end_time__gt=slot_start,
-                        status__in=['confirmed', 'completed']
-                    )
+                    # Logic: 
+                    # 1. Check if ANY coaching bay is available
+                    # 2. If NO coaching bay available, check if ANY simulator bay is available (fallback)
+                    # 3. If neither, slot is unavailable
                     
-                    assigned_bay_number = coaching_bay.bay_number
-                    if bay_conflicts.exists():
-                        # Try any other available non-coaching bay
-                        other_bay = Simulator.objects.filter(
+                    available_coaching_bay = None
+                    assigned_bay_number = None
+                    
+                    # 1. Check all coaching bays
+                    for bay in coaching_bays:
+                        # Check booking conflicts
+                        bay_has_booking = Booking.objects.filter(
+                            simulator=bay,
+                            start_time__lt=slot_end,
+                            end_time__gt=slot_start,
+                            status__in=['confirmed', 'completed']
+                        ).exists()
+                        
+                        # Check temp booking conflicts
+                        bay_has_temp = TempBooking.objects.filter(
+                            simulator=bay,
+                            start_time__lt=slot_end,
+                            end_time__gt=slot_start,
+                            status='reserved',
+                            expires_at__gt=timezone.now()
+                        ).exists()
+                        
+                        if not bay_has_booking and not bay_has_temp:
+                            available_coaching_bay = bay
+                            break
+                    
+                    if available_coaching_bay:
+                        assigned_bay_number = available_coaching_bay.bay_number
+                    else:
+                        # 2. No coaching bay available, try simulator bays (fallback)
+                        simulator_bays_qs = Simulator.objects.filter(
                             is_active=True,
                             is_coaching_bay=False
+                        )
+                        if location_id:
+                            simulator_bays_qs = simulator_bays_qs.filter(location_id=location_id)
+                            
+                        # Find first available simulator bay
+                        # Exclude those with conflicts
+                        conflicting_sim_ids = Booking.objects.filter(
+                            simulator__in=simulator_bays_qs,
+                            start_time__lt=slot_end,
+                            end_time__gt=slot_start,
+                            status__in=['confirmed', 'completed']
+                        ).values_list('simulator_id', flat=True)
+                        
+                        conflicting_temp_ids = TempBooking.objects.filter(
+                            simulator__in=simulator_bays_qs,
+                            start_time__lt=slot_end,
+                            end_time__gt=slot_start,
+                            status='reserved',
+                            expires_at__gt=timezone.now()
+                        ).values_list('simulator_id', flat=True)
+                        
+                        available_simulator_bay = simulator_bays_qs.exclude(
+                            id__in=conflicting_sim_ids
                         ).exclude(
-                            id__in=Booking.objects.filter(
-                                start_time__lt=slot_end,
-                                end_time__gt=slot_start,
-                                status__in=['confirmed', 'completed']
-                            ).values_list('simulator_id', flat=True)
+                            id__in=conflicting_temp_ids
                         ).first()
                         
-                        if not other_bay:
+                        if available_simulator_bay:
+                            assigned_bay_number = available_simulator_bay.bay_number
+                        else:
+                            # 3. Neither available
                             current_time += timedelta(minutes=slot_interval)
                             continue
-                        
-                        assigned_bay_number = other_bay.bay_number
                     
                     slot_key = slot_start.isoformat()
                     slot_entry = available_slots_map.get(slot_key)
