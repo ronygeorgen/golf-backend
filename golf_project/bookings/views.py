@@ -246,7 +246,64 @@ class BookingViewSet(viewsets.ModelViewSet):
             # Re-raise other exceptions
             raise
     
+    def _check_simulator_availability_atomic(self, simulator, start_time, end_time, use_locking=True):
+        """
+        Atomically check if a simulator is available for a given time slot.
+        
+        This method prevents race conditions by:
+        1. Using select_for_update() to lock relevant rows
+        2. Checking both confirmed Bookings AND active TempBookings
+        3. Being called within a transaction
+        
+        Args:
+            simulator: Simulator object to check
+            start_time: Start datetime
+            end_time: End datetime
+            use_locking: If True, use select_for_update() for row-level locking
+            
+        Returns:
+            bool: True if available, False if conflicting booking exists
+        """
+        # Check confirmed/completed bookings
+        booking_query = Booking.objects.filter(
+            simulator=simulator,
+            start_time__lt=end_time,
+            end_time__gt=start_time,
+            status__in=['confirmed', 'completed'],
+            booking_type='simulator'
+        )
+        
+        if use_locking:
+            # Lock the rows to prevent concurrent modifications
+            booking_query = booking_query.select_for_update()
+        
+        if booking_query.exists():
+            return False
+        
+        # Check active temp bookings (reserved and not expired)
+        # These represent pending payments that are holding slots
+        temp_booking_query = TempBooking.objects.filter(
+            simulator=simulator,
+            start_time__lt=end_time,
+            end_time__gt=start_time,
+            status='reserved',  # Only reserved temp bookings block slots
+            expires_at__gt=timezone.now()  # Not expired
+        )
+        
+        if use_locking:
+            temp_booking_query = temp_booking_query.select_for_update()
+        
+        if temp_booking_query.exists():
+            logger.info(
+                f"Simulator {simulator.bay_number} blocked by active temp booking "
+                f"for time slot {start_time} - {end_time}"
+            )
+            return False
+        
+        return True
+    
     def _find_optimal_simulator(self, start_time, end_time):
+
         """Assign the best simulator by filling gaps and balancing usage."""
         location_id = get_location_id_from_request(self.request)
         active_simulators = Simulator.objects.filter(
@@ -259,16 +316,10 @@ class BookingViewSet(viewsets.ModelViewSet):
         
         best_choice = None
         for simulator in active_simulators:
-            conflict_exists = Booking.objects.filter(
-                simulator=simulator,
-                start_time__lt=end_time,
-                end_time__gt=start_time,
-                status__in=['confirmed', 'completed'],
-                booking_type='simulator'
-            ).exists()
-            
-            if conflict_exists:
+            # Use atomic availability check (with locking if in transaction)
+            if not self._check_simulator_availability_atomic(simulator, start_time, end_time, use_locking=False):
                 continue
+
             
             previous_booking = Booking.objects.filter(
                 simulator=simulator,
@@ -319,16 +370,9 @@ class BookingViewSet(viewsets.ModelViewSet):
         for simulator in active_simulators:
             if len(available_simulators) >= count:
                 break
-                
-            conflict_exists = Booking.objects.filter(
-                simulator=simulator,
-                start_time__lt=end_time,
-                end_time__gt=start_time,
-                status__in=['confirmed', 'completed'],
-                booking_type='simulator'
-            ).exists()
             
-            if not conflict_exists:
+            # Use atomic availability check (with locking if in transaction)
+            if self._check_simulator_availability_atomic(simulator, start_time, end_time, use_locking=False):
                 available_simulators.append(simulator)
         
         return available_simulators if len(available_simulators) >= count else []
@@ -706,6 +750,21 @@ class BookingViewSet(viewsets.ModelViewSet):
                     if simulator_count > 1:
                         available_simulators = self._find_multiple_available_simulators(start_time, end_time, simulator_count)
                         if len(available_simulators) < simulator_count:
+                            # Check if blocked by temp booking
+                            temp_check = TempBooking.objects.filter(
+                                start_time__lt=end_time,
+                                end_time__gt=start_time,
+                                status='reserved',
+                                expires_at__gt=timezone.now()
+                            )
+                            if location_id:
+                                temp_check = temp_check.filter(location_id=location_id)
+                            
+                            if temp_check.exists():
+                                raise serializers.ValidationError(
+                                    f"Only {len(available_simulators)} simulator(s) available. Some slots are currently under booking process by other users. Please wait for 9 minutes then recheck."
+                                )
+
                             raise serializers.ValidationError(
                                 f"Only {len(available_simulators)} simulator(s) available for this time slot. Requested: {simulator_count}"
                             )
@@ -713,6 +772,19 @@ class BookingViewSet(viewsets.ModelViewSet):
                         # Single simulator booking
                         assigned_simulator = booking_data.get('simulator') or self._find_optimal_simulator(start_time, end_time)
                         if not assigned_simulator:
+                            # Check if blocked by temp booking to give better error message
+                            temp_check = TempBooking.objects.filter(
+                                start_time__lt=end_time,
+                                end_time__gt=start_time,
+                                status='reserved',
+                                expires_at__gt=timezone.now()
+                            )
+                            if location_id:
+                                temp_check = temp_check.filter(location_id=location_id)
+                                
+                            if temp_check.exists():
+                                raise serializers.ValidationError("This slot is currently under booking process by another user. Please wait for 9 minutes then recheck.")
+                                
                             raise serializers.ValidationError("No simulators available for this time slot")
                         available_simulators = [assigned_simulator]
                     
@@ -1790,6 +1862,15 @@ class BookingViewSet(viewsets.ModelViewSet):
                         end_time__gt=slot_start,
                         status__in=['confirmed', 'completed']
                     )
+
+                    # Check for conflicting temp bookings
+                    conflicting_temp_bookings = TempBooking.objects.filter(
+                        simulator=simulator,
+                        start_time__lt=slot_end,
+                        end_time__gt=slot_start,
+                        status='reserved',
+                        expires_at__gt=timezone.now()
+                    )
                     
                     # Skip special event conflict check as per requirement
                     # has_special_event, event_title = self._check_special_event_conflict(slot_start)
@@ -1799,7 +1880,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                     location_id = get_location_id_from_request(request)
                     is_closed, closed_message = ClosedDay.check_if_closed(slot_start, location_id=location_id)
                     
-                    if not conflicting_bookings.exists() and not is_closed:
+                    if not conflicting_bookings.exists() and not conflicting_temp_bookings.exists() and not is_closed:
                         slot_start_str = slot_start.isoformat()
                         existing_slot = next((s for s in available_slots if s['start_time'] == slot_start_str), None)
                         
@@ -2293,6 +2374,204 @@ class BookingWebhookView(APIView):
     """
     permission_classes = [AllowAny]  # Webhook should be accessible without authentication
     
+    # @transaction.atomic
+    # def post(self, request):
+    #     import uuid
+        
+    #     # New parameter name: recipient_phone contains the temp_id
+    #     temp_id_str = request.data.get('recipient_phone')
+        
+    #     # Fallback to temp_id for backward compatibility
+    #     if not temp_id_str:
+    #         temp_id_str = request.data.get('temp_id')
+        
+    #     if not temp_id_str:
+    #         return Response(
+    #             {'error': 'recipient_phone (temp_id) is required.'},
+    #             status=status.HTTP_400_BAD_REQUEST
+    #         )
+        
+    #     # Parse and validate temp_id
+    #     try:
+    #         temp_id = uuid.UUID(temp_id_str)
+    #     except (ValueError, TypeError):
+    #         return Response(
+    #             {'error': 'Invalid recipient_phone (temp_id) format. Must be a valid UUID.'},
+    #             status=status.HTTP_400_BAD_REQUEST
+    #         )
+        
+    #     # Get count parameter (duration in hours) - optional for backward compatibility
+    #     count = request.data.get('count')
+    #     if count:
+    #         try:
+    #             count = int(count)
+    #             logger.info(f"Booking webhook called with count: {count} hours")
+    #         except (ValueError, TypeError):
+    #             logger.warning(f"Invalid count parameter: {count}, ignoring")
+    #             count = None
+        
+    #     # Log webhook attempt
+    #     logger.info(f"Booking webhook called for temp_id: {temp_id_str}, phone: {request.data.get('phone')}, count: {count}")
+        
+    #     # Get temp booking
+    #     try:
+    #         temp_booking = TempBooking.objects.get(temp_id=temp_id)
+    #         logger.info(f"Temp booking found: temp_id={temp_id}, buyer={temp_booking.buyer_phone}, created_at={temp_booking.created_at}, expired={temp_booking.is_expired}")
+    #     except TempBooking.DoesNotExist:
+    #         # Log additional debugging info
+    #         recent_temp_bookings = TempBooking.objects.order_by('-created_at')[:5]
+    #         logger.error(
+    #             f"Temp booking not found: temp_id={temp_id_str}. "
+    #             f"Recent temp bookings (last 5): {[(str(tb.temp_id), tb.buyer_phone, tb.created_at) for tb in recent_temp_bookings]}"
+    #         )
+            
+    #         # Check if there are any temp bookings at all
+    #         total_count = TempBooking.objects.count()
+    #         logger.error(f"Total temp bookings in database: {total_count}")
+            
+    #         # Check if phone matches any recent temp bookings
+    #         phone_from_request = request.data.get('phone')
+    #         if phone_from_request:
+    #             temp_by_phone = TempBooking.objects.filter(buyer_phone=phone_from_request).order_by('-created_at').first()
+    #             if temp_by_phone:
+    #                 logger.warning(f"Found temp booking for phone {phone_from_request}: temp_id={temp_by_phone.temp_id}, created_at={temp_by_phone.created_at}")
+            
+    #         return Response(
+    #             {
+    #                 'error': f'Temporary booking with recipient_phone (temp_id) {temp_id_str} not found.',
+    #                 'debug_info': {
+    #                     'temp_id_received': temp_id_str,
+    #                     'phone_received': phone_from_request,
+    #                     'total_temp_bookings': total_count,
+    #                     'recent_temp_bookings': [
+    #                         {
+    #                             'temp_id': str(tb.temp_id),
+    #                             'buyer_phone': tb.buyer_phone,
+    #                             'created_at': tb.created_at.isoformat() if tb.created_at else None,
+    #                             'expired': tb.is_expired
+    #                         }
+    #                         for tb in recent_temp_bookings
+    #                     ]
+    #                 }
+    #             },
+    #             status=status.HTTP_404_NOT_FOUND
+    #         )
+        
+    #     # Check if temp booking is expired
+    #     if temp_booking.is_expired:
+    #         return Response(
+    #             {'error': 'Temporary booking has expired.'},
+    #             status=status.HTTP_400_BAD_REQUEST
+    #         )
+        
+    #     # Get buyer user
+    #     try:
+    #         buyer = User.objects.get(phone=temp_booking.buyer_phone)
+    #     except User.DoesNotExist:
+    #         return Response(
+    #             {'error': f'Buyer with phone number {temp_booking.buyer_phone} not found.'},
+    #             status=status.HTTP_404_NOT_FOUND
+    #         )
+        
+    #     # Get simulator_count from temp_booking (default to 1 for backward compatibility)
+    #     simulator_count = getattr(temp_booking, 'simulator_count', 1)
+        
+    #     # Validate count if provided (should match duration_minutes * simulator_count / 60)
+    #     if count is not None:
+    #         expected_count = (temp_booking.duration_minutes * simulator_count) / 60
+    #         if abs(count - expected_count) > 0.01:  # Allow small floating point differences
+    #             logger.warning(
+    #                 f"Count mismatch: received count={count}, expected count={expected_count} "
+    #                 f"(duration_minutes={temp_booking.duration_minutes}, simulator_count={simulator_count}). Using values from temp_booking."
+    #             )
+        
+    #     # Create bookings for each simulator
+    #     try:
+    #         created_bookings = []
+            
+    #         # Get location_id from temp booking, with fallback to user's location_id or simulator's location_id
+    #         location_id = temp_booking.location_id
+    #         if not location_id:
+    #             # Fallback: try to get from buyer's ghl_location_id
+    #             location_id = getattr(buyer, 'ghl_location_id', None)
+    #             if not location_id:
+    #                 # Final fallback: get from simulator
+    #                 location_id = getattr(temp_booking.simulator, 'location_id', None)
+            
+    #         # Find available simulators for this time slot
+    #         # Use the same logic as in BookingViewSet
+    #         active_simulators = Simulator.objects.filter(
+    #             is_active=True,
+    #             is_coaching_bay=False
+    #         )
+    #         if location_id:
+    #             active_simulators = active_simulators.filter(location_id=location_id)
+    #         active_simulators = active_simulators.order_by('bay_number')
+            
+    #         available_simulators = []
+    #         for simulator in active_simulators:
+    #             if len(available_simulators) >= simulator_count:
+    #                 break
+                    
+    #             conflict_exists = Booking.objects.filter(
+    #                 simulator=simulator,
+    #                 start_time__lt=temp_booking.end_time,
+    #                 end_time__gt=temp_booking.start_time,
+    #                 status__in=['confirmed', 'completed'],
+    #                 booking_type='simulator'
+    #             ).exists()
+                
+    #             if not conflict_exists:
+    #                 available_simulators.append(simulator)
+            
+    #         if len(available_simulators) < simulator_count:
+    #             logger.error(
+    #                 f"Only {len(available_simulators)} simulator(s) available for webhook booking. "
+    #                 f"Requested: {simulator_count}. Temp booking: {temp_booking.temp_id}"
+    #             )
+    #             return Response(
+    #                 {'error': f'Only {len(available_simulators)} simulator(s) available for this time slot.'},
+    #                 status=status.HTTP_400_BAD_REQUEST
+    #             )
+            
+    #         # Create a booking for each simulator
+    #         single_simulator_price = temp_booking.total_price / simulator_count
+    #         for simulator in available_simulators:
+    #             booking = Booking.objects.create(
+    #                 client=buyer,
+    #                 location_id=location_id,
+    #                 booking_type='simulator',
+    #                 simulator=simulator,
+    #                 start_time=temp_booking.start_time,
+    #                 end_time=temp_booking.end_time,
+    #                 duration_minutes=temp_booking.duration_minutes,
+    #                 total_price=single_simulator_price,
+    #                 status='confirmed'
+    #             )
+    #             created_bookings.append(booking)
+            
+    #         logger.info(
+    #             f"Simulator booking(s) created via webhook: User {buyer.phone}, "
+    #             f"Booking IDs: {[b.id for b in created_bookings]}, "
+    #             f"Simulator count: {simulator_count}, "
+    #             f"Duration per simulator: {temp_booking.duration_minutes} minutes "
+    #             f"({temp_booking.duration_minutes / 60} hours), Count received: {count}"
+    #         )
+            
+    #         # Return all created bookings
+    #         booking_serializer = BookingSerializer(created_bookings, many=True)
+    #         return Response({
+    #             'message': f'Simulator booking(s) created successfully ({simulator_count} booking(s)).',
+    #             'booking_ids': [b.id for b in created_bookings],
+    #             'bookings': booking_serializer.data
+    #         }, status=status.HTTP_201_CREATED)
+            
+    #     except Exception as e:
+    #         logger.error(f"Error creating booking via webhook: {e}")
+    #         return Response(
+    #             {'error': f'Failed to create booking: {str(e)}'},
+    #             status=status.HTTP_500_INTERNAL_SERVER_ERROR
+    #         )
     @transaction.atomic
     def post(self, request):
         import uuid
@@ -2332,10 +2611,10 @@ class BookingWebhookView(APIView):
         # Log webhook attempt
         logger.info(f"Booking webhook called for temp_id: {temp_id_str}, phone: {request.data.get('phone')}, count: {count}")
         
-        # Get temp booking
+        # Get temp booking (without locking first, for initial checks)
         try:
             temp_booking = TempBooking.objects.get(temp_id=temp_id)
-            logger.info(f"Temp booking found: temp_id={temp_id}, buyer={temp_booking.buyer_phone}, created_at={temp_booking.created_at}, expired={temp_booking.is_expired}")
+            logger.info(f"Temp booking found: temp_id={temp_id}, buyer={temp_booking.buyer_phone}, created_at={temp_booking.created_at}, status={temp_booking.status}, expired={temp_booking.is_expired}")
         except TempBooking.DoesNotExist:
             # Log additional debugging info
             recent_temp_bookings = TempBooking.objects.order_by('-created_at')[:5]
@@ -2367,7 +2646,8 @@ class BookingWebhookView(APIView):
                                 'temp_id': str(tb.temp_id),
                                 'buyer_phone': tb.buyer_phone,
                                 'created_at': tb.created_at.isoformat() if tb.created_at else None,
-                                'expired': tb.is_expired
+                                'expired': tb.is_expired,
+                                'status': tb.status
                             }
                             for tb in recent_temp_bookings
                         ]
@@ -2376,12 +2656,103 @@ class BookingWebhookView(APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
         
+        # IDEMPOTENCY CHECK #1: Check if already completed (before locking)
+        if temp_booking.status == 'completed':
+            logger.warning(
+                f"Webhook called for already completed temp booking: {temp_id_str}. "
+                f"Processed at: {temp_booking.processed_at}"
+            )
+            # Return success with existing booking IDs if available
+            existing_bookings = Booking.objects.filter(
+                client__phone=temp_booking.buyer_phone,
+                start_time=temp_booking.start_time,
+                end_time=temp_booking.end_time,
+                booking_type='simulator'
+            ).order_by('-created_at')[:getattr(temp_booking, 'simulator_count', 1)]
+            
+            if existing_bookings.exists():
+                booking_serializer = BookingSerializer(existing_bookings, many=True)
+                return Response({
+                    'message': f'Booking already processed (idempotency check).',
+                    'booking_ids': [b.id for b in existing_bookings],
+                    'bookings': booking_serializer.data,
+                    'idempotent': True
+                }, status=status.HTTP_200_OK)
+            else:
+                return Response({
+                    'message': 'Booking already processed but bookings not found.',
+                    'idempotent': True
+                }, status=status.HTTP_200_OK)
+        
         # Check if temp booking is expired
         if temp_booking.is_expired:
+            # Mark as expired
+            temp_booking.status = 'expired'
+            temp_booking.save(update_fields=['status'])
             return Response(
                 {'error': 'Temporary booking has expired.'},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        
+        # IDEMPOTENCY CHECK #2: Check payment_id
+        payment_id = request.data.get('payment_id') or request.data.get('transaction_id')
+        if payment_id:
+            # Check if this payment_id has already been processed
+            existing_temp = TempBooking.objects.filter(
+                payment_id=payment_id,
+                status='completed'
+            ).exclude(temp_id=temp_id).first()
+            
+            if existing_temp:
+                logger.warning(
+                    f"Duplicate webhook call detected for payment_id: {payment_id}. "
+                    f"Original temp_id: {existing_temp.temp_id}, Current temp_id: {temp_id_str}"
+                )
+                # Return the existing bookings
+                existing_bookings = Booking.objects.filter(
+                    client__phone=existing_temp.buyer_phone,
+                    start_time=existing_temp.start_time,
+                    end_time=existing_temp.end_time,
+                    booking_type='simulator'
+                ).order_by('-created_at')[:getattr(existing_temp, 'simulator_count', 1)]
+                
+                if existing_bookings.exists():
+                    booking_serializer = BookingSerializer(existing_bookings, many=True)
+                    return Response({
+                        'message': f'Payment already processed (idempotency check).',
+                        'booking_ids': [b.id for b in existing_bookings],
+                        'bookings': booking_serializer.data,
+                        'idempotent': True,
+                        'original_temp_id': str(existing_temp.temp_id)
+                    }, status=status.HTTP_200_OK)
+        
+        # LOCK THE TEMP_BOOKING ROW to prevent concurrent processing
+        temp_booking = TempBooking.objects.select_for_update().get(temp_id=temp_id)
+        
+        # IDEMPOTENCY CHECK #3: Double-check status after locking
+        # (another concurrent request might have processed it while we were waiting for the lock)
+        if temp_booking.status == 'completed':
+            logger.warning(f"Temp booking {temp_id_str} was completed by another request while waiting for lock")
+            existing_bookings = Booking.objects.filter(
+                client__phone=temp_booking.buyer_phone,
+                start_time=temp_booking.start_time,
+                end_time=temp_booking.end_time,
+                booking_type='simulator'
+            ).order_by('-created_at')[:getattr(temp_booking, 'simulator_count', 1)]
+            
+            if existing_bookings.exists():
+                booking_serializer = BookingSerializer(existing_bookings, many=True)
+                return Response({
+                    'message': f'Booking already processed by concurrent request.',
+                    'booking_ids': [b.id for b in existing_bookings],
+                    'bookings': booking_serializer.data,
+                    'idempotent': True
+                }, status=status.HTTP_200_OK)
+        
+        # Update payment_id if provided (for future idempotency checks)
+        if payment_id and not temp_booking.payment_id:
+            temp_booking.payment_id = payment_id
+            temp_booking.save(update_fields=['payment_id'])
         
         # Get buyer user
         try:
@@ -2395,10 +2766,10 @@ class BookingWebhookView(APIView):
         # Get simulator_count from temp_booking (default to 1 for backward compatibility)
         simulator_count = getattr(temp_booking, 'simulator_count', 1)
         
-        # Validate count if provided (should match duration_minutes * simulator_count / 60)
+        # Validate count if provided
         if count is not None:
             expected_count = (temp_booking.duration_minutes * simulator_count) / 60
-            if abs(count - expected_count) > 0.01:  # Allow small floating point differences
+            if abs(count - expected_count) > 0.01:
                 logger.warning(
                     f"Count mismatch: received count={count}, expected count={expected_count} "
                     f"(duration_minutes={temp_booking.duration_minutes}, simulator_count={simulator_count}). Using values from temp_booking."
@@ -2408,31 +2779,33 @@ class BookingWebhookView(APIView):
         try:
             created_bookings = []
             
-            # Get location_id from temp booking, with fallback to user's location_id or simulator's location_id
+            # Get location_id from temp booking, with fallback
             location_id = temp_booking.location_id
             if not location_id:
-                # Fallback: try to get from buyer's ghl_location_id
                 location_id = getattr(buyer, 'ghl_location_id', None)
                 if not location_id:
-                    # Final fallback: get from simulator
                     location_id = getattr(temp_booking.simulator, 'location_id', None)
             
-            # Find available simulators for this time slot
-            # Use the same logic as in BookingViewSet
+            # ATOMIC AVAILABILITY CHECK WITH LOCKING
+            # Find available simulators using row-level locking
             active_simulators = Simulator.objects.filter(
                 is_active=True,
                 is_coaching_bay=False
             )
             if location_id:
                 active_simulators = active_simulators.filter(location_id=location_id)
-            active_simulators = active_simulators.order_by('bay_number')
+            
+            # Lock simulator rows to prevent concurrent bookings
+            active_simulators = active_simulators.select_for_update().order_by('bay_number')
             
             available_simulators = []
             for simulator in active_simulators:
                 if len(available_simulators) >= simulator_count:
                     break
-                    
-                conflict_exists = Booking.objects.filter(
+                
+                # Use atomic availability check with locking
+                # Check both Bookings and active TempBookings
+                booking_conflict = Booking.objects.select_for_update().filter(
                     simulator=simulator,
                     start_time__lt=temp_booking.end_time,
                     end_time__gt=temp_booking.start_time,
@@ -2440,17 +2813,44 @@ class BookingWebhookView(APIView):
                     booking_type='simulator'
                 ).exists()
                 
-                if not conflict_exists:
-                    available_simulators.append(simulator)
+                if booking_conflict:
+                    continue
+                
+                # Check for conflicting temp bookings (excluding this one)
+                temp_conflict = TempBooking.objects.select_for_update().filter(
+                    simulator=simulator,
+                    start_time__lt=temp_booking.end_time,
+                    end_time__gt=temp_booking.start_time,
+                    status='reserved',
+                    expires_at__gt=timezone.now()
+                ).exclude(temp_id=temp_id).exists()
+                
+                if temp_conflict:
+                    logger.warning(
+                        f"Simulator {simulator.bay_number} blocked by another active temp booking "
+                        f"for time slot {temp_booking.start_time} - {temp_booking.end_time}"
+                    )
+                    continue
+                
+                available_simulators.append(simulator)
             
+            # Check if we have enough simulators
             if len(available_simulators) < simulator_count:
                 logger.error(
                     f"Only {len(available_simulators)} simulator(s) available for webhook booking. "
-                    f"Requested: {simulator_count}. Temp booking: {temp_booking.temp_id}"
+                    f"Requested: {simulator_count}. Temp booking: {temp_booking.temp_id}. "
+                    f"This indicates a race condition or expired reservation."
                 )
+                # Mark temp_booking as expired/cancelled
+                temp_booking.status = 'cancelled'
+                temp_booking.save(update_fields=['status'])
+                
                 return Response(
-                    {'error': f'Only {len(available_simulators)} simulator(s) available for this time slot.'},
-                    status=status.HTTP_400_BAD_REQUEST
+                    {
+                        'error': f'Only {len(available_simulators)} simulator(s) available for this time slot. '
+                                f'The reservation may have expired or been taken by another booking.'
+                    },
+                    status=status.HTTP_409_CONFLICT  # 409 Conflict is appropriate for race conditions
                 )
             
             # Create a booking for each simulator
@@ -2469,12 +2869,18 @@ class BookingWebhookView(APIView):
                 )
                 created_bookings.append(booking)
             
+            # MARK TEMP_BOOKING AS COMPLETED
+            temp_booking.status = 'completed'
+            temp_booking.processed_at = timezone.now()
+            temp_booking.save(update_fields=['status', 'processed_at'])
+            
             logger.info(
                 f"Simulator booking(s) created via webhook: User {buyer.phone}, "
                 f"Booking IDs: {[b.id for b in created_bookings]}, "
                 f"Simulator count: {simulator_count}, "
                 f"Duration per simulator: {temp_booking.duration_minutes} minutes "
-                f"({temp_booking.duration_minutes / 60} hours), Count received: {count}"
+                f"({temp_booking.duration_minutes / 60} hours), Count received: {count}, "
+                f"Temp booking marked as completed"
             )
             
             # Return all created bookings
@@ -2486,12 +2892,15 @@ class BookingWebhookView(APIView):
             }, status=status.HTTP_201_CREATED)
             
         except Exception as e:
-            logger.error(f"Error creating booking via webhook: {e}")
+            logger.error(f"Error creating booking via webhook: {e}", exc_info=True)
+            # Mark temp_booking as failed/cancelled
+            temp_booking.status = 'cancelled'
+            temp_booking.save(update_fields=['status'])
+            
             return Response(
                 {'error': f'Failed to create booking: {str(e)}'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
-
 
 class GuestBookingCreateView(APIView):
     """

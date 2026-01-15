@@ -67,7 +67,20 @@ class TempBooking(models.Model):
     """
     Temporary booking record created before payment processing for simulator bookings.
     Stores booking details until webhook confirms payment.
+    
+    Status flow:
+    - reserved: Initial state, slot is reserved pending payment
+    - completed: Payment confirmed, converted to real booking
+    - expired: Reservation expired without payment
+    - cancelled: Manually cancelled before payment
     """
+    STATUS_CHOICES = (
+        ('reserved', 'Reserved'),
+        ('completed', 'Completed'),
+        ('expired', 'Expired'),
+        ('cancelled', 'Cancelled'),
+    )
+    
     temp_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     simulator = models.ForeignKey(
         'simulators.Simulator',
@@ -81,6 +94,24 @@ class TempBooking(models.Model):
     duration_minutes = models.IntegerField(help_text="Duration per simulator in minutes")
     simulator_count = models.IntegerField(default=1, help_text="Number of simulators to book")
     total_price = models.DecimalField(max_digits=8, decimal_places=2)
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default='reserved',
+        help_text="Status of the temporary booking reservation"
+    )
+    payment_id = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        unique=True,
+        help_text="External payment ID for idempotency protection"
+    )
+    processed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="When the temp booking was converted to a real booking"
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     expires_at = models.DateTimeField(
         null=True,
@@ -98,11 +129,21 @@ class TempBooking(models.Model):
     
     def save(self, *args, **kwargs):
         if not self.expires_at:
-            self.expires_at = timezone.now() + timedelta(hours=24)
+            # User has 15 minutes to complete payment before slot is released
+            self.expires_at = timezone.now() + timedelta(minutes=15)
         super().save(*args, **kwargs)
+    
     
     @property
     def is_expired(self):
         if self.expires_at:
             return timezone.now() > self.expires_at
         return False
+    
+    @property
+    def is_active(self):
+        """
+        Check if this temp booking is actively reserving a slot.
+        A temp booking is active if it's in 'reserved' status and not expired.
+        """
+        return self.status == 'reserved' and not self.is_expired
