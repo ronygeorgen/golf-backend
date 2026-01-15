@@ -1,4 +1,5 @@
 from django.db import models
+from django.db.models import Q
 import uuid
 from django.utils import timezone
 from datetime import timedelta
@@ -58,6 +59,14 @@ class Booking(models.Model):
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        indexes = [
+            models.Index(
+                fields=['simulator', 'start_time', 'booking_type', 'status'],
+                name='booking_conflict_check_idx'
+            ),
+        ]
     
     def __str__(self):
         return f"{self.client.username} - {self.booking_type} - {self.start_time}"
@@ -123,14 +132,29 @@ class TempBooking(models.Model):
         ordering = ['-created_at']
         verbose_name = 'Temporary Booking'
         verbose_name_plural = 'Temporary Bookings'
+        indexes = [
+            models.Index(
+                fields=['status', 'expires_at'],
+                name='tempbook_status_expires_idx'
+            ),
+            models.Index(
+                fields=['payment_id'],
+                name='tempbook_payment_id_idx',
+                condition=Q(payment_id__isnull=False)
+            ),
+            models.Index(
+                fields=['simulator', 'start_time', 'end_time', 'status'],
+                name='tempbook_avail_check_idx'
+            ),
+        ]
     
     def __str__(self):
         return f"TempBooking {self.temp_id} - {self.buyer_phone} - {self.start_time}"
     
     def save(self, *args, **kwargs):
         if not self.expires_at:
-            # User has 15 minutes to complete payment before slot is released
-            self.expires_at = timezone.now() + timedelta(minutes=15)
+            # User has 9 minutes to complete payment before slot is released
+            self.expires_at = timezone.now() + timedelta(minutes=9)
         super().save(*args, **kwargs)
     
     

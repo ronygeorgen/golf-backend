@@ -6,7 +6,6 @@ from django.db import migrations
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('bookings', '0002_add_booking_constraints'),
         ('bookings', '0009_booking_is_tpi_assessment'),
     ]
 
