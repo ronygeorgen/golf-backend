@@ -167,40 +167,37 @@ class StaffViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
             
-            # Get existing availability entries for the days in request
-            requested_days = set()
-            for avail_data in availability_data:
-                day_of_week = avail_data.get('day_of_week')
-                if day_of_week is not None:
-                    requested_days.add(int(day_of_week))
+            # Process each item in the payload - supports explicit delete or update/create
+            updated_availability = []
             
-            # Delete availability entries for these days that are not in the request
-            if requested_days:
-                existing_for_days = StaffAvailability.objects.filter(
-                    staff=staff,
-                    day_of_week__in=requested_days
-                )
-                # Get IDs of entries to keep
-                entries_to_keep = set()
-                for avail_data in availability_data:
+            for avail_data in availability_data:
+                # Check for explicit delete flag
+                if avail_data.get('deleted') is True:
                     day_of_week = avail_data.get('day_of_week')
                     start_time_str = avail_data.get('start_time')
-                    if day_of_week is not None and start_time_str:
-                        entries_to_keep.add((int(day_of_week), start_time_str))
-                
-                # Delete entries not in the keep list
-                to_delete = existing_for_days.exclude(
-                    id__in=[
-                        av.id for av in existing_for_days 
-                        if (av.day_of_week, str(av.start_time)[:5]) in entries_to_keep
-                    ]
-                )
-                deleted_count = to_delete.delete()
-                print(f"Deleted {deleted_count[0]} availability entries for staff {staff.id}")
-            
-            # Update or create each availability entry
-            updated_availability = []
-            for avail_data in availability_data:
+                    avail_id = avail_data.get('id')
+                    
+                    # Try to delete by ID if present
+                    if avail_id:
+                         StaffAvailability.objects.filter(id=avail_id, staff=staff).delete()
+                         print(f"Deleted availability {avail_id} for staff {staff.id}")
+                    # Fallback: Delete by matching day/time if ID not provided (for older clients?)
+                    elif day_of_week is not None and start_time_str:
+                        if len(start_time_str) > 5:
+                            start_time_str = start_time_str[:5]
+                            
+                        # Find matching entry
+                        # This is a bit unsafe without ID but provided for robustness
+                        # Filter by checking start_time string match
+                        candidates = StaffAvailability.objects.filter(staff=staff, day_of_week=day_of_week)
+                        for c in candidates:
+                            if str(c.start_time)[:5] == start_time_str:
+                                c.delete()
+                                print(f"Deleted availability (by match) for staff {staff.id}")
+                    
+                    continue # Skip update logic for this item
+
+                # Update or create logic for items NOT marked deleted
                 day_of_week = avail_data.get('day_of_week')
                 if day_of_week is not None:
                     try:
@@ -238,8 +235,9 @@ class StaffViewSet(viewsets.ModelViewSet):
                     except (ValueError, TypeError):
                         pass
             
-            # Return updated availability list
-            serializer = StaffAvailabilitySerializer(updated_availability, many=True, context={'location_id': location_id})
+            # Return updated availability list (fetch fresh from DB to include all current items)
+            all_avail = StaffAvailability.objects.filter(staff=staff).order_by('day_of_week', 'start_time')
+            serializer = StaffAvailabilitySerializer(all_avail, many=True, context={'location_id': location_id})
             return Response(serializer.data)
     
     @action(detail=True, methods=['get', 'put'], url_path='day-availability')
