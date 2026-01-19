@@ -1083,12 +1083,12 @@ def format_booking_datetime(booking):
     if timezone.is_aware(start_time):
         # Convert from UTC (or current timezone) to Canada Atlantic Time
         # Django stores datetimes in UTC when USE_TZ=True, so convert to UTC first if needed
-        start_time = start_time.astimezone(timezone.utc)
+        start_time = start_time.astimezone(ZoneInfo('UTC'))
         # Then convert from UTC to Canada timezone
         start_time = start_time.astimezone(canada_tz)
     else:
         # If naive, assume UTC and convert to Canada timezone
-        start_time = timezone.make_aware(start_time, timezone.utc)
+        start_time = timezone.make_aware(start_time, ZoneInfo('UTC'))
         start_time = start_time.astimezone(canada_tz)
     
     # Format: "DD-MMM-YYYY HH:MM AM/PM" (e.g., "21-OCT-2021 08:30 AM")
