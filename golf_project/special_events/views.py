@@ -644,6 +644,71 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
         serializer = SpecialEventRegistrationSerializer(registration)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
+    @action(detail=True, methods=['get'])
+    def future_occurrences(self, request, pk=None):
+        """Get all future occurrences of this event"""
+        event = self.get_object()
+        today = timezone.now().date()
+        # Get occurrences for next 2 years to be safe
+        occurrences = event.get_occurrences(start_date=today, end_date=today + timedelta(days=365*2))
+        return Response([d.strftime('%Y-%m-%d') for d in occurrences])
+
+    @action(detail=True, methods=['post'])
+    def pause_occurrences(self, request, pk=None):
+        """Pause specific occurrences of an event and optionally extend the end date"""
+        event = self.get_object()
+        dates_to_pause = request.data.get('dates', [])
+        should_extend = request.data.get('extend', False)
+        
+        if not dates_to_pause:
+            return Response({'error': 'No dates provided'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        paused_count = 0
+        
+        # Create paused dates
+        from .models import SpecialEventPausedDate
+        
+        for date_str in dates_to_pause:
+            try:
+                date_obj = datetime.strptime(date_str, '%Y-%m-%d').date()
+                # Create if not exists
+                if not SpecialEventPausedDate.objects.filter(event=event, date=date_obj).exists():
+                     SpecialEventPausedDate.objects.create(event=event, date=date_obj)
+                     paused_count += 1
+            except ValueError:
+                continue
+                
+        if should_extend and paused_count > 0 and event.recurring_end_date:
+            # Extend the recurring_end_date
+            if event.event_type == 'weekly':
+                event.recurring_end_date += timedelta(weeks=paused_count)
+            elif event.event_type == 'monthly':
+                # Add exact number of months
+                new_date = event.recurring_end_date
+                months_to_add = paused_count
+                
+                # Calculate new year and month
+                # Month is 1-12, so subtract 1 for 0-indexed calculation, then add back
+                new_month_index = (new_date.month - 1) + months_to_add
+                year_add = new_month_index // 12
+                new_year = new_date.year + year_add
+                new_month = (new_month_index % 12) + 1
+                
+                # Handle day overflow (e.g. proceeding from Jan 31 to Feb)
+                import calendar
+                day = min(new_date.day, calendar.monthrange(new_year, new_month)[1])
+                
+                event.recurring_end_date = new_date.replace(year=new_year, month=new_month, day=day)
+                
+            event.save()
+            
+        return Response({
+            'message': 'Occurrences paused successfully', 
+            'extended': should_extend, 
+            'paused_count': paused_count,
+            'new_end_date': event.recurring_end_date if should_extend and event.recurring_end_date else None
+        })
+
 
 class SpecialEventRegistrationViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = SpecialEventRegistrationSerializer

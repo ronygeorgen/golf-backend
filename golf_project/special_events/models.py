@@ -134,6 +134,12 @@ class SpecialEvent(models.Model):
                     occurrences.append(current_date)
                 current_date = current_date.replace(year=current_date.year + 1)
         
+
+        
+        # Filter out paused dates
+        paused_dates = set(self.paused_dates.values_list('date', flat=True))
+        occurrences = [d for d in occurrences if d not in paused_dates]
+        
         return occurrences
     
     def conflicts_with_datetime(self, check_datetime):
@@ -233,6 +239,25 @@ class SpecialEvent(models.Model):
                         occurrence_date=next_occurrence,
                         status='registered'
                     )
+
+
+class SpecialEventPausedDate(models.Model):
+    event = models.ForeignKey(
+        SpecialEvent,
+        on_delete=models.CASCADE,
+        related_name='paused_dates'
+    )
+    date = models.DateField(help_text="The date of the occurrence to pause")
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        unique_together = [['event', 'date']]
+        verbose_name = 'Paused Event Date'
+        ordering = ['date']
+        
+    def __str__(self):
+        return f"{self.event.title} - Paused: {self.date}"
+
 
 
 class SpecialEventRegistration(models.Model):
