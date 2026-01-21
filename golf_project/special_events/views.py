@@ -660,9 +660,7 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
             )
         
         # Check if event is full for this specific occurrence date
-        total_registrations = event.get_registered_count(occurrence_date)
-        
-        if total_registrations >= event.max_capacity:
+        if event.is_full(occurrence_date):
             return Response(
                 {'error': 'This event occurrence is full'},
                 status=status.HTTP_400_BAD_REQUEST
