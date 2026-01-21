@@ -51,7 +51,7 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
                 (Q(event_type__in=['weekly', 'monthly', 'yearly']) & (Q(recurring_end_date__isnull=True) | Q(recurring_end_date__gte=today)))
             )
         
-        return queryset.order_by('date', 'start_time')
+        return queryset.order_by('-created_at')
     
     def get_serializer_context(self):
         context = super().get_serializer_context()
@@ -103,12 +103,12 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
                             'occurrence_date': next_occurrence
                         })
                         data = serializer.data
-                        # Update the date field to show next occurrence date
+                        # Update the date field to show this occurrence date
                         data['date'] = next_occurrence.strftime('%Y-%m-%d')
                         result.append(data)
             
-            # Sort by occurrence date
-            result.sort(key=lambda x: (x['date'], x['start_time']))
+            # Sort by created_at descending (newly created first)
+            result.sort(key=lambda x: x['created_at'], reverse=True)
             return Response(result)
         elif is_admin_or_staff and view_type == 'conducted':
             # For conducted view, show all past occurrences
@@ -147,6 +147,7 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
         else:
             # Default behavior for clients or if no view_type specified
             return super().list(request, *args, **kwargs)
+
     @action(detail=False, methods=['get'], url_path='calendar-events')
     def calendar_events(self, request):
         """
@@ -208,13 +209,14 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
                 result.append(data)
         
         return Response(result)
+
     @action(detail=False, methods=['get'])
     def upcoming(self, request):
         """Get all upcoming events - for recurring events, only show the first upcoming date.
         Private events are excluded for non-admin/staff users via get_queryset().
         Auto-enrolls users for events with is_auto_enroll=True."""
         today = timezone.now().date()
-        events = self.get_queryset()
+        events = self.get_queryset()  # Already ordered by -created_at
         
         result = []
         for event in events:
@@ -235,6 +237,8 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
                 data['next_occurrence_date'] = next_occurrence_date.strftime('%Y-%m-%d')
                 result.append(data)
         
+        # Sort explicitly by created_at descending just in case get_queryset changed or we need to be sure
+        result.sort(key=lambda x: x['created_at'], reverse=True)
         return Response(result)
     
     @action(detail=False, methods=['get'])
