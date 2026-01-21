@@ -1,12 +1,18 @@
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.views import APIView
 from django.utils import timezone
+from django.db import transaction
 from datetime import datetime, timedelta
+import logging
 from users.utils import get_location_id_from_request
-from .models import SpecialEvent, SpecialEventRegistration
+from .models import SpecialEvent, SpecialEventRegistration, TempSpecialEventBooking
 from .serializers import SpecialEventSerializer, SpecialEventRegistrationSerializer
+from users.models import User
+
+logger = logging.getLogger(__name__)
 
 
 class SpecialEventViewSet(viewsets.ModelViewSet):
@@ -327,19 +333,55 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Check if event is full for this specific occurrence date
-        # Count both registered and showed_up statuses
-        total_registrations = SpecialEventRegistration.objects.filter(
-            event=event,
-            occurrence_date=next_occurrence_date,
-            status__in=['registered', 'showed_up']
-        ).count()
-        
-        if total_registrations >= event.max_capacity:
+        # Check if event is full for this specific occurrence date (including temp bookings)
+        if event.is_full(next_occurrence_date):
+            # Check if blocked by temp booking to give better error message
+            temp_count = event.get_temp_reserved_count(next_occurrence_date)
+            if temp_count > 0:
+                return Response(
+                    {'error': 'This event occurrence is currently under booking process by other users. Please wait for 9 minutes then recheck.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
             return Response(
                 {'error': 'This event occurrence is full'},
                 status=status.HTTP_400_BAD_REQUEST
             )
+        
+        # Handle upfront payment
+        if event.upfront_payment:
+            # Create a temporary booking reservation
+            with transaction.atomic():
+                # Re-check capacity within transaction with row-level locking
+                event_locked = SpecialEvent.objects.select_for_update().get(id=event.id)
+                if event_locked.is_full(next_occurrence_date):
+                    return Response(
+                        {'error': 'This event occurrence just became full. Please try again later.'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                
+                temp_booking = TempSpecialEventBooking.objects.create(
+                    event=event,
+                    user=user,
+                    occurrence_date=next_occurrence_date,
+                    status='reserved'
+                )
+                
+                redirect_url = event.redirect_url
+                if not redirect_url:
+                    return Response(
+                        {'error': 'This event requires upfront payment but no redirect URL is configured. Please contact support.'},
+                        status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                    )
+                
+                # Format redirect URL with params similar to simulator booking
+                # Note: simulator booking passes details as query params along with the url
+                return Response({
+                    'temp_id': str(temp_booking.temp_id),
+                    'redirect_url': redirect_url,
+                    'is_upfront': True,
+                    'message': 'Temporary booking created successfully. Redirect to payment.'
+                }, status=status.HTTP_200_OK)
         
         # Use update_or_create to handle case where user previously cancelled for this occurrence
         # This prevents IntegrityError when re-registering after cancellation
@@ -729,3 +771,79 @@ class SpecialEventRegistrationViewSet(viewsets.ReadOnlyModelViewSet):
             return SpecialEventRegistration.objects.filter(
                 user=self.request.user
             ).select_related('user', 'event')
+
+
+class SpecialEventWebhookView(APIView):
+    """
+    Webhook endpoint to complete special event registration after external payment verification.
+    Receives recipient_phone (which contains temp_id) and other details.
+    """
+    permission_classes = [AllowAny]
+    
+    @transaction.atomic
+    def post(self, request):
+        import uuid
+        
+        # recipient_phone contains the temp_id (consistent with simulator booking)
+        temp_id_str = request.data.get('recipient_phone')
+        
+        if not temp_id_str:
+            temp_id_str = request.data.get('temp_id')
+            
+        if not temp_id_str:
+            return Response(
+                {'error': 'recipient_phone (temp_id) is required.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+            
+        try:
+            temp_id = uuid.UUID(temp_id_str)
+        except (ValueError, TypeError):
+            return Response(
+                {'error': 'Invalid temp_id format.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+            
+        logger.info(f"Special Event webhook called for temp_id: {temp_id_str}")
+        
+        try:
+            temp_booking = TempSpecialEventBooking.objects.select_for_update().get(temp_id=temp_id)
+        except TempSpecialEventBooking.DoesNotExist:
+            return Response(
+                {'error': 'Temporary booking not found.'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+            
+        if temp_booking.status == 'completed':
+            logger.info(f"Special Event booking already completed for temp_id: {temp_id}")
+            return Response({'message': 'Already processed.'}, status=status.HTTP_200_OK)
+            
+        if temp_booking.is_expired:
+            temp_booking.status = 'expired'
+            temp_booking.save(update_fields=['status'])
+            return Response({'error': 'Temporary booking has expired.'}, status=status.HTTP_400_BAD_REQUEST)
+            
+        # Convert temp booking to real registration
+        registration, created = SpecialEventRegistration.objects.update_or_create(
+            event=temp_booking.event,
+            user=temp_booking.user,
+            occurrence_date=temp_booking.occurrence_date,
+            defaults={
+                'status': 'registered'
+            }
+        )
+        
+        if not created and registration.status == 'registered':
+            registration.registered_at = timezone.now()
+            registration.save(update_fields=['registered_at'])
+            
+        # Mark temp booking as completed
+        temp_booking.status = 'completed'
+        temp_booking.save(update_fields=['status'])
+        
+        logger.info(f"Special Event registration completed for user {temp_booking.user.username} - Event: {temp_booking.event.title}")
+        
+        return Response({
+            'message': 'Registration completed successfully.',
+            'registration_id': registration.id
+        }, status=status.HTTP_200_OK)

@@ -2,6 +2,7 @@ from django.conf import settings
 from django.db import models
 from django.utils import timezone
 from datetime import datetime, timedelta
+import uuid
 
 
 class SpecialEvent(models.Model):
@@ -50,6 +51,16 @@ class SpecialEvent(models.Model):
         default=False,
         help_text="If True, registered customers will be automatically enrolled for the next occurrence. Only applicable for weekly and monthly recurring events."
     )
+    upfront_payment = models.BooleanField(
+        default=False,
+        help_text="If True, users must pay upfront to register. This creates a temporary hold on the spot until payment is confirmed."
+    )
+    redirect_url = models.URLField(
+        max_length=500,
+        blank=True,
+        null=True,
+        help_text="URL to redirect to after event registration payment (if upfront_payment is True)"
+    )
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -81,14 +92,27 @@ class SpecialEvent(models.Model):
             status='showed_up'
         ).count()
     
+    def get_temp_reserved_count(self, occurrence_date=None):
+        """Get the number of spots currently held by active temp bookings"""
+        if occurrence_date is None:
+            return 0
+        
+        # Use the related manager
+        return self.temp_bookings.filter(
+            occurrence_date=occurrence_date,
+            status='reserved',
+            expires_at__gt=timezone.now()
+        ).count()
+
     def get_available_spots(self, occurrence_date=None):
         """Get remaining available spots for a specific occurrence date"""
         registered = self.get_registered_count(occurrence_date)
-        return max(0, self.max_capacity - registered)
+        temp_reserved = self.get_temp_reserved_count(occurrence_date)
+        return max(0, self.max_capacity - (registered + temp_reserved))
     
     def is_full(self, occurrence_date=None):
         """Check if event is at capacity for a specific occurrence date"""
-        return self.get_registered_count(occurrence_date) >= self.max_capacity
+        return self.get_available_spots(occurrence_date) <= 0
     
     def get_occurrences(self, start_date=None, end_date=None):
         """
@@ -257,6 +281,74 @@ class SpecialEventPausedDate(models.Model):
         
     def __str__(self):
         return f"{self.event.title} - Paused: {self.date}"
+
+
+class TempSpecialEventBooking(models.Model):
+    """
+    Temporary booking record created before payment processing for special events.
+    Stores booking details until webhook confirms payment.
+    """
+    STATUS_CHOICES = (
+        ('reserved', 'Reserved'),
+        ('completed', 'Completed'),
+        ('expired', 'Expired'),
+        ('cancelled', 'Cancelled'),
+    )
+    
+    temp_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    event = models.ForeignKey(
+        SpecialEvent,
+        on_delete=models.CASCADE,
+        related_name='temp_bookings'
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='temp_event_bookings'
+    )
+    occurrence_date = models.DateField(help_text="The specific date of the event occurrence")
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default='reserved'
+    )
+    payment_id = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        unique=True,
+        help_text="External payment ID"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text="Expiration time for temp booking (default 9 mins)"
+    )
+    
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'Temporary Event Booking'
+        verbose_name_plural = 'Temporary Event Bookings'
+    
+    def __str__(self):
+        return f"TempEventBooking {self.temp_id} - {self.user.username} - {self.event.title}"
+    
+    def save(self, *args, **kwargs):
+        if not self.expires_at:
+            # User has 9 minutes to complete payment before slot is released
+            self.expires_at = timezone.now() + timedelta(minutes=9)
+        super().save(*args, **kwargs)
+    
+    @property
+    def is_expired(self):
+        if self.expires_at:
+            return timezone.now() > self.expires_at
+        return False
+        
+    @property
+    def is_active(self):
+        return self.status == 'reserved' and not self.is_expired
 
 
 
