@@ -199,15 +199,24 @@ def update_upcoming_booking_dates_task():
             try:
                 location_id = location.location_id
                 
-                # Get all clients for this location
+                from bookings.models import Booking
+                
+                # Get IDs of clients who actually have upcoming bookings
+                upcoming_client_ids = Booking.objects.filter(
+                    status='confirmed',
+                    start_time__gt=timezone.now()
+                ).values_list('client_id', flat=True).distinct()
+                
+                # Filter clients for this location who have upcoming bookings
                 clients = User.objects.filter(
+                    id__in=upcoming_client_ids,
                     role='client',
                     ghl_location_id=location_id,
                     is_active=True,
                     phone__isnull=False
                 ).exclude(phone='')
                 
-                logger.info(f"Processing {clients.count()} clients for location {location_id}")
+                logger.info(f"Processing {clients.count()} clients with upcoming bookings for location {location_id}")
                 
                 for client in clients:
                     try:
