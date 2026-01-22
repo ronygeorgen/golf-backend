@@ -25,6 +25,8 @@ from .services import (
     get_contact_custom_field_value,
     get_contact_custom_field_mapping,
     set_contact_custom_values,
+    get_first_upcoming_special_event,
+    format_special_event_datetime
 )
 
 logger = logging.getLogger(__name__)
@@ -201,16 +203,24 @@ def update_upcoming_booking_dates_task():
                 
                 from bookings.models import Booking
                 
-                # Get IDs of clients who actually have upcoming bookings
-                upcoming_client_ids = Booking.objects.filter(
+                # Get IDs of clients who actually have upcoming bookings or special events
+                upcoming_client_ids = set(Booking.objects.filter(
                     status='confirmed',
                     start_time__gt=timezone.now()
-                ).values_list('client_id', flat=True).distinct()
+                ).values_list('client_id', flat=True))
                 
-                # Filter clients for this location who have upcoming bookings
-                # Include all roles (admins, staff, etc.) if they have a booking
+                from special_events.models import SpecialEventRegistration
+                upcoming_event_user_ids = set(SpecialEventRegistration.objects.filter(
+                    status='registered',
+                    occurrence_date__gte=timezone.now().date()
+                ).values_list('user_id', flat=True))
+                
+                all_active_user_ids = upcoming_client_ids.union(upcoming_event_user_ids)
+                
+                # Filter clients for this location who have upcoming activity
+                # Include all roles (admins, staff, etc.) if they have activity
                 clients = User.objects.filter(
-                    id__in=upcoming_client_ids,
+                    id__in=all_active_user_ids,
                     ghl_location_id=location_id,
                     is_active=True,
                     phone__isnull=False
@@ -272,6 +282,28 @@ def update_upcoming_booking_dates_task():
                             logger.info(
                                 f"Client {client.id}: Coaching booking date changed from "
                                 f"'{current_coaching_date}' to '{coaching_date_str}'"
+                            )
+                        
+                        # Get first upcoming special event
+                        special_event = get_first_upcoming_special_event(
+                            client,
+                            location_id=location_id
+                        )
+                        special_event_date_str = format_special_event_datetime(special_event) if special_event else ''
+                        
+                        # Get current value from GHL
+                        current_special_event_date = get_contact_custom_field_value(
+                            contact_id,
+                            location_id,
+                            'special_event_booked'
+                        ) or ''
+                        
+                        # Only update if there's an actual event (non-empty) and value is different
+                        if special_event_date_str and special_event_date_str != current_special_event_date:
+                            custom_fields_to_update['Special Event Booked'] = special_event_date_str
+                            logger.info(
+                                f"Client {client.id}: Special event date changed from "
+                                f"'{current_special_event_date}' to '{special_event_date_str}'"
                             )
                         
                         # Update custom fields if there are changes

@@ -1547,8 +1547,11 @@ class BookingViewSet(viewsets.ModelViewSet):
         
         # Update GHL custom fields after booking cancellation
         try:
-            from ghl.services import update_user_ghl_custom_fields
+            from ghl.services import update_user_ghl_custom_fields, update_ghl_cancellation_fields
             location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            # Track the cancelled date
+            update_ghl_cancellation_fields(booking.client, booking, location_id=location_id)
+            # Update upcoming dates and other fields
             update_user_ghl_custom_fields(booking.client, location_id=location_id)
         except Exception as exc:
             logger.warning("Failed to update GHL custom fields after booking cancellation: %s", exc)

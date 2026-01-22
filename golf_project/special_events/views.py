@@ -404,6 +404,16 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
             registration.save(update_fields=['registered_at'])
         
         serializer = SpecialEventRegistrationSerializer(registration)
+        
+        # Update GHL custom fields after registration
+        try:
+            from ghl.services import update_user_ghl_custom_fields
+            from django.conf import settings
+            location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            update_user_ghl_custom_fields(user, location_id=location_id)
+        except Exception as exc:
+            logger.warning("Failed to update GHL custom fields after special event registration: %s", exc)
+            
         return Response(serializer.data, status=status.HTTP_201_CREATED)
     
     @action(detail=True, methods=['post'])
@@ -439,6 +449,18 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
         
         registration.status = 'cancelled'
         registration.save()
+        
+        # Update GHL custom fields after cancellation
+        try:
+            from ghl.services import update_user_ghl_custom_fields, update_ghl_cancellation_fields
+            from django.conf import settings
+            location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            # Track the cancelled date
+            update_ghl_cancellation_fields(user, registration, location_id=location_id)
+            # Update upcoming dates
+            update_user_ghl_custom_fields(user, location_id=location_id)
+        except Exception as exc:
+            logger.warning("Failed to update GHL custom fields after special event cancellation: %s", exc)
         
         serializer = SpecialEventRegistrationSerializer(registration)
         return Response(serializer.data)
@@ -535,6 +557,17 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
             registration.status = new_status
             registration.save()
             
+            # Update GHL custom fields after status update
+            try:
+                from ghl.services import update_user_ghl_custom_fields, update_ghl_cancellation_fields
+                from django.conf import settings
+                location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+                if new_status == 'cancelled':
+                    update_ghl_cancellation_fields(registration.user, registration, location_id=location_id)
+                update_user_ghl_custom_fields(registration.user, location_id=location_id)
+            except Exception as exc:
+                logger.warning("Failed to update GHL custom fields after special event registration status update: %s", exc)
+            
             serializer = SpecialEventRegistrationSerializer(registration)
             return Response(serializer.data)
         except SpecialEventRegistration.DoesNotExist:
@@ -573,7 +606,17 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
                 id=registration_id,
                 event=event
             )
+            target_user = registration.user
             registration.delete()
+            
+            # Update GHL custom fields after removal
+            try:
+                from ghl.services import update_user_ghl_custom_fields
+                from django.conf import settings
+                location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+                update_user_ghl_custom_fields(target_user, location_id=location_id)
+            except Exception as exc:
+                logger.warning("Failed to update GHL custom fields after special event registration removal: %s", exc)
             
             return Response(
                 {'message': 'Registration removed successfully'},
@@ -686,6 +729,16 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
             registration.save(update_fields=['registered_at'])
         
         serializer = SpecialEventRegistrationSerializer(registration)
+        
+        # Update GHL custom fields after registration
+        try:
+            from ghl.services import update_user_ghl_custom_fields
+            from django.conf import settings
+            location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            update_user_ghl_custom_fields(user_to_register, location_id=location_id)
+        except Exception as exc:
+            logger.warning("Failed to update GHL custom fields after admin special event registration: %s", exc)
+            
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=['get'])
@@ -842,6 +895,15 @@ class SpecialEventWebhookView(APIView):
         # Mark temp booking as completed
         temp_booking.status = 'completed'
         temp_booking.save(update_fields=['status'])
+        
+        # Update GHL custom fields after registration via webhook
+        try:
+            from ghl.services import update_user_ghl_custom_fields
+            from django.conf import settings
+            location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            update_user_ghl_custom_fields(temp_booking.user, location_id=location_id)
+        except Exception as exc:
+            logger.warning("Failed to update GHL custom fields after special event webhook registration: %s", exc)
         
         logger.info(f"Special Event registration completed for user {temp_booking.user.username} - Event: {temp_booking.event.title}")
         

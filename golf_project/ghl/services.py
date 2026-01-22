@@ -107,7 +107,11 @@ def get_contact_custom_field_mapping(location_id):
         {"name": "Total Simulator Hour", "type": "TEXT", "key": "total_simulator_hour"},
         {"name": "Last Active Package", "type": "TEXT", "key": "last_active_package"},
         {"name": "upcoming simulator booking date", "type": "TEXT", "key": "upcoming_simulator_booking_date"},
-        {"name": "upcoming coaching session booking date", "type": "TEXT", "key": "upcoming_coaching_session_booking_date"}
+        {"name": "upcoming coaching session booking date", "type": "TEXT", "key": "upcoming_coaching_session_booking_date"},
+        {"name": "Coaching Session Cancelled", "type": "TEXT", "key": "coaching_session_cancelled"},
+        {"name": "Simulator Session Cancelled", "type": "TEXT", "key": "simulator_session_cancelled"},
+        {"name": "Special Event Booked", "type": "TEXT", "key": "special_event_booked"},
+        {"name": "Special Event Cancelled", "type": "TEXT", "key": "special_event_cancelled"}
     ]
     
     field_mapping = {}
@@ -239,7 +243,11 @@ def set_contact_custom_values(contact_id, location_id, custom_fields_dict):
                     'total_simulator_hour': 'Total Simulator Hour',
                     'last_active_package': 'Last Active Package',
                     'upcoming_simulator_booking_date': 'upcoming simulator booking date',
-                    'upcoming_coaching_session_booking_date': 'upcoming coaching session booking date'
+                    'upcoming_coaching_session_booking_date': 'upcoming coaching session booking date',
+                    'coaching_session_cancelled': 'Coaching Session Cancelled',
+                    'simulator_session_cancelled': 'Simulator Session Cancelled',
+                    'special_event_booked': 'Special Event Booked',
+                    'special_event_cancelled': 'Special Event Cancelled'
                 }
                 if field_name_mapping.get(key) == field_name:
                     field_id = f_id
@@ -710,6 +718,10 @@ def sync_user_contact(user, *, location_id: Optional[str] = None,
                 'last_active_package': 'Last Active Package',
                 'upcoming_simulator_booking_date': 'upcoming simulator booking date',
                 'upcoming_coaching_session_booking_date': 'upcoming coaching session booking date',
+                'coaching_session_cancelled': 'Coaching Session Cancelled',
+                'simulator_session_cancelled': 'Simulator Session Cancelled',
+                'special_event_booked': 'Special Event Booked',
+                'special_event_cancelled': 'Special Event Cancelled',
             }
             
             for key, value in custom_fields.items():
@@ -955,6 +967,10 @@ def update_user_ghl_custom_fields(user, location_id=None):
         simulator_date = format_booking_datetime(simulator_booking)
         coaching_date = format_booking_datetime(coaching_booking)
         
+        # Get upcoming special event
+        special_event = get_first_upcoming_special_event(user, location_id=location_id)
+        special_event_date = format_special_event_datetime(special_event)
+        
         custom_fields = {
             'total_coaching_session': str(total_sessions),
             'total_simulator_hour': str(total_hours),
@@ -967,6 +983,8 @@ def update_user_ghl_custom_fields(user, location_id=None):
             custom_fields['upcoming_simulator_booking_date'] = simulator_date
         if coaching_date:
             custom_fields['upcoming_coaching_session_booking_date'] = coaching_date
+        if special_event_date:
+            custom_fields['special_event_booked'] = special_event_date
         
         result, contact_id = sync_user_contact(
             user,
@@ -1097,6 +1115,32 @@ def get_first_upcoming_coaching_booking(user, location_id=None):
     return query.order_by('start_time').first()
 
 
+def get_first_upcoming_special_event(user, location_id=None):
+    """
+    Get the first upcoming special event registration for a user.
+    """
+    from special_events.models import SpecialEventRegistration
+    from django.utils import timezone
+    from django.db.models import Q
+    
+    today = timezone.now().date()
+    
+    query = SpecialEventRegistration.objects.filter(
+        user=user,
+        status='registered',
+        occurrence_date__gte=today
+    )
+    
+    if location_id:
+        query = query.filter(
+            Q(event__location_id=location_id) | 
+            Q(event__location_id__isnull=True) | 
+            Q(event__location_id='')
+        )
+        
+    return query.order_by('occurrence_date', 'event__start_time').first()
+
+
 def format_booking_datetime(booking):
     """
     Format booking start_time to a readable date and time string.
@@ -1139,6 +1183,64 @@ def format_booking_datetime(booking):
     
     formatted_date = f"{day}-{month}-{year} {time_str}"
     return formatted_date
+
+
+def format_special_event_datetime(registration):
+    """
+    Format a special event registration to a readable date and time string.
+    """
+    if not registration or not registration.occurrence_date or not registration.event.start_time:
+        return ''
+    
+    occurrence_date = registration.occurrence_date
+    start_time = registration.event.start_time
+    
+    # Format: "DD-MMM-YYYY HH:MM AM/PM"
+    day = occurrence_date.strftime("%d")
+    month = occurrence_date.strftime("%b").upper()
+    year = occurrence_date.strftime("%Y")
+    time_str = start_time.strftime("%I:%M %p")
+    
+    return f"{day}-{month}-{year} {time_str}"
+
+
+def update_ghl_cancellation_fields(user, booking_or_registration, location_id=None):
+    """
+    Update GHL with the date of a cancelled session or event.
+    """
+    if not user or not booking_or_registration:
+        return False
+        
+    from bookings.models import Booking
+    from special_events.models import SpecialEventRegistration
+    
+    custom_fields = {}
+    
+    if isinstance(booking_or_registration, Booking):
+        date_str = format_booking_datetime(booking_or_registration)
+        if not date_str:
+            return False
+            
+        if booking_or_registration.booking_type == 'coaching':
+            custom_fields['coaching_session_cancelled'] = date_str
+        elif booking_or_registration.booking_type == 'simulator':
+            custom_fields['simulator_session_cancelled'] = date_str
+            
+    elif isinstance(booking_or_registration, SpecialEventRegistration):
+        date_str = format_special_event_datetime(booking_or_registration)
+        if not date_str:
+            return False
+        custom_fields['special_event_cancelled'] = date_str
+    
+    if not custom_fields:
+        return False
+        
+    result, contact_id = sync_user_contact(
+        user,
+        location_id=location_id,
+        custom_fields=custom_fields
+    )
+    return bool(contact_id)
 
 
 def debug_contact_custom_fields(contact_id, location_id):
