@@ -111,7 +111,9 @@ def get_contact_custom_field_mapping(location_id, force_refresh=False):
         {"name": "Coaching Session Cancelled", "type": "TEXT", "key": "coaching_session_cancelled"},
         {"name": "Simulator Session Cancelled", "type": "TEXT", "key": "simulator_session_cancelled"},
         {"name": "Special Event Booked", "type": "TEXT", "key": "special_event_booked"},
-        {"name": "Special Event Cancelled", "type": "TEXT", "key": "special_event_cancelled"}
+        {"name": "Special Event Booked Name", "type": "TEXT", "key": "special_event_booked_name"},
+        {"name": "Special Event Cancelled", "type": "TEXT", "key": "special_event_cancelled"},
+        {"name": "Special Event Cancelled Name", "type": "TEXT", "key": "special_event_cancelled_name"}
     ]
     
     field_mapping = {}
@@ -239,7 +241,6 @@ def set_contact_custom_values(contact_id, location_id, custom_fields_dict):
             # Find the field ID for this field name
             field_id = None
             for key, f_id in field_mapping.items():
-                # Map back from our internal key to field name
                 field_name_mapping = {
                     'login_otp': 'Login Otp',
                     'last_login_at': 'Last Login At', 
@@ -252,11 +253,14 @@ def set_contact_custom_values(contact_id, location_id, custom_fields_dict):
                     'coaching_session_cancelled': 'Coaching Session Cancelled',
                     'simulator_session_cancelled': 'Simulator Session Cancelled',
                     'special_event_booked': 'Special Event Booked',
-                    'special_event_cancelled': 'Special Event Cancelled'
+                    'special_event_booked_name': 'Special Event Booked Name',
+                    'special_event_cancelled': 'Special Event Cancelled',
+                    'special_event_cancelled_name': 'Special Event Cancelled Name'
                 }
-                if field_name_mapping.get(key) == field_name:
+                # Check both key (internal) and mapped name (human-readable)
+                if key == field_name or field_name_mapping.get(key) == field_name:
                     field_id = f_id
-                    logger.debug(f"🔍 Found ID {field_id} for Human-Readable name '{field_name}' (key: {key})")
+                    logger.info(f"🔍 Found ID {field_id} for field '{field_name}' (matched key: {key == field_name})")
                     break
             
             if field_id:
@@ -991,6 +995,8 @@ def update_user_ghl_custom_fields(user, location_id=None):
             custom_fields['upcoming_coaching_session_booking_date'] = coaching_date
         if special_event_date:
             custom_fields['special_event_booked'] = special_event_date
+            if special_event and hasattr(special_event, 'event') and special_event.event.title:
+                custom_fields['special_event_booked_name'] = special_event.event.title
         
         result, contact_id = sync_user_contact(
             user,
@@ -1242,6 +1248,8 @@ def update_ghl_cancellation_fields(user, booking_or_registration, location_id=No
         if not date_str:
             return False
         custom_fields['special_event_cancelled'] = date_str
+        if hasattr(booking_or_registration, 'event') and booking_or_registration.event.title:
+            custom_fields['special_event_cancelled_name'] = booking_or_registration.event.title
     
     if not custom_fields:
         logger.warning(f"No cancellation fields to update for user {user.id}")
@@ -1305,7 +1313,9 @@ def debug_contact_custom_fields(contact_id, location_id):
                 'coaching_session_cancelled': 'Coaching Session Cancelled',
                 'simulator_session_cancelled': 'Simulator Session Cancelled',
                 'special_event_booked': 'Special Event Booked',
-                'special_event_cancelled': 'Special Event Cancelled'
+                'special_event_booked_name': 'Special Event Booked Name',
+                'special_event_cancelled': 'Special Event Cancelled',
+                'special_event_cancelled_name': 'Special Event Cancelled Name'
             }
             
             if custom_fields:

@@ -408,9 +408,9 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
         # Update GHL custom fields after registration
         try:
             from ghl.tasks import update_user_ghl_custom_fields_task
-            from django.conf import settings
-            # Use event-specific location or default
-            ghl_loc_id = getattr(event, 'location_id', None) or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            # Use event-specific location ID or user's location ID
+            ghl_loc_id = event.location_id or getattr(user, 'ghl_location_id', None)
+            logger.info(f"Queuing GHL update task for user {user.id} at location {ghl_loc_id} after registration")
             update_user_ghl_custom_fields_task.delay(user.id, location_id=ghl_loc_id)
         except Exception as exc:
             logger.warning("Failed to queue GHL custom fields update after special event registration: %s", exc)
@@ -454,10 +454,10 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
         # Update GHL custom fields after cancellation
         try:
             from ghl.tasks import update_user_ghl_custom_fields_task, update_ghl_cancellation_fields_task
-            from django.conf import settings
-            # Use event-specific location or default
-            ghl_loc_id = getattr(event, 'location_id', None) or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            # Use event-specific location ID or user's location ID
+            ghl_loc_id = event.location_id or getattr(user, 'ghl_location_id', None)
             # Track the cancelled date
+            logger.info(f"Queuing GHL cancellation and update tasks for user {user.id} at location {ghl_loc_id}")
             update_ghl_cancellation_fields_task.delay(user.id, registration_id=registration.id, location_id=ghl_loc_id)
             # Update upcoming dates
             update_user_ghl_custom_fields_task.delay(user.id, location_id=ghl_loc_id)
@@ -562,9 +562,8 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
             # Update GHL custom fields after status update
             try:
                 from ghl.tasks import update_user_ghl_custom_fields_task, update_ghl_cancellation_fields_task
-                from django.conf import settings
-                # Use event-specific location or default
-                ghl_loc_id = getattr(event, 'location_id', None) or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+                # Use event-specific location ID or user's location ID
+                ghl_loc_id = event.location_id or getattr(registration.user, 'ghl_location_id', None)
                 if new_status == 'cancelled':
                     update_ghl_cancellation_fields_task.delay(registration.user.id, registration_id=registration.id, location_id=ghl_loc_id)
                 update_user_ghl_custom_fields_task.delay(registration.user.id, location_id=ghl_loc_id)
@@ -735,9 +734,8 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
         # Update GHL custom fields after registration
         try:
             from ghl.tasks import update_user_ghl_custom_fields_task
-            from django.conf import settings
-            # Use event-specific location or default
-            ghl_loc_id = getattr(event, 'location_id', None) or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            # Use event-specific location ID or user's location ID
+            ghl_loc_id = event.location_id or getattr(user_to_register, 'ghl_location_id', None)
             update_user_ghl_custom_fields_task.delay(user_to_register.id, location_id=ghl_loc_id)
         except Exception as exc:
             logger.warning("Failed to queue GHL custom fields update after admin special event registration: %s", exc)
@@ -902,9 +900,8 @@ class SpecialEventWebhookView(APIView):
         # Update GHL custom fields after registration via webhook
         try:
             from ghl.tasks import update_user_ghl_custom_fields_task
-            from django.conf import settings
-            # Use event-specific location or default
-            ghl_loc_id = getattr(temp_booking.event, 'location_id', None) or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            # Use event-specific location ID or user's location ID
+            ghl_loc_id = temp_booking.event.location_id or getattr(temp_booking.user, 'ghl_location_id', None)
             update_user_ghl_custom_fields_task.delay(temp_booking.user.id, location_id=ghl_loc_id)
         except Exception as exc:
             logger.warning("Failed to queue GHL custom fields update after special event webhook registration: %s", exc)

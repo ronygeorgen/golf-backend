@@ -301,6 +301,10 @@ def update_upcoming_booking_dates_task():
                         # Only update if there's an actual event (non-empty) and value is different
                         if special_event_date_str and special_event_date_str != current_special_event_date:
                             custom_fields_to_update['Special Event Booked'] = special_event_date_str
+                            if special_event and hasattr(special_event, 'event'):
+                                name = special_event.event.title
+                                if name:
+                                    custom_fields_to_update['Special Event Booked Name'] = name
                             logger.info(
                                 f"Client {client.id}: Special event date changed from "
                                 f"'{current_special_event_date}' to '{special_event_date_str}'"
