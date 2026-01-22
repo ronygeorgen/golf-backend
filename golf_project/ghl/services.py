@@ -202,16 +202,30 @@ def set_contact_custom_values(contact_id, location_id, custom_fields_dict):
         
         contact_data = get_response.json().get('contact', {})
         
-        # Prepare customFields payload
-        custom_fields_payload = []
-        
         # Get existing custom fields to preserve them
         existing_custom_fields = contact_data.get('customFields', [])
+        
+        # Create a map of field_id -> existing value to preserve all fields
+        existing_fields_map = {}
+        for field in existing_custom_fields:
+            field_id = field.get('id')
+            field_value = field.get('value', '')
+            if field_id:
+                existing_fields_map[field_id] = field_value
         
         # Get field name to ID mapping
         field_mapping = get_contact_custom_field_mapping(location_id)
         
         # Build the custom fields array for update
+        # Start with all existing fields to preserve them
+        custom_fields_payload = []
+        for field_id, field_value in existing_fields_map.items():
+            custom_fields_payload.append({
+                "id": field_id,
+                "value": str(field_value) if field_value else ""
+            })
+        
+        # Now update only the fields that are in custom_fields_dict
         for field_name, field_value in custom_fields_dict.items():
             # Find the field ID for this field name
             field_id = None
@@ -232,10 +246,22 @@ def set_contact_custom_values(contact_id, location_id, custom_fields_dict):
                     break
             
             if field_id:
-                custom_fields_payload.append({
-                    "id": field_id,
-                    "value": str(field_value)
-                })
+                # Update the field in the payload (replace existing entry if present)
+                # Find and update existing entry, or add new one
+                field_updated = False
+                for payload_field in custom_fields_payload:
+                    if payload_field['id'] == field_id:
+                        payload_field['value'] = str(field_value)
+                        field_updated = True
+                        break
+                
+                if not field_updated:
+                    # Field doesn't exist in existing fields, add it
+                    custom_fields_payload.append({
+                        "id": field_id,
+                        "value": str(field_value)
+                    })
+                
                 logger.info(f"🔄 Setting custom field: {field_name} = {field_value} (Field ID: {field_id})")
             else:
                 logger.error(f"❌ Field ID not found for field name: {field_name}")

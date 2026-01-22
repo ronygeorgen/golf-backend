@@ -233,8 +233,9 @@ def update_upcoming_booking_dates_task():
                             'upcoming_simulator_booking_date'
                         ) or ''
                         
-                        # Only update if value is different
-                        if simulator_date_str != current_simulator_date:
+                        # Only update if there's an actual booking (non-empty) and value is different
+                        # Don't update if there's no booking - preserve existing value in GHL
+                        if simulator_date_str and simulator_date_str != current_simulator_date:
                             custom_fields_to_update['upcoming simulator booking date'] = simulator_date_str
                             logger.info(
                                 f"Client {client.id}: Simulator booking date changed from "
@@ -255,8 +256,9 @@ def update_upcoming_booking_dates_task():
                             'upcoming_coaching_session_booking_date'
                         ) or ''
                         
-                        # Only update if value is different
-                        if coaching_date_str != current_coaching_date:
+                        # Only update if there's an actual booking (non-empty) and value is different
+                        # Don't update if there's no booking - preserve existing value in GHL
+                        if coaching_date_str and coaching_date_str != current_coaching_date:
                             custom_fields_to_update['upcoming coaching session booking date'] = coaching_date_str
                             logger.info(
                                 f"Client {client.id}: Coaching booking date changed from "
