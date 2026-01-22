@@ -958,10 +958,15 @@ def update_user_ghl_custom_fields(user, location_id=None):
         custom_fields = {
             'total_coaching_session': str(total_sessions),
             'total_simulator_hour': str(total_hours),
-            'last_active_package': last_package,
-            'upcoming_simulator_booking_date': simulator_date,
-            'upcoming_coaching_session_booking_date': coaching_date
+            'last_active_package': last_package
         }
+        
+        # Only add upcoming booking dates if they are not empty
+        # This ensures we don't clear the GHL field if there's no upcoming booking
+        if simulator_date:
+            custom_fields['upcoming_simulator_booking_date'] = simulator_date
+        if coaching_date:
+            custom_fields['upcoming_coaching_session_booking_date'] = coaching_date
         
         result, contact_id = sync_user_contact(
             user,
