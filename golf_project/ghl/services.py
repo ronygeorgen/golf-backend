@@ -948,10 +948,19 @@ def update_user_ghl_custom_fields(user, location_id=None):
         total_hours = calculate_total_simulator_hours(user)
         last_package = get_last_active_package(user)
         
+        # Get upcoming bookings
+        simulator_booking = get_first_upcoming_simulator_booking(user, location_id=location_id)
+        coaching_booking = get_first_upcoming_coaching_booking(user, location_id=location_id)
+        
+        simulator_date = format_booking_datetime(simulator_booking)
+        coaching_date = format_booking_datetime(coaching_booking)
+        
         custom_fields = {
             'total_coaching_session': str(total_sessions),
             'total_simulator_hour': str(total_hours),
-            'last_active_package': last_package
+            'last_active_package': last_package,
+            'upcoming_simulator_booking_date': simulator_date,
+            'upcoming_coaching_session_booking_date': coaching_date
         }
         
         result, contact_id = sync_user_contact(

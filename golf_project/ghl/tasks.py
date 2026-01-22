@@ -208,9 +208,9 @@ def update_upcoming_booking_dates_task():
                 ).values_list('client_id', flat=True).distinct()
                 
                 # Filter clients for this location who have upcoming bookings
+                # Include all roles (admins, staff, etc.) if they have a booking
                 clients = User.objects.filter(
                     id__in=upcoming_client_ids,
-                    role='client',
                     ghl_location_id=location_id,
                     is_active=True,
                     phone__isnull=False

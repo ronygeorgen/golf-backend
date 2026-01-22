@@ -1446,6 +1446,14 @@ class BookingViewSet(viewsets.ModelViewSet):
         booking.status = new_status
         booking.save()
         
+        # Update GHL custom fields after status update
+        try:
+            from ghl.services import update_user_ghl_custom_fields
+            location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            update_user_ghl_custom_fields(booking.client, location_id=location_id)
+        except Exception as exc:
+            logger.warning("Failed to update GHL custom fields after status update: %s", exc)
+        
         # Log status change
         print(f"Booking {booking.id} status changed to {new_status} by {request.user}")
         
@@ -1623,6 +1631,14 @@ class BookingViewSet(viewsets.ModelViewSet):
                 update_fields.append('total_price')
             
             booking.save(update_fields=update_fields)
+        
+        # Update GHL custom fields after rescheduling
+        try:
+            from ghl.services import update_user_ghl_custom_fields
+            location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            update_user_ghl_custom_fields(booking.client, location_id=location_id)
+        except Exception as exc:
+            logger.warning("Failed to update GHL custom fields after rescheduling: %s", exc)
         
         serializer = self.get_serializer(booking)
         return Response({
