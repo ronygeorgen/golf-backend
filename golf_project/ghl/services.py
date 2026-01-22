@@ -88,15 +88,15 @@ def get_or_create_contact_custom_field(location_id, field_name, field_type="TEXT
         return None
 
 
-def get_contact_custom_field_mapping(location_id):
+def get_contact_custom_field_mapping(location_id, force_refresh=False):
     """
     Get mapping of field names to field IDs for required contact custom fields.
     """
     cache_key = f"ghl_contact_field_mapping_{location_id}"
-    cached_mapping = cache.get(cache_key)
-    
-    if cached_mapping:
-        return cached_mapping
+    if not force_refresh:
+        cached_mapping = cache.get(cache_key)
+        if cached_mapping:
+            return cached_mapping
     
     # Update these field names to match EXACTLY what's in your GHL dashboard
     required_fields = [
@@ -124,6 +124,7 @@ def get_contact_custom_field_mapping(location_id):
         )
         if field_id:
             field_mapping[field_info["key"]] = field_id
+            logger.info(f"Mapped field '{field_info['name']}' to ID: {field_id}")
         else:
             logger.warning(f"Failed to get/create field '{field_info['name']}' for location {location_id}")
     
@@ -209,19 +210,23 @@ def set_contact_custom_values(contact_id, location_id, custom_fields_dict):
         # Get existing custom fields to preserve them
         existing_custom_fields = contact_data.get('customFields', [])
         
-        # Create a map of field_id -> existing value to preserve all fields
+        # Get field name to ID mapping first
+        field_mapping = get_contact_custom_field_mapping(location_id)
+        
+        # Get the set of valid field IDs (only fields in our current mapping)
+        valid_field_ids = set(field_mapping.values())
+        
+        # Create a map of field_id -> existing value ONLY for valid fields
         existing_fields_map = {}
         for field in existing_custom_fields:
             field_id = field.get('id')
             field_value = field.get('value', '')
-            if field_id:
+            # Only include fields that are in our current field mapping
+            if field_id and field_id in valid_field_ids:
                 existing_fields_map[field_id] = field_value
         
-        # Get field name to ID mapping
-        field_mapping = get_contact_custom_field_mapping(location_id)
-        
         # Build the custom fields array for update
-        # Start with all existing fields to preserve them
+        # Start with existing VALID fields to preserve them
         custom_fields_payload = []
         for field_id, field_value in existing_fields_map.items():
             custom_fields_payload.append({
@@ -251,6 +256,7 @@ def set_contact_custom_values(contact_id, location_id, custom_fields_dict):
                 }
                 if field_name_mapping.get(key) == field_name:
                     field_id = f_id
+                    logger.debug(f"🔍 Found ID {field_id} for Human-Readable name '{field_name}' (key: {key})")
                     break
             
             if field_id:
@@ -270,12 +276,12 @@ def set_contact_custom_values(contact_id, location_id, custom_fields_dict):
                         "value": str(field_value)
                     })
                 
-                logger.info(f"🔄 Setting custom field: {field_name} = {field_value} (Field ID: {field_id})")
+                logger.info(f"🔄 Preparing custom field update: {field_name} (ID: {field_id}) = {field_value}")
             else:
-                logger.error(f"❌ Field ID not found for field name: {field_name}")
-                # Try to get field mapping again
+                logger.warning(f"❌ No Field ID found in GHL for human-readable field name: '{field_name}'. This field will be SKIPPED.")
+                # Try to get field mapping again (could be cache issue)
                 field_mapping = get_contact_custom_field_mapping(location_id)
-                logger.info(f"🔍 Current field mapping: {field_mapping}")
+                logger.info(f"🔍 Current ID-to-Key mapping for location {location_id}: {field_mapping}")
         
         # Update the contact with custom fields
         update_payload = {
@@ -1137,8 +1143,13 @@ def get_first_upcoming_special_event(user, location_id=None):
             Q(event__location_id__isnull=True) | 
             Q(event__location_id='')
         )
-        
-    return query.order_by('occurrence_date', 'event__start_time').first()
+    
+    result = query.order_by('occurrence_date', 'event__start_time').first()
+    if result:
+        logger.debug(f"Found upcoming special event for user {user.id}: {result.event.title} on {result.occurrence_date}")
+    else:
+        logger.debug(f"No upcoming special event found for user {user.id}")
+    return result
 
 
 def format_booking_datetime(booking):
@@ -1233,8 +1244,10 @@ def update_ghl_cancellation_fields(user, booking_or_registration, location_id=No
         custom_fields['special_event_cancelled'] = date_str
     
     if not custom_fields:
+        logger.warning(f"No cancellation fields to update for user {user.id}")
         return False
         
+    logger.info(f"Syncing cancellation fields for user {user.id}: {custom_fields}")
     result, contact_id = sync_user_contact(
         user,
         location_id=location_id,
@@ -1286,7 +1299,13 @@ def debug_contact_custom_fields(contact_id, location_id):
                 'purchase_amount': 'Purchase Amount',
                 'total_coaching_session': 'Total Coaching Session',
                 'total_simulator_hour': 'Total Simulator Hour',
-                'last_active_package': 'Last Active Package'
+                'last_active_package': 'Last Active Package',
+                'upcoming_simulator_booking_date': 'Upcoming Simulator Date',
+                'upcoming_coaching_session_booking_date': 'Upcoming Coaching Date',
+                'coaching_session_cancelled': 'Coaching Session Cancelled',
+                'simulator_session_cancelled': 'Simulator Session Cancelled',
+                'special_event_booked': 'Special Event Booked',
+                'special_event_cancelled': 'Special Event Cancelled'
             }
             
             if custom_fields:

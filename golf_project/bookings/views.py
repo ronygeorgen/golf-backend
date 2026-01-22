@@ -983,11 +983,12 @@ class BookingViewSet(viewsets.ModelViewSet):
                     
                     # Update GHL custom fields after simulator booking creation
                     try:
-                        from ghl.services import update_user_ghl_custom_fields
-                        location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
-                        update_user_ghl_custom_fields(target_user, location_id=location_id)
+                        from ghl.tasks import update_user_ghl_custom_fields_task
+                        # Use booking-specific location ID
+                        ghl_loc_id = location_id or getattr(target_user, 'ghl_location_id', None)
+                        update_user_ghl_custom_fields_task.delay(target_user.id, location_id=ghl_loc_id)
                     except Exception as exc:
-                        logger.warning("Failed to update GHL custom fields after simulator booking creation: %s", exc)
+                        logger.warning("Failed to queue GHL custom fields update after simulator booking creation: %s", exc)
                     
                     return
             elif booking_type == 'coaching':
@@ -1073,13 +1074,14 @@ class BookingViewSet(viewsets.ModelViewSet):
                     booking_instance.save(update_fields=['location_id'])
                 logger.info(f"Coaching booking created: id={booking_instance.id}, location_id={booking_instance.location_id}, client={target_user.phone}")
                 
-                # Update GHL custom fields after booking creation
+                # Update GHL custom fields after coaching booking creation
                 try:
-                    from ghl.services import update_user_ghl_custom_fields
-                    location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
-                    update_user_ghl_custom_fields(target_user, location_id=location_id)
+                    from ghl.tasks import update_user_ghl_custom_fields_task
+                    # Use booking-specific location ID
+                    ghl_loc_id = location_id or getattr(target_user, 'ghl_location_id', None)
+                    update_user_ghl_custom_fields_task.delay(target_user.id, location_id=ghl_loc_id)
                 except Exception as exc:
-                    logger.warning("Failed to update GHL custom fields after coaching booking creation: %s", exc)
+                    logger.warning("Failed to queue GHL custom fields update after coaching booking creation: %s", exc)
                 
                 return
             
@@ -1448,11 +1450,11 @@ class BookingViewSet(viewsets.ModelViewSet):
         
         # Update GHL custom fields after status update
         try:
-            from ghl.services import update_user_ghl_custom_fields
-            location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
-            update_user_ghl_custom_fields(booking.client, location_id=location_id)
+            from ghl.tasks import update_user_ghl_custom_fields_task
+            ghl_loc_id = booking.location_id or getattr(booking.client, 'ghl_location_id', None)
+            update_user_ghl_custom_fields_task.delay(booking.client.id, location_id=ghl_loc_id)
         except Exception as exc:
-            logger.warning("Failed to update GHL custom fields after status update: %s", exc)
+            logger.warning("Failed to queue GHL custom fields update after status update: %s", exc)
         
         # Log status change
         print(f"Booking {booking.id} status changed to {new_status} by {request.user}")
@@ -1547,14 +1549,16 @@ class BookingViewSet(viewsets.ModelViewSet):
         
         # Update GHL custom fields after booking cancellation
         try:
-            from ghl.services import update_user_ghl_custom_fields, update_ghl_cancellation_fields
-            location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
-            # Track the cancelled date
-            update_ghl_cancellation_fields(booking.client, booking, location_id=location_id)
-            # Update upcoming dates and other fields
-            update_user_ghl_custom_fields(booking.client, location_id=location_id)
+            from ghl.tasks import update_user_ghl_custom_fields_task, update_ghl_cancellation_fields_task
+            # Use booking-specific location or default
+            ghl_loc_id = getattr(booking, 'location_id', None) or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            
+            # Track the cancelled date (asynchronously)
+            update_ghl_cancellation_fields_task.delay(booking.client.id, booking_id=booking.id, location_id=ghl_loc_id)
+            # Update upcoming dates and other fields (asynchronously)
+            update_user_ghl_custom_fields_task.delay(booking.client.id, location_id=ghl_loc_id)
         except Exception as exc:
-            logger.warning("Failed to update GHL custom fields after booking cancellation: %s", exc)
+            logger.warning("Failed to queue GHL custom fields update after booking cancellation: %s", exc)
         
         serializer = self.get_serializer(booking)
         return Response({
@@ -1637,11 +1641,11 @@ class BookingViewSet(viewsets.ModelViewSet):
         
         # Update GHL custom fields after rescheduling
         try:
-            from ghl.services import update_user_ghl_custom_fields
-            location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
-            update_user_ghl_custom_fields(booking.client, location_id=location_id)
+            from ghl.tasks import update_user_ghl_custom_fields_task
+            ghl_loc_id = booking.location_id or getattr(booking.client, 'ghl_location_id', None)
+            update_user_ghl_custom_fields_task.delay(booking.client.id, location_id=ghl_loc_id)
         except Exception as exc:
-            logger.warning("Failed to update GHL custom fields after rescheduling: %s", exc)
+            logger.warning("Failed to queue GHL custom fields update after rescheduling: %s", exc)
         
         serializer = self.get_serializer(booking)
         return Response({
@@ -3010,6 +3014,14 @@ class BookingWebhookView(APIView):
                 f"({temp_booking.duration_minutes / 60} hours), Count received: {count}, "
                 f"Temp booking marked as completed"
             )
+            
+            # Update GHL custom fields after webhook booking creation
+            try:
+                from ghl.tasks import update_user_ghl_custom_fields_task
+                ghl_loc_id = location_id or getattr(buyer, 'ghl_location_id', None)
+                update_user_ghl_custom_fields_task.delay(buyer.id, location_id=ghl_loc_id)
+            except Exception as exc:
+                logger.warning("Failed to queue GHL custom fields update after webhook booking creation: %s", exc)
             
             # Return all created bookings
             booking_serializer = BookingSerializer(created_bookings, many=True)

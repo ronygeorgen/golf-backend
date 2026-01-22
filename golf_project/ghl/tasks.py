@@ -14,8 +14,6 @@ except ImportError:
             return func
         return decorator
 
-from django.conf import settings
-
 from .services import (
     sync_user_contact,
     purchase_custom_fields,
@@ -26,7 +24,9 @@ from .services import (
     get_contact_custom_field_mapping,
     set_contact_custom_values,
     get_first_upcoming_special_event,
-    format_special_event_datetime
+    format_special_event_datetime,
+    update_user_ghl_custom_fields,
+    update_ghl_cancellation_fields
 )
 
 logger = logging.getLogger(__name__)
@@ -367,3 +367,35 @@ def update_upcoming_booking_dates_task():
         logger.error(f"Failed to run upcoming booking dates update task: {exc}", exc_info=True)
         raise
 
+@shared_task(bind=True, max_retries=3, default_retry_delay=60)
+def update_user_ghl_custom_fields_task(self, user_id, location_id=None):
+    """Async task to update user-level GHL custom fields (Total sessions, etc)"""
+    try:
+        from users.models import User
+        user = User.objects.get(id=user_id)
+        update_user_ghl_custom_fields(user, location_id=location_id)
+    except Exception as exc:
+        logger.error(f"Failed task update_user_ghl_custom_fields for user {user_id}: {exc}")
+        raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=60)
+def update_ghl_cancellation_fields_task(self, user_id, booking_id=None, registration_id=None, location_id=None):
+    """Async task to track a cancellation in GHL fields"""
+    try:
+        from users.models import User
+        user = User.objects.get(id=user_id)
+        
+        item = None
+        if booking_id:
+            from bookings.models import Booking
+            item = Booking.objects.get(id=booking_id)
+        elif registration_id:
+            from special_events.models import SpecialEventRegistration
+            item = SpecialEventRegistration.objects.get(id=registration_id)
+            
+        if item:
+            update_ghl_cancellation_fields(user, item, location_id=location_id)
+    except Exception as exc:
+        logger.error(f"Failed task update_ghl_cancellation_fields for user {user_id}: {exc}")
+        raise self.retry(exc=exc)
