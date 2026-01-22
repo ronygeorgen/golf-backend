@@ -226,7 +226,7 @@ if crontab:
         },
         'update-upcoming-booking-dates': {
             'task': 'ghl.tasks.update_upcoming_booking_dates_task',
-            'schedule': crontab(hour='9,13,15,21,0', minute=0),  # Run at 9 AM, 1 PM, 3 PM, 9 PM, and midnight (end of day)
+            'schedule': crontab(minute=0),  # Run every hour at minute 0
         },
     }
 else:
