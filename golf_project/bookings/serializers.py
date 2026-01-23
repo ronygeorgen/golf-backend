@@ -73,6 +73,18 @@ class BookingCreateSerializer(serializers.ModelSerializer):
                     })
                 current_check += timedelta(minutes=15)
             
+            # Check for special event conflicts
+            from special_events.models import SpecialEvent
+            active_events = SpecialEvent.objects.filter(is_active=True)
+            if location_id:
+                active_events = active_events.filter(location_id=location_id)
+            
+            for event in active_events:
+                if event.conflicts_with_range(start_time, end_time):
+                    raise serializers.ValidationError({
+                        'start_time': f"This time slot conflicts with a special event: {event.title}."
+                    })
+            
             # Check for overlapping bookings
             conflicting_bookings = Booking.objects.filter(
                 start_time__lt=end_time,

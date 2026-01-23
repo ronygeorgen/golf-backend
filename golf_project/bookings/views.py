@@ -113,9 +113,9 @@ class BookingViewSet(viewsets.ModelViewSet):
             return [AllowAny()]
         return [IsAuthenticated()]
     
-    def _check_special_event_conflict(self, check_datetime):
+    def _check_special_event_conflict(self, start_time, end_time=None):
         """
-        Check if a datetime conflicts with any active special event.
+        Check if a datetime or range conflicts with any active special event.
         Returns (has_conflict, event_title) tuple.
         """
         from special_events.models import SpecialEvent
@@ -126,8 +126,12 @@ class BookingViewSet(viewsets.ModelViewSet):
             active_events = active_events.filter(location_id=location_id)
         
         for event in active_events:
-            if event.conflicts_with_datetime(check_datetime):
-                return (True, event.title)
+            if end_time:
+                if event.conflicts_with_range(start_time, end_time):
+                    return (True, event.title)
+            else:
+                if event.conflicts_with_datetime(start_time):
+                    return (True, event.title)
         return (False, None)
     
     def _check_closed_day(self, check_datetime):
@@ -246,7 +250,7 @@ class BookingViewSet(viewsets.ModelViewSet):
             # Re-raise other exceptions
             raise
     
-    def _check_simulator_availability_atomic(self, simulator, start_time, end_time, use_locking=True):
+    def _check_simulator_availability_atomic(self, simulator, start_time, end_time, use_locking=True, exclude_booking_id=None):
         """
         Atomically check if a simulator is available for a given time slot.
         
@@ -260,6 +264,7 @@ class BookingViewSet(viewsets.ModelViewSet):
             start_time: Start datetime
             end_time: End datetime
             use_locking: If True, use select_for_update() for row-level locking
+            exclude_booking_id: Optional booking ID to exclude from conflict check (for rescheduling)
             
         Returns:
             bool: True if available, False if conflicting booking exists
@@ -269,9 +274,11 @@ class BookingViewSet(viewsets.ModelViewSet):
             simulator=simulator,
             start_time__lt=end_time,
             end_time__gt=start_time,
-            status__in=['confirmed', 'completed'],
-            booking_type='simulator'
+            status__in=['confirmed', 'completed']
         )
+        
+        if exclude_booking_id:
+            booking_query = booking_query.exclude(id=exclude_booking_id)
         
         if use_locking:
             # Lock the rows to prevent concurrent modifications
@@ -745,12 +752,37 @@ class BookingViewSet(viewsets.ModelViewSet):
                 start_time = booking_data.get('start_time')
                 end_time = booking_data.get('end_time')
                 
+                # Check for Special Event conflict
+                has_event_conflict, event_title = self._check_special_event_conflict(start_time, end_time)
+                if has_event_conflict:
+                    raise serializers.ValidationError(f"This slot conflicts with a special event: {event_title}")
+                
+                # Check if facility is closed
+                is_closed, closed_message = self._check_closed_day(start_time)
+                if is_closed:
+                    raise serializers.ValidationError(closed_message or "The facility is closed during this time.")
+
                 if start_time and end_time:
                     # Handle multiple simulator bookings
                     if simulator_count > 1:
-                        available_simulators = self._find_multiple_available_simulators(start_time, end_time, simulator_count)
+                        # Lock all simulators for this location to ensure atomic multi-bay assignment
+                        candidate_sims_qs = Simulator.objects.filter(is_active=True, is_coaching_bay=False).order_by('bay_number')
+                        if location_id:
+                            candidate_sims_qs = candidate_sims_qs.filter(location_id=location_id)
+                        
+                        with transaction.atomic():
+                            # The lock ensures no other process assigns these bays simultaneously
+                            locked_sims = list(candidate_sims_qs.select_for_update())
+                            
+                            available_simulators = []
+                            for sim in locked_sims:
+                                if self._check_simulator_availability_atomic(sim, start_time, end_time, use_locking=False):
+                                    available_simulators.append(sim)
+                                    if len(available_simulators) >= simulator_count:
+                                        break
+                        
                         if len(available_simulators) < simulator_count:
-                            # Check if blocked by temp booking
+                            # (Keep existing TempBooking logic for error message)
                             temp_check = TempBooking.objects.filter(
                                 start_time__lt=end_time,
                                 end_time__gt=start_time,
@@ -764,15 +796,35 @@ class BookingViewSet(viewsets.ModelViewSet):
                                 raise serializers.ValidationError(
                                     f"Only {len(available_simulators)} simulator(s) available. Some slots are currently under booking process by other users. Please wait for 9 minutes then recheck."
                                 )
-
                             raise serializers.ValidationError(
                                 f"Only {len(available_simulators)} simulator(s) available for this time slot. Requested: {simulator_count}"
                             )
                     else:
                         # Single simulator booking
-                        assigned_simulator = booking_data.get('simulator') or self._find_optimal_simulator(start_time, end_time)
+                        candidate_sims_qs = Simulator.objects.filter(is_active=True, is_coaching_bay=False).order_by('bay_number')
+                        if location_id:
+                            candidate_sims_qs = candidate_sims_qs.filter(location_id=location_id)
+                        
+                        assigned_simulator = None
+                        with transaction.atomic():
+                            locked_sims = list(candidate_sims_qs.select_for_update())
+                            
+                            # If a specific simulator was requested, try it first
+                            requested_sim = booking_data.get('simulator')
+                            if requested_sim and requested_sim in locked_sims:
+                                if self._check_simulator_availability_atomic(requested_sim, start_time, end_time, use_locking=False):
+                                    assigned_simulator = requested_sim
+                            
+                            # Otherwise find the optimal one among locked candidates
+                            if not assigned_simulator:
+                                # We pass the already locked list to avoid re-querying inside _find_optimal
+                                # But for simplicity we'll just re-check availability here since we already have the lock
+                                for sim in locked_sims:
+                                    if self._check_simulator_availability_atomic(sim, start_time, end_time, use_locking=False):
+                                        assigned_simulator = sim
+                                        break
+                        
                         if not assigned_simulator:
-                            # Check if blocked by temp booking to give better error message
                             temp_check = TempBooking.objects.filter(
                                 start_time__lt=end_time,
                                 end_time__gt=start_time,
@@ -781,11 +833,10 @@ class BookingViewSet(viewsets.ModelViewSet):
                             )
                             if location_id:
                                 temp_check = temp_check.filter(location_id=location_id)
-                                
                             if temp_check.exists():
                                 raise serializers.ValidationError("This slot is currently under booking process by another user. Please wait for 9 minutes then recheck.")
-                                
                             raise serializers.ValidationError("No simulators available for this time slot")
+                        
                         available_simulators = [assigned_simulator]
                     
                     # User can choose: use pre-paid hours OR pay for one-off session
@@ -1000,62 +1051,36 @@ class BookingViewSet(viewsets.ModelViewSet):
                 start_time = booking_data.get('start_time')
                 end_time = booking_data.get('end_time')
                 
-                # Find available bay (Coaching Bay first, then Simulator Bay)
-                # 1. Get Coaching Bays
-                coaching_bay_qs = Simulator.objects.filter(is_coaching_bay=True, is_active=True)
+                # Check for Special Event conflict
+                has_event_conflict, event_title = self._check_special_event_conflict(start_time, end_time)
+                if has_event_conflict:
+                    raise serializers.ValidationError(f"This slot conflicts with a special event: {event_title}")
+                
+                # Check if facility is closed
+                is_closed, closed_message = self._check_closed_day(start_time)
+                if is_closed:
+                    raise serializers.ValidationError(closed_message or "The facility is closed during this time.")
+                
+                # Find available bay (Coaching Bay first, then Simulator Bay) using locking
+                # Order by is_coaching_bay DESC so we try coaching bays first, then by bay_number
+                candidate_sims_qs = Simulator.objects.filter(is_active=True).order_by('-is_coaching_bay', 'bay_number')
                 if location_id:
-                    coaching_bay_qs = coaching_bay_qs.filter(location_id=location_id)
-                coaching_bays = list(coaching_bay_qs)
-
+                    candidate_sims_qs = candidate_sims_qs.filter(location_id=location_id)
+                
                 assigned_simulator = None
-                
-                # Check coaching bays
-                for bay in coaching_bays:
-                    bay_has_booking = Booking.objects.filter(
-                        simulator=bay,
-                        start_time__lt=end_time,
-                        end_time__gt=start_time,
-                        status__in=['confirmed', 'completed']
-                    ).exists()
+                # Lock the simulator rows to prevent race conditions during bay assignment
+                with transaction.atomic():
+                    # We use select_for_update() to ensure serial access to these bay records
+                    locked_sims = list(candidate_sims_qs.select_for_update())
                     
-                    bay_has_temp = TempBooking.objects.filter(
-                        simulator=bay,
-                        start_time__lt=end_time,
-                        end_time__gt=start_time,
-                        status='reserved',
-                        expires_at__gt=timezone.now()
-                    ).exists()
-                    
-                    if not bay_has_booking and not bay_has_temp:
-                         assigned_simulator = bay
-                         break
+                    for simulator in locked_sims:
+                        # Use our atomic check (no need for further locking within the check as we have the rows locked)
+                        if self._check_simulator_availability_atomic(simulator, start_time, end_time, use_locking=False):
+                            assigned_simulator = simulator
+                            break
                 
                 if not assigned_simulator:
-                    # Fallback to Simulator Bays
-                    simulator_bays_qs = Simulator.objects.filter(is_active=True, is_coaching_bay=False)
-                    if location_id:
-                        simulator_bays_qs = simulator_bays_qs.filter(location_id=location_id)
-                    
-                    # Exclusion logic
-                    conflicting_sims = Booking.objects.filter(
-                        simulator__in=simulator_bays_qs,
-                        start_time__lt=end_time,
-                        end_time__gt=start_time,
-                        status__in=['confirmed', 'completed']
-                    ).values_list('simulator_id', flat=True)
-                    
-                    conflicting_temps = TempBooking.objects.filter(
-                        simulator__in=simulator_bays_qs,
-                        start_time__lt=end_time,
-                        end_time__gt=start_time,
-                        status='reserved',
-                        expires_at__gt=timezone.now()
-                    ).values_list('simulator_id', flat=True)
-                    
-                    assigned_simulator = simulator_bays_qs.exclude(id__in=conflicting_sims).exclude(id__in=conflicting_temps).first()
-                
-                if not assigned_simulator:
-                    raise serializers.ValidationError("No bay available for this coaching session (Coaching bays and Simulators are full).")
+                    raise serializers.ValidationError("No bay available for this coaching session (Coaching bays and Simulators are full for this time slot).")
 
                 purchase = self._consume_package_session(package, use_organization=use_organization_package, user=target_user)
                 # Check if package is TPI assessment
@@ -1612,24 +1637,89 @@ class BookingViewSet(viewsets.ModelViewSet):
         validated = serializer.validated_data
         
         with transaction.atomic():
+            # Get consistent location_id
+            loc_id = booking.location_id or get_location_id_from_request(request)
+            
+            # Lock the coach and ALL simulator rows at this location to prevent concurrent moves/bookings
+            if booking.booking_type == 'coaching' and validated.get('coach'):
+                User.objects.select_for_update().filter(id=validated['coach'].id).exists()
+            
+            active_sims_qs = Simulator.objects.filter(is_active=True)
+            if loc_id:
+                active_sims_qs = active_sims_qs.filter(location_id=loc_id)
+            # Consuming the queryset with list() ensures the lock is actually acquired on all rows
+            list(active_sims_qs.select_for_update())
+
+            # Now perform the logical checks
+            if booking.booking_type == 'simulator':
+                assigned_simulator = validated.get('simulator')
+                if not assigned_simulator:
+                    assigned_simulator = self._find_optimal_simulator(validated['start_time'], validated['end_time'])
+                
+                if not assigned_simulator:
+                    raise serializers.ValidationError("No simulators available for this time slot")
+                
+                # Double check availability (including special events and facility closures)
+                if not self._check_simulator_availability_atomic(
+                    assigned_simulator, validated['start_time'], validated['end_time'],
+                    exclude_booking_id=booking.id
+                ):
+                    raise serializers.ValidationError("The selected simulator slot is no longer available.")
+                
+                # Special Event and Closed Day checks are redundant here since _check_simulator_availability_atomic handles them,
+                # but we already checked them in the Serializer.
+                
+                booking.simulator = assigned_simulator
+                update_fields.append('simulator')
+            
+            elif booking.booking_type == 'coaching':
+                target_coach = validated.get('coach') or booking.coach
+                if not target_coach:
+                    raise serializers.ValidationError("Coach is required for coaching sessions.")
+                
+                # Standard coaching bay assignment logic
+                coaching_bays = Simulator.objects.filter(is_active=True, is_coaching_bay=True).order_by('bay_number')
+                if loc_id:
+                    coaching_bays = coaching_bays.filter(location_id=loc_id)
+                
+                assigned_bay = None
+                for bay in coaching_bays:
+                    if self._check_simulator_availability_atomic(bay, validated['start_time'], validated['end_time'], exclude_booking_id=booking.id):
+                        assigned_bay = bay
+                        break
+                
+                if not assigned_bay:
+                    regular_sims = Simulator.objects.filter(is_active=True, is_coaching_bay=False).order_by('bay_number')
+                    if loc_id:
+                        regular_sims = regular_sims.filter(location_id=loc_id)
+                    
+                    for bay in regular_sims:
+                        if self._check_simulator_availability_atomic(bay, validated['start_time'], validated['end_time'], exclude_booking_id=booking.id):
+                            assigned_bay = bay
+                            break
+                
+                if not assigned_bay:
+                    raise serializers.ValidationError("No bays available for this coaching session at the new time.")
+                
+                # Check coach availability (already locked above)
+                coach_conflict = Booking.objects.filter(
+                    coach=target_coach,
+                    start_time__lt=validated['end_time'],
+                    end_time__gt=validated['start_time'],
+                    status__in=['confirmed', 'completed']
+                ).exclude(id=booking.id).exists()
+                
+                if coach_conflict:
+                    raise serializers.ValidationError("The coach is already booked for this new time.")
+                
+                booking.coach = target_coach
+                booking.simulator = assigned_bay
+                update_fields.extend(['coach', 'simulator'])
+
             booking.start_time = validated['start_time']
             booking.end_time = validated['end_time']
             booking.duration_minutes = validated.get('duration_minutes', booking.duration_minutes)
             
-            update_fields = ['start_time', 'end_time', 'duration_minutes', 'updated_at']
-            if booking.booking_type == 'simulator':
-                assigned_simulator = validated.get('simulator')
-                if not assigned_simulator:
-                    assigned_simulator = self._find_optimal_simulator(booking.start_time, booking.end_time)
-                if not assigned_simulator:
-                    raise serializers.ValidationError("No simulators available for this time slot")
-                booking.simulator = assigned_simulator
-                update_fields.append('simulator')
-            elif booking.booking_type == 'coaching':
-                if validated.get('coach'):
-                    booking.coach = validated['coach']
-                    update_fields.append('coach')
-
             if booking.booking_type == 'simulator' and not booking.simulator_credit_redemption_id:
                 booking.total_price = self._calculate_simulator_price(
                     booking.simulator,
@@ -1925,6 +2015,16 @@ class BookingViewSet(viewsets.ModelViewSet):
                         if current_time >= avail_end:
                             break
                 
+                # Pre-fetch special events for this day to avoid thousands of queries
+                from special_events.models import SpecialEvent
+                location_id = get_location_id_from_request(request)
+                day_events = SpecialEvent.objects.filter(is_active=True)
+                if location_id:
+                    day_events = day_events.filter(location_id=location_id)
+                # Filter events that could potentially occur on this day
+                # (Simple check to reduce the list)
+                day_events = [e for e in day_events if booking_date in e.get_occurrences(start_date=booking_date, end_date=booking_date)]
+
                 while current_time < avail_end:
                     slot_start = timezone.make_aware(current_time)
                     # Skip slots that have already passed (for today's bookings)
@@ -1956,17 +2056,29 @@ class BookingViewSet(viewsets.ModelViewSet):
                         expires_at__gt=timezone.now()
                     )
                     
-                    # Skip special event conflict check as per requirement
-                    # has_special_event, event_title = self._check_special_event_conflict(slot_start)
+                    # Check for special event conflict
+                    has_special_event = False
+                    for event in day_events:
+                        if event.conflicts_with_range(slot_start, slot_end):
+                            has_special_event = True
+                            break
                     
                     # Check if facility is closed
                     from admin_panel.models import ClosedDay
                     location_id = get_location_id_from_request(request)
                     is_closed, closed_message = ClosedDay.check_if_closed(slot_start, location_id=location_id)
                     
-                    if not conflicting_bookings.exists() and not conflicting_temp_bookings.exists() and not is_closed:
+                    if not conflicting_bookings.exists() and not conflicting_temp_bookings.exists() and not is_closed and not has_special_event:
                         slot_start_str = slot_start.isoformat()
                         existing_slot = next((s for s in available_slots if s['start_time'] == slot_start_str), None)
+                        
+                        # Calculate effective availability end time (min of window end and next special event start)
+                        effective_avail_end = availability_end_datetime
+                        for event in day_events:
+                            # Convert event start to datetime on this day
+                            event_start_dt = timezone.make_aware(datetime.combine(booking_date, event.start_time))
+                            if event_start_dt > slot_start and event_start_dt < effective_avail_end:
+                                effective_avail_end = event_start_dt
                         
                         if not existing_slot:
                             slot_payload = {
@@ -1974,7 +2086,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                                 'start_time': slot_start_str,
                                 'end_time': slot_end.isoformat(),
                                 'duration_minutes': duration_minutes,
-                                'availability_end_time': availability_end_datetime.isoformat(),
+                                'availability_end_time': effective_avail_end.isoformat(),
                                 'fits_duration': True, # All generated slots now fit
                                 'bay_count': 1,
                             }
@@ -1992,8 +2104,8 @@ class BookingViewSet(viewsets.ModelViewSet):
                             available_slots.append(slot_payload)
                         else:
                             # Update existing slot details
-                            if availability_end_datetime.isoformat() > existing_slot.get('availability_end_time', ''):
-                                existing_slot['availability_end_time'] = availability_end_datetime.isoformat()
+                            if effective_avail_end.isoformat() > existing_slot.get('availability_end_time', ''):
+                                existing_slot['availability_end_time'] = effective_avail_end.isoformat()
                             # fits_duration is already True if it's there
                             existing_slot['fits_duration'] = True
                             # We keep the end_time as max of all simulators
@@ -2140,242 +2252,258 @@ class BookingViewSet(viewsets.ModelViewSet):
         else:
             duration_minutes = selected_package.session_duration_minutes
         
-        # Get day of week (0=Monday, 6=Sunday)
+        # Get ALL active simulators for this location
+        all_simulators = Simulator.objects.filter(is_active=True)
+        if location_id:
+            all_simulators = all_simulators.filter(location_id=location_id)
+        all_simulators = list(all_simulators)
+        
+        coaching_bays = [s for s in all_simulators if s.is_coaching_bay]
+        simulator_bays = [s for s in all_simulators if not s.is_coaching_bay]
+        
+        if not coaching_bays and not simulator_bays:
+            return Response({
+                'available_slots': [],
+                'message': 'No bays available at this location'
+            })
+
+        # Prefetch ALL relevant bookings and temp bookings for this date and location
+        # This eliminates thousands of database queries in the loops below
+        relevant_bookings = Booking.objects.filter(
+            start_time__date=booking_date,
+            status__in=['confirmed', 'completed']
+        )
+        if location_id:
+            relevant_bookings = relevant_bookings.filter(location_id=location_id)
+        relevant_bookings = list(relevant_bookings.select_related('simulator', 'coach'))
+
+        relevant_temps = TempBooking.objects.filter(
+            start_time__date=booking_date,
+            status='reserved',
+            expires_at__gt=timezone.now()
+        )
+        if location_id:
+            relevant_temps = relevant_temps.filter(location_id=location_id)
+        relevant_temps = list(relevant_temps.select_related('simulator'))
+
+        # Prefetch closed days
+        from admin_panel.models import ClosedDay
+        active_closures = ClosedDay.objects.filter(is_active=True)
+        if location_id:
+            active_closures = active_closures.filter(Q(location_id=location_id) | Q(location_id__isnull=True))
+        active_closures = list(active_closures)
+
+        def is_facility_closed(check_time):
+            for closure in active_closures:
+                is_closed, _ = closure.is_datetime_closed(check_time)
+                if is_closed:
+                    return True
+            return False
+
+        # Pre-process coach availabilities into a map for fast lookup
+        availability_by_staff = {}
         day_of_week = booking_date.weekday()
         
-        # Generate time slots based on staff availability for this day of week
-        slot_interval = 30  # 30-minute intervals for slot generation
-        available_slots_map = {}
-        
-        # Get weekly recurring staff availability entries for the requested day, scoped to selected coaches
-        staff_availabilities = StaffAvailability.objects.filter(
-            day_of_week=day_of_week,
-            staff__in=coaches
-        ).select_related('staff')
-        
-        # Get day-specific availability entries for the requested date, scoped to selected coaches
-        day_specific_availabilities = StaffDayAvailability.objects.filter(
-            date=booking_date,
-            staff__in=coaches
-        ).select_related('staff')
-        
-        availability_by_staff = {}
-        
-        # First, get staff IDs that have day-specific availability for this date
-        # Day-specific availability takes precedence over weekly recurring
-        staff_with_day_specific = set(day_specific_availabilities.values_list('staff_id', flat=True))
-        
-        # Process day-specific availability first (takes precedence)
-        for day_avail in day_specific_availabilities:
-            staff_id = day_avail.staff_id
-            if staff_id not in availability_by_staff:
-                availability_by_staff[staff_id] = []
-            availability_by_staff[staff_id].append({
-                'type': 'day_specific',
-                'start_time': day_avail.start_time,
-                'end_time': day_avail.end_time,
-                'staff': day_avail.staff
-            })
-        
-        # Process weekly recurring availability only for staff without day-specific availability
-        for availability in staff_availabilities:
-            staff_id = availability.staff_id
-            # Only add weekly availability if this staff doesn't have day-specific availability
-            if staff_id not in staff_with_day_specific:
-                availability_by_staff.setdefault(staff_id, []).append({
-                    'type': 'weekly',
-                    'start_time': availability.start_time,
-                    'end_time': availability.end_time,
-                    'staff': availability.staff
-                })
-        
         for coach in coaches:
-            coach_availabilities = availability_by_staff.get(coach.id, [])
-            if not coach_availabilities:
+            # First check for specific date availability
+            availabilities = list(StaffDayAvailability.objects.filter(
+                staff=coach,
+                date=booking_date
+            ).values('start_time', 'end_time'))
+            
+            if not availabilities:
+                # Fall back to recurring availability
+                availabilities = list(StaffAvailability.objects.filter(
+                    staff=coach,
+                    day_of_week=day_of_week
+                ).values('start_time', 'end_time'))
+            
+            if availabilities:
+                availability_by_staff[coach.id] = availabilities
+
+        # We will iterate through all possible 30-minute slots of the day
+        # and for each slot, determine which coaches are available and which bays are free.
+        
+        # Determine the earliest start and latest end across all coaches to bound the search
+        min_start = None
+        max_end_dt = None
+        for staff_id, avail_list in availability_by_staff.items():
+            for a in avail_list:
+                s_time = a['start_time']
+                e_time = a['end_time']
+                
+                if min_start is None or s_time < min_start:
+                    min_start = s_time
+                
+                # Create a datetime for the end time to handle comparison across midnight
+                current_e_dt = datetime.combine(booking_date, e_time)
+                if e_time <= s_time: # Midnight or crossover
+                    current_e_dt += timedelta(days=1)
+                
+                if max_end_dt is None or current_e_dt > max_end_dt:
+                    max_end_dt = current_e_dt
+        
+        if not min_start:
+            return Response({'available_slots': [], 'message': 'No coach availability found'})
+
+        current_slot_start_naive = datetime.combine(booking_date, min_start)
+        day_end_naive = max_end_dt
+        
+        slot_interval = 30
+        available_slots_map = {}
+        now = timezone.now()
+        
+        # Prefetch special events for this day
+        from special_events.models import SpecialEvent
+        day_events = SpecialEvent.objects.filter(is_active=True)
+        if location_id:
+            day_events = day_events.filter(location_id=location_id)
+        # Filter events that could potentially occur on this day
+        day_events = [e for e in day_events if booking_date in e.get_occurrences(start_date=booking_date, end_date=booking_date)]
+
+        while current_slot_start_naive < day_end_naive:
+            slot_start = timezone.make_aware(current_slot_start_naive)
+            
+            # Skip past slots
+            if slot_start < now:
+                current_slot_start_naive += timedelta(minutes=slot_interval)
                 continue
             
-            coach_name = f"{coach.first_name} {coach.last_name}".strip() or coach.username
+            slot_end = slot_start + timedelta(minutes=duration_minutes)
             
-            # Process all availability entries (both weekly and day-specific)
-            for avail_entry in coach_availabilities:
-                avail_start = datetime.combine(booking_date, avail_entry['start_time'])
-                avail_end = datetime.combine(booking_date, avail_entry['end_time'])
-                
-                if avail_end <= avail_start:
-                    if avail_entry['end_time'] < avail_entry['start_time']:
-                        avail_end = avail_end + timedelta(days=1)
-                    else:
-                        continue
-                
-                current_time = avail_start
-                now = timezone.now()
-                
-                # If booking is for today, adjust start time to skip past slots
-                if booking_date == now.date():
-                    # Round current time up to next 30-minute interval
-                    current_minute = now.minute
-                    current_second = now.second
-                    current_microsecond = now.microsecond
-                    
-                    # Calculate minutes to add to round up to next 30-minute slot
-                    minutes_to_add = 30 - (current_minute % 30)
-                    if minutes_to_add == 30 and current_second == 0 and current_microsecond == 0:
-                        minutes_to_add = 0  # Already on a 30-minute boundary
-                    
-                    # Calculate the next valid slot start time
-                    next_slot_time = now + timedelta(minutes=minutes_to_add)
-                    next_slot_time = next_slot_time.replace(second=0, microsecond=0)
-                    
-                    # If the next slot time is after availability start, use it
-                    next_slot_naive = next_slot_time.replace(tzinfo=None)
-                    if next_slot_naive > current_time:
-                        current_time = next_slot_naive
-                        # If we've passed the availability window, skip to next availability
-                        if current_time >= avail_end:
-                            continue
-                
-                while current_time < avail_end:
-                    slot_start = timezone.make_aware(current_time)
-                    # Skip slots that have already passed (for today's bookings)
-                    if booking_date == now.date() and slot_start < now:
-                        current_time += timedelta(minutes=slot_interval)
-                        continue
-                    
-                    slot_end = slot_start + timedelta(minutes=duration_minutes)
-                    availability_end_datetime = timezone.make_aware(avail_end)
-                    
-                    # ONLY include slots that fully fit within the availability window
-                    if slot_end > availability_end_datetime:
-                        # Since we generate slots in increasing order, we can break here for this window
+            # Check if facility is closed
+            if is_facility_closed(slot_start):
+                current_slot_start_naive += timedelta(minutes=slot_interval)
+                continue
+
+            # Check for special event conflict
+            has_special_event = False
+            for event in day_events:
+                if event.conflicts_with_range(slot_start, slot_end):
+                    has_special_event = True
+                    break
+            
+            if has_special_event:
+                current_slot_start_naive += timedelta(minutes=slot_interval)
+                continue
+
+            # 1. Find all free bays for this slot
+            free_coaching_bays = []
+            for bay in coaching_bays:
+                has_conflict = False
+                # Check bookings
+                for b in relevant_bookings:
+                    if b.simulator_id == bay.id and b.start_time < slot_end and b.end_time > slot_start:
+                        has_conflict = True
                         break
+                if has_conflict: continue
+                # Check temps
+                for t in relevant_temps:
+                    if t.simulator_id == bay.id and t.start_time < slot_end and t.end_time > slot_start:
+                        has_conflict = True
+                        break
+                if not has_conflict:
+                    free_coaching_bays.append(bay)
+            
+            free_simulator_bays = []
+            for bay in simulator_bays:
+                has_conflict = False
+                for b in relevant_bookings:
+                    if b.simulator_id == bay.id and b.start_time < slot_end and b.end_time > slot_start:
+                        has_conflict = True
+                        break
+                if has_conflict: continue
+                for t in relevant_temps:
+                    if t.simulator_id == bay.id and t.start_time < slot_end and t.end_time > slot_start:
+                        has_conflict = True
+                        break
+                if not has_conflict:
+                    free_simulator_bays.append(bay)
+            
+            total_free_bays = free_coaching_bays + free_simulator_bays
+            if not total_free_bays:
+                current_slot_start_naive += timedelta(minutes=slot_interval)
+                continue
+
+            # 2. Find all coaches available for this slot
+            slot_coaches = []
+            for coach in coaches:
+                # Check if coach has shift at this time
+                is_on_shift = False
+                shift_end_time = None
+                coach_availabilities = availability_by_staff.get(coach.id, [])
+                for a in coach_availabilities:
+                    a_start = timezone.make_aware(datetime.combine(booking_date, a['start_time']))
+                    a_end = timezone.make_aware(datetime.combine(booking_date, a['end_time']))
+                    if a['end_time'] <= a['start_time']: # Handle midnight crossover
+                         a_end += timedelta(days=1)
                     
-                    # Check conflicts for coach
-                    conflicting_bookings = Booking.objects.filter(
-                        coach=coach,
-                        start_time__lt=slot_end,
-                        end_time__gt=slot_start,
-                        status__in=['confirmed', 'completed']
-                    )
-                    
-                    # Skip special event conflict check as per requirement
-                    # has_special_event, event_title = self._check_special_event_conflict(slot_start)
-                    
-                    # Check if facility is closed
-                    from admin_panel.models import ClosedDay
-                    location_id = get_location_id_from_request(request)
-                    is_closed, closed_message = ClosedDay.check_if_closed(slot_start, location_id=location_id)
-                    
-                    if conflicting_bookings.exists() or is_closed:
-                        current_time += timedelta(minutes=slot_interval)
-                        continue
-                    
-                    # Check conflicts for coaching bay
-                    # Logic: 
-                    # 1. Check if ANY coaching bay is available
-                    # 2. If NO coaching bay available, check if ANY simulator bay is available (fallback)
-                    # 3. If neither, slot is unavailable
-                    
-                    available_coaching_bay = None
-                    assigned_bay_number = None
-                    
-                    # 1. Check all coaching bays
-                    for bay in coaching_bays:
-                        # Check booking conflicts
-                        bay_has_booking = Booking.objects.filter(
-                            simulator=bay,
-                            start_time__lt=slot_end,
-                            end_time__gt=slot_start,
-                            status__in=['confirmed', 'completed']
-                        ).exists()
-                        
-                        # Check temp booking conflicts
-                        bay_has_temp = TempBooking.objects.filter(
-                            simulator=bay,
-                            start_time__lt=slot_end,
-                            end_time__gt=slot_start,
-                            status='reserved',
-                            expires_at__gt=timezone.now()
-                        ).exists()
-                        
-                        if not bay_has_booking and not bay_has_temp:
-                            available_coaching_bay = bay
-                            break
-                    
-                    if available_coaching_bay:
-                        assigned_bay_number = available_coaching_bay.bay_number
-                    else:
-                        # 2. No coaching bay available, try simulator bays (fallback)
-                        simulator_bays_qs = Simulator.objects.filter(
-                            is_active=True,
-                            is_coaching_bay=False
-                        )
-                        if location_id:
-                            simulator_bays_qs = simulator_bays_qs.filter(location_id=location_id)
-                            
-                        # Find first available simulator bay
-                        # Exclude those with conflicts
-                        conflicting_sim_ids = Booking.objects.filter(
-                            simulator__in=simulator_bays_qs,
-                            start_time__lt=slot_end,
-                            end_time__gt=slot_start,
-                            status__in=['confirmed', 'completed']
-                        ).values_list('simulator_id', flat=True)
-                        
-                        conflicting_temp_ids = TempBooking.objects.filter(
-                            simulator__in=simulator_bays_qs,
-                            start_time__lt=slot_end,
-                            end_time__gt=slot_start,
-                            status='reserved',
-                            expires_at__gt=timezone.now()
-                        ).values_list('simulator_id', flat=True)
-                        
-                        available_simulator_bay = simulator_bays_qs.exclude(
-                            id__in=conflicting_sim_ids
-                        ).exclude(
-                            id__in=conflicting_temp_ids
-                        ).first()
-                        
-                        if available_simulator_bay:
-                            assigned_bay_number = available_simulator_bay.bay_number
-                        else:
-                            # 3. Neither available
-                            current_time += timedelta(minutes=slot_interval)
-                            continue
-                    
-                    slot_key = slot_start.isoformat()
-                    slot_entry = available_slots_map.get(slot_key)
-                    
-                    if not slot_entry:
-                        slot_entry = {
-                            'start_time': slot_key,
-                            'end_time': slot_end.isoformat(),
-                            'duration_minutes': duration_minutes,
-                            'availability_end_time': availability_end_datetime.isoformat(),
-                            'fits_duration': True,
-                            'available_coaches': []
-                        }
-                        available_slots_map[slot_key] = slot_entry
-                    else:
-                        # Keep the furthest availability end time
-                        if availability_end_datetime.isoformat() > slot_entry['availability_end_time']:
-                            slot_entry['availability_end_time'] = availability_end_datetime.isoformat()
-                        
-                        # fits_duration is already True if it's there
-                        slot_entry['fits_duration'] = True
-                        
-                        # We keep the end_time as max of all coaches
-                        if slot_end.isoformat() > slot_entry['end_time']:
-                            slot_entry['end_time'] = slot_end.isoformat()
-                    
-                    if coach.id not in [c['id'] for c in slot_entry['available_coaches']]:
-                        slot_entry['available_coaches'].append({
-                            'id': coach.id,
-                            'name': coach_name,
-                            'email': coach.email,
-                            'assigned_bay': assigned_bay_number
-                        })
-                    
-                    current_time += timedelta(minutes=slot_interval)
+                    if a_start <= slot_start and a_end >= slot_end:
+                        is_on_shift = True
+                        shift_end_time = a_end
+                        break
+                
+                if not is_on_shift:
+                    continue
+                
+                # Check if coach is already booked
+                is_booked = False
+                for b in relevant_bookings:
+                    if b.coach_id == coach.id and b.start_time < slot_end and b.end_time > slot_start:
+                        is_booked = True
+                        break
+                
+                if is_booked:
+                    continue
+                
+                slot_coaches.append((coach, shift_end_time))
+            
+            if not slot_coaches:
+                current_slot_start_naive += timedelta(minutes=slot_interval)
+                continue
+
+            # 3. Associate coaches with bays
+            # We can have at most min(len(slot_coaches), len(total_free_bays)) bookings
+            # We assign coaching bays first, then simulators
+            assigned_count = 0
+            slot_key = slot_start.isoformat()
+            
+            for coach, shift_end in slot_coaches:
+                if assigned_count >= len(total_free_bays):
+                    break
+                
+                # Assign a bay for metadata
+                bay_to_assign = None
+                if assigned_count < len(free_coaching_bays):
+                    bay_to_assign = free_coaching_bays[assigned_count]
+                else:
+                    bay_to_assign = free_simulator_bays[assigned_count - len(free_coaching_bays)]
+                
+                if slot_key not in available_slots_map:
+                    available_slots_map[slot_key] = {
+                        'start_time': slot_key,
+                        'end_time': slot_end.isoformat(),
+                        'duration_minutes': duration_minutes,
+                        'availability_end_time': shift_end.isoformat(),
+                        'fits_duration': True,
+                        'available_coaches': []
+                    }
+                
+                slot_entry = available_slots_map[slot_key]
+                if shift_end.isoformat() > slot_entry['availability_end_time']:
+                    slot_entry['availability_end_time'] = shift_end.isoformat()
+                
+                coach_name = f"{coach.first_name} {coach.last_name}".strip() or coach.username
+                slot_entry['available_coaches'].append({
+                    'id': coach.id,
+                    'name': coach_name,
+                    'email': coach.email,
+                    'assigned_bay': bay_to_assign.bay_number
+                })
+                
+                assigned_count += 1
+
+            current_slot_start_naive += timedelta(minutes=slot_interval)
         
         available_slots = sorted(available_slots_map.values(), key=lambda x: x['start_time'])
         
@@ -2470,17 +2598,56 @@ class CreateTempBookingView(APIView):
         # Get location_id for temp booking
         location_id = get_location_id_from_request(request)
         
-        # Create temp booking
+        # Create temp booking with locking
         try:
-            temp_booking = TempBooking.objects.create(
-                simulator=simulator,
-                location_id=location_id,
-                buyer_phone=buyer_phone,
-                start_time=start_time_dt,
-                end_time=end_time_dt,
-                duration_minutes=int(duration_minutes),
-                total_price=Decimal(str(total_price))
-            )
+            with transaction.atomic():
+                # Lock the simulator row to prevent concurrent assignment
+                locked_simulator = Simulator.objects.select_for_update().get(id=simulator_id, is_active=True)
+                
+                # Double-check availability while holding the lock
+                booking_query = Booking.objects.filter(
+                    simulator=locked_simulator,
+                    start_time__lt=end_time_dt,
+                    end_time__gt=start_time_dt,
+                    status__in=['confirmed', 'completed']
+                )
+                
+                temp_booking_query = TempBooking.objects.filter(
+                    simulator=locked_simulator,
+                    start_time__lt=end_time_dt,
+                    end_time__gt=start_time_dt,
+                    status='reserved',
+                    expires_at__gt=timezone.now()
+                )
+                
+                if booking_query.exists() or temp_booking_query.exists():
+                     return Response(
+                        {'error': 'This slot is no longer available. Please choose another time.'},
+                        status=status.HTTP_409_CONFLICT
+                    )
+
+                # Check for special event conflict
+                from special_events.models import SpecialEvent
+                active_events = SpecialEvent.objects.filter(is_active=True)
+                if location_id:
+                    active_events = active_events.filter(location_id=location_id)
+                
+                for event in active_events:
+                    if event.conflicts_with_range(start_time_dt, end_time_dt):
+                        return Response(
+                            {'error': f'This slot conflicts with a special event: {event.title}.'},
+                            status=status.HTTP_409_CONFLICT
+                        )
+
+                temp_booking = TempBooking.objects.create(
+                    simulator=locked_simulator,
+                    location_id=location_id,
+                    buyer_phone=buyer_phone,
+                    start_time=start_time_dt,
+                    end_time=end_time_dt,
+                    duration_minutes=int(duration_minutes),
+                    total_price=Decimal(str(total_price))
+                )
             
             logger.info(f"Temp booking created: temp_id={temp_booking.temp_id}, buyer={buyer_phone}, simulator={simulator_id}")
             
@@ -3156,91 +3323,137 @@ class GuestBookingCreateView(APIView):
                     status=status.HTTP_404_NOT_FOUND
                 )
         
-        # Check for booking conflicts
-        from .models import Booking
-        conflicting_bookings = Booking.objects.filter(
-            Q(start_time__lt=end_time, end_time__gt=start_time),
-            status__in=['confirmed', 'pending']
-        )
-        
-        if coach:
-            conflicting_bookings = conflicting_bookings.filter(coach=coach)
-        else:
-            # Check if any coach assigned to package has conflict
-            package_coaches = package.staff_members.filter(role__in=['staff', 'admin'], is_active=True)
-            if location_id:
-                package_coaches = package_coaches.filter(ghl_location_id=location_id)
-            conflicting_bookings = conflicting_bookings.filter(coach__in=package_coaches)
-        
-        # Check coaching bay availability
-        from simulators.models import Simulator
-        coaching_bay = Simulator.objects.filter(is_coaching_bay=True, is_active=True).first()
-        if location_id:
-            coaching_bay = Simulator.objects.filter(
-                is_coaching_bay=True, is_active=True, location_id=location_id
-            ).first()
-        
-        if not coaching_bay:
-            return Response(
-                {'error': 'Coaching bay not available.'},
-                status=status.HTTP_400_BAD_REQUEST
+        # ATOMIC CONCURRENCY CHECK
+        with transaction.atomic():
+            # Get consistent location_id
+            target_loc_id = location_id or user.ghl_location_id
+            
+            # Lock the coach row
+            if coach:
+                User.objects.select_for_update().filter(id=coach.id).exists()
+            
+            # Lock ALL simulator rows at this location
+            all_sims = Simulator.objects.filter(is_active=True)
+            if target_loc_id:
+                all_sims = all_sims.filter(location_id=target_loc_id)
+            list(all_sims.select_for_update())
+
+            # 1. Facility & Special Event Checks
+            from admin_panel.models import ClosedDay
+            from special_events.models import SpecialEvent
+            
+            is_closed, closure_msg = ClosedDay.check_if_closed(start_time, location_id=target_loc_id)
+            if is_closed:
+                return Response({'error': closure_msg or "Facility is closed."}, status=status.HTTP_400_BAD_REQUEST)
+            
+            active_events = SpecialEvent.objects.filter(is_active=True)
+            if target_loc_id:
+                active_events = active_events.filter(location_id=target_loc_id)
+            for event in active_events:
+                if event.conflicts_with_range(start_time, end_time):
+                    return Response({'error': f"Slot conflicts with special event: {event.title}"}, status=status.HTTP_400_BAD_REQUEST)
+
+            # 2. Check Coach Conflict
+            coach_conflict_qs = Booking.objects.filter(
+                start_time__lt=end_time,
+                end_time__gt=start_time,
+                status__in=['confirmed', 'completed']
             )
-        
-        # Check if coaching bay is booked
-        bay_conflicts = Booking.objects.filter(
-            simulator=coaching_bay,
-            start_time__lt=end_time,
-            end_time__gt=start_time,
-            status__in=['confirmed', 'pending']
-        )
-        if bay_conflicts.exists():
-            return Response(
-                {'error': 'This time slot is already booked.'},
-                status=status.HTTP_400_BAD_REQUEST
+            if coach:
+                coach_conflict = coach_conflict_qs.filter(coach=coach).exists()
+            else:
+                package_coaches = package.staff_members.filter(role__in=['staff', 'admin'], is_active=True)
+                if target_loc_id:
+                    package_coaches = package_coaches.filter(ghl_location_id=target_loc_id)
+                coach_conflict = coach_conflict_qs.filter(coach__in=package_coaches).exists()
+
+            if coach_conflict:
+                return Response(
+                    {'error': 'Selected coach is already booked for this time slot.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            # 3. Find Available Bay (Try Coaching Bay first, then Fallback)
+            coaching_bays = Simulator.objects.filter(is_active=True, is_coaching_bay=True).order_by('bay_number')
+            simulator_bays = Simulator.objects.filter(is_active=True, is_coaching_bay=False).order_by('bay_number')
+            if target_loc_id:
+                coaching_bays = coaching_bays.filter(location_id=target_loc_id)
+                simulator_bays = simulator_bays.filter(location_id=target_loc_id)
+
+            assigned_bay = None
+            
+            # Helper to check bay conflicts (Bookings + TempBookings)
+            def is_bay_free(bay):
+                has_booking = Booking.objects.filter(
+                    simulator=bay,
+                    start_time__lt=end_time,
+                    end_time__gt=start_time,
+                    status__in=['confirmed', 'completed']
+                ).exists()
+                if has_booking: return False
+                
+                has_temp = TempBooking.objects.filter(
+                    simulator=bay,
+                    start_time__lt=end_time,
+                    end_time__gt=start_time,
+                    status='reserved',
+                    expires_at__gt=timezone.now()
+                ).exists()
+                return not has_temp
+
+            for bay in coaching_bays:
+                if is_bay_free(bay):
+                    assigned_bay = bay
+                    break
+            
+            if not assigned_bay:
+                for bay in simulator_bays:
+                    if is_bay_free(bay):
+                        assigned_bay = bay
+                        break
+            
+            if not assigned_bay:
+                return Response(
+                    {'error': 'No bays available for this coaching session (Coaching bays and Simulators are full).'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Consume session from purchase
+            if purchase.sessions_remaining <= 0:
+                return Response(
+                    {'error': 'No sessions remaining in this package.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            purchase.sessions_remaining -= 1
+            purchase.save(update_fields=['sessions_remaining', 'updated_at'])
+
+            # Calculate price
+            from decimal import Decimal, ROUND_HALF_UP
+            if package.session_count:
+                per_session = (Decimal(str(package.price)) / Decimal(str(package.session_count))).quantize(
+                    Decimal('0.01'),
+                    rounding=ROUND_HALF_UP
+                )
+            else:
+                per_session = Decimal(str(package.price)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+            # Create booking using the assigned_bay from our atomic check
+            booking = Booking.objects.create(
+                client=user,
+                location_id=target_loc_id,
+                booking_type='coaching',
+                coaching_package=package,
+                coach=coach,
+                simulator=assigned_bay,
+                start_time=start_time,
+                end_time=end_time,
+                duration_minutes=package.session_duration_minutes,
+                total_price=per_session,
+                package_purchase=purchase,
+                is_tpi_assessment=True,
+                status='confirmed'
             )
-        
-        if conflicting_bookings.exists():
-            return Response(
-                {'error': 'This time slot is already booked for the selected coach.'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Calculate price
-        from decimal import Decimal, ROUND_HALF_UP
-        if package.session_count:
-            per_session = (Decimal(str(package.price)) / Decimal(str(package.session_count))).quantize(
-                Decimal('0.01'),
-                rounding=ROUND_HALF_UP
-            )
-        else:
-            per_session = Decimal(str(package.price)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-        
-        # Consume session from purchase
-        if purchase.sessions_remaining <= 0:
-            return Response(
-                {'error': 'No sessions remaining in this package.'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        purchase.sessions_remaining -= 1
-        purchase.save(update_fields=['sessions_remaining', 'updated_at'])
-        
-        # Create booking
-        booking = Booking.objects.create(
-            client=user,
-            location_id=location_id,
-            booking_type='coaching',
-            coaching_package=package,
-            coach=coach,
-            simulator=coaching_bay,
-            start_time=start_time,
-            end_time=end_time,
-            duration_minutes=package.session_duration_minutes,
-            total_price=per_session,
-            package_purchase=purchase,
-            is_tpi_assessment=True,
-            status='confirmed'
-        )
         
         logger.info(f"Guest coaching booking created: id={booking.id}, location_id={location_id}, client={user.phone}")
         

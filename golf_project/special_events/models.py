@@ -193,6 +193,39 @@ class SpecialEvent(models.Model):
         else:
             # Normal case
             return event_start <= check_time < event_end
+
+    def conflicts_with_range(self, start_datetime, end_datetime):
+        """
+        Check if a given datetime range conflicts with this event.
+        Returns True if any part of the range overlaps with any occurrence of this event.
+        """
+        # Get start and end dates to check occurrences
+        start_date = start_datetime.date()
+        end_date = end_datetime.date()
+        
+        # Get all occurrences in this range
+        occurrences = self.get_occurrences(
+            start_date=start_date,
+            end_date=end_date
+        )
+        
+        if not occurrences:
+            return False
+            
+        for occ_date in occurrences:
+            # Convert event times to datetimes on this specific occurrence date
+            event_start_dt = timezone.make_aware(datetime.combine(occ_date, self.start_time))
+            event_end_dt = timezone.make_aware(datetime.combine(occ_date, self.end_time))
+            
+            # Handle midnight crossover
+            if self.end_time < self.start_time:
+                event_end_dt += timedelta(days=1)
+            
+            # Check for overlap: (StartA < EndB) and (EndA > StartB)
+            if start_datetime < event_end_dt and end_datetime > event_start_dt:
+                return True
+                
+        return False
     
     def auto_enroll_users_for_next_occurrence(self):
         """
