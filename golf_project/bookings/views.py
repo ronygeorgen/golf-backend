@@ -2015,15 +2015,23 @@ class BookingViewSet(viewsets.ModelViewSet):
                         if current_time >= avail_end:
                             break
                 
-                # Pre-fetch special events for this day to avoid thousands of queries
+                # Pre-fetch special events for this day AND the next day to handle UTC crossover
+                # Late night slots in local time might be next day in UTC
+                next_day = booking_date + timedelta(days=1)
+                
                 from special_events.models import SpecialEvent
                 location_id = get_location_id_from_request(request)
-                day_events = SpecialEvent.objects.filter(is_active=True)
+                active_events = SpecialEvent.objects.filter(is_active=True)
                 if location_id:
-                    day_events = day_events.filter(location_id=location_id)
-                # Filter events that could potentially occur on this day
-                # (Simple check to reduce the list)
-                day_events = [e for e in day_events if booking_date in e.get_occurrences(start_date=booking_date, end_date=booking_date)]
+                    active_events = active_events.filter(location_id=location_id)
+                
+                # Filter events that could potentially occur on booking_date OR next_day
+                day_events = []
+                for e in active_events:
+                    # Check occurrences for both days
+                    occs = e.get_occurrences(start_date=booking_date, end_date=next_day)
+                    if occs:
+                        day_events.append(e)
 
                 while current_time < avail_end:
                     slot_start = timezone.make_aware(current_time)

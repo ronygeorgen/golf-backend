@@ -1,0 +1,6 @@
+Could not find platform independent libraries <prefix>
+Unauthorized: /api/bookings/check_simulator_availability/
+Testing Next Day UTC Conflict (Late Night Slot)...
+Created Event: Late Night Event 1769212328 on 2026-01-26 00:00:00-04:00:00
+Checking availability for date: 2026-01-25
+Error checking availability: 401
