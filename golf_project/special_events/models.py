@@ -200,8 +200,15 @@ class SpecialEvent(models.Model):
         Returns True if any part of the range overlaps with any occurrence of this event.
         """
         # Get start and end dates to check occurrences
-        start_date = start_datetime.date()
-        end_date = end_datetime.date()
+        if isinstance(start_datetime, datetime):
+            start_date = start_datetime.date()
+        else:
+            start_date = start_datetime
+            
+        if isinstance(end_datetime, datetime):
+            end_date = end_datetime.date()
+        else:
+            end_date = end_datetime
         
         # Get all occurrences in this range
         occurrences = self.get_occurrences(
@@ -222,6 +229,7 @@ class SpecialEvent(models.Model):
                 event_end_dt += timedelta(days=1)
             
             # Check for overlap: (StartA < EndB) and (EndA > StartB)
+            # Standard intersection
             if start_datetime < event_end_dt and end_datetime > event_start_dt:
                 return True
                 
