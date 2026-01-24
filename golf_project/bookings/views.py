@@ -2083,10 +2083,17 @@ class BookingViewSet(viewsets.ModelViewSet):
                         # Calculate effective availability end time (min of window end and next special event start)
                         effective_avail_end = availability_end_datetime
                         for event in day_events:
-                            # Convert event start to datetime on this day
-                            event_start_dt = timezone.make_aware(datetime.combine(booking_date, event.start_time))
-                            if event_start_dt > slot_start and event_start_dt < effective_avail_end:
-                                effective_avail_end = event_start_dt
+                            # Get occurrences that are relevant (on slot day or next day)
+                            relevant_dates = event.get_occurrences(
+                                start_date=slot_start.date(), 
+                                end_date=(slot_start + timedelta(days=1)).date()
+                            )
+                            for occ_date in relevant_dates:
+                                # Convert event start to datetime on this specific occurrence date
+                                event_start_dt = timezone.make_aware(datetime.combine(occ_date, event.start_time))
+                                # Only care about events that constrain this slot (start after it)
+                                if event_start_dt > slot_start and event_start_dt < effective_avail_end:
+                                    effective_avail_end = event_start_dt
                         
                         if not existing_slot:
                             slot_payload = {
