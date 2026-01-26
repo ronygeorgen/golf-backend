@@ -210,9 +210,15 @@ class SpecialEvent(models.Model):
         else:
             end_date = end_datetime
         
-        # Get all occurrences in this range
+        # IMPORTANT: Check the day before as well to catch timezone crossovers
+        # A late-night event on Day N might block early morning slots on Day N+1
+        # Example: Event on Feb 2 (8PM Halifax = 00:00 UTC Feb 3) should block
+        # slots on Feb 3 00:00 UTC
+        prev_day = start_date - timedelta(days=1)
+        
+        # Get all occurrences in this expanded range
         occurrences = self.get_occurrences(
-            start_date=start_date,
+            start_date=prev_day,  # Check previous day too!
             end_date=end_date
         )
         

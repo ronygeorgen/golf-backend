@@ -94,19 +94,17 @@ class SpecialEventSerializer(serializers.ModelSerializer):
     def to_representation(self, instance):
         """Return UTC times as-is (no conversion)"""
         representation = super().to_representation(instance)
-        # Format times as HH:MM for consistency
+        # Format times as HH:MM:SS for consistency
         if representation.get('start_time'):
             if isinstance(representation['start_time'], str):
-                if len(representation['start_time'].split(':')) > 2:
-                    representation['start_time'] = representation['start_time'][:5]
+                pass  # Already a string
             else:
-                representation['start_time'] = representation['start_time'].strftime('%H:%M')
+                representation['start_time'] = representation['start_time'].strftime('%H:%M:%S')
         if representation.get('end_time'):
             if isinstance(representation['end_time'], str):
-                if len(representation['end_time'].split(':')) > 2:
-                    representation['end_time'] = representation['end_time'][:5]
+                pass  # Already a string
             else:
-                representation['end_time'] = representation['end_time'].strftime('%H:%M')
+                representation['end_time'] = representation['end_time'].strftime('%H:%M:%S')
         # Format date as YYYY-MM-DD
         if representation.get('date'):
             if isinstance(representation['date'], str):
@@ -146,6 +144,7 @@ class SpecialEventSerializer(serializers.ModelSerializer):
                 except ValueError:
                     pass
         return super().to_internal_value(data)
+
     
     def validate(self, attrs):
         """Check if the event date/time is on a closed day and validate recurring_end_date"""
