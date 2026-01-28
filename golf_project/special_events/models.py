@@ -170,6 +170,10 @@ class SpecialEvent(models.Model):
         """
         Check if a given datetime conflicts with this event.
         Returns True if the datetime falls within any occurrence of this event.
+        
+        IMPORTANT: The date and times stored in the database are already in UTC.
+        We must treat them as UTC directly, not apply timezone.make_aware() which
+        would cause a double conversion.
         """
         check_date = check_datetime.date()
         check_time = check_datetime.time()
@@ -198,6 +202,10 @@ class SpecialEvent(models.Model):
         """
         Check if a given datetime range conflicts with this event.
         Returns True if any part of the range overlaps with any occurrence of this event.
+        
+        IMPORTANT: The date and times stored in the database are already in UTC.
+        We must treat them as UTC directly, not apply timezone.make_aware() which
+        would cause a double conversion (converting UTC values as if they were local time).
         """
         # Get start and end dates to check occurrences
         if isinstance(start_datetime, datetime):
@@ -226,9 +234,14 @@ class SpecialEvent(models.Model):
             return False
             
         for occ_date in occurrences:
-            # Convert event times to datetimes on this specific occurrence date
-            event_start_dt = timezone.make_aware(datetime.combine(occ_date, self.start_time))
-            event_end_dt = timezone.make_aware(datetime.combine(occ_date, self.end_time))
+            # CRITICAL FIX: The date and times in the database are ALREADY in UTC.
+            # We must NOT use timezone.make_aware() because it would treat them as 
+            # local/naive times and convert them to UTC again (double conversion).
+            # Instead, we directly mark them as UTC using replace(tzinfo=timezone.utc)
+            
+            # Create UTC-aware datetimes from the stored UTC date and times
+            event_start_dt = datetime.combine(occ_date, self.start_time).replace(tzinfo=timezone.utc)
+            event_end_dt = datetime.combine(occ_date, self.end_time).replace(tzinfo=timezone.utc)
             
             # Handle midnight crossover
             if self.end_time < self.start_time:
