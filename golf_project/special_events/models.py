@@ -1,7 +1,7 @@
 from django.conf import settings
 from django.db import models
 from django.utils import timezone
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone as dt_timezone
 import uuid
 
 
@@ -237,11 +237,11 @@ class SpecialEvent(models.Model):
             # CRITICAL FIX: The date and times in the database are ALREADY in UTC.
             # We must NOT use timezone.make_aware() because it would treat them as 
             # local/naive times and convert them to UTC again (double conversion).
-            # Instead, we directly mark them as UTC using replace(tzinfo=timezone.utc)
+            # Instead, we directly mark them as UTC using replace(tzinfo=dt_timezone.utc)
             
             # Create UTC-aware datetimes from the stored UTC date and times
-            event_start_dt = datetime.combine(occ_date, self.start_time).replace(tzinfo=timezone.utc)
-            event_end_dt = datetime.combine(occ_date, self.end_time).replace(tzinfo=timezone.utc)
+            event_start_dt = datetime.combine(occ_date, self.start_time).replace(tzinfo=dt_timezone.utc)
+            event_end_dt = datetime.combine(occ_date, self.end_time).replace(tzinfo=dt_timezone.utc)
             
             # Handle midnight crossover
             if self.end_time < self.start_time:
