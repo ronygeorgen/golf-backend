@@ -1205,18 +1205,32 @@ def format_booking_datetime(booking):
 def format_special_event_datetime(registration):
     """
     Format a special event registration to a readable date and time string.
+    Converts stored UTC time to Canada timezone (America/Halifax - Atlantic Time).
     """
     if not registration or not registration.occurrence_date or not registration.event.start_time:
         return ''
     
+    from datetime import datetime
+    from django.utils import timezone
+    from zoneinfo import ZoneInfo
+    
     occurrence_date = registration.occurrence_date
     start_time = registration.event.start_time
     
+    # Combine date and time
+    # Treat the stored time as UTC
+    dt = datetime.combine(occurrence_date, start_time)
+    dt_utc = timezone.make_aware(dt, ZoneInfo('UTC'))
+    
+    # Convert to Canada timezone (America/Halifax handles AST/ADT automatically)
+    canada_tz = ZoneInfo('America/Halifax')
+    dt_ast = dt_utc.astimezone(canada_tz)
+    
     # Format: "DD-MMM-YYYY HH:MM AM/PM"
-    day = occurrence_date.strftime("%d")
-    month = occurrence_date.strftime("%b").upper()
-    year = occurrence_date.strftime("%Y")
-    time_str = start_time.strftime("%I:%M %p")
+    day = dt_ast.strftime("%d")
+    month = dt_ast.strftime("%b").upper()
+    year = dt_ast.strftime("%Y")
+    time_str = dt_ast.strftime("%I:%M %p")
     
     return f"{day}-{month}-{year} {time_str}"
 
