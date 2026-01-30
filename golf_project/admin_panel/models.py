@@ -178,3 +178,43 @@ class ClosedDay(models.Model):
                 return (True, closure.title)
         
         return (False, None)
+
+
+class LiabilityWaiver(models.Model):
+    """
+    Model to store liability waiver content.
+    Only one active waiver can exist at a time.
+    Supports rich text formatting (heading, bold, italic, new lines).
+    """
+    content = models.JSONField(
+        help_text="Rich text content as JSON array. Each item has 'type' (heading/paragraph), 'text', and optional 'bold', 'italic'"
+    )
+    is_active = models.BooleanField(
+        default=True,
+        help_text="If False, waiver will not be shown to users during login"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'Liability Waiver'
+        verbose_name_plural = 'Liability Waivers'
+    
+    def __str__(self):
+        status = "Active" if self.is_active else "Inactive"
+        return f"Liability Waiver ({status}) - {self.created_at.strftime('%Y-%m-%d')}"
+    
+    def save(self, *args, **kwargs):
+        # Ensure only one active waiver exists
+        if self.is_active:
+            # Deactivate all other waivers
+            LiabilityWaiver.objects.filter(is_active=True).exclude(pk=self.pk if self.pk else None).update(is_active=False)
+        super().save(*args, **kwargs)
+    
+    def get_content_hash(self):
+        """Generate a hash of the content to detect changes"""
+        import hashlib
+        import json
+        content_str = json.dumps(self.content, sort_keys=True)
+        return hashlib.md5(content_str.encode()).hexdigest()

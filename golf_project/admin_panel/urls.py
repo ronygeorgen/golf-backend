@@ -15,6 +15,7 @@ router.register(r'packages', CoachingPackageViewSet, basename='admin-packages')
 router.register(r'bookings', BookingViewSet, basename='admin-bookings')
 router.register(r'overrides', views.AdminOverrideViewSet, basename='admin-overrides')
 router.register(r'closed-days', views.ClosedDayViewSet, basename='admin-closed-days')
+router.register(r'liability-waiver', views.LiabilityWaiverViewSet, basename='admin-liability-waiver')
 
 urlpatterns = [
     path('', include(router.urls)),

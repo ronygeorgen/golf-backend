@@ -60,3 +60,29 @@ class StaffDayAvailability(models.Model):
     
     def __str__(self):
         return f"{self.staff.username} - {self.date} ({self.start_time} - {self.end_time})"
+
+
+class LiabilityWaiverAcceptance(models.Model):
+    """
+    Model to track user acceptance of liability waivers.
+    Stores acceptance timestamp in UTC.
+    """
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='waiver_acceptances')
+    waiver = models.ForeignKey('admin_panel.LiabilityWaiver', on_delete=models.CASCADE, related_name='acceptances')
+    accepted_at = models.DateTimeField(
+        help_text="Timestamp when user accepted the waiver (stored in UTC)"
+    )
+    waiver_content_hash = models.CharField(
+        max_length=32,
+        help_text="Hash of waiver content at time of acceptance to detect content changes"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        unique_together = ['user', 'waiver']
+        ordering = ['-accepted_at']
+        verbose_name = 'Liability Waiver Acceptance'
+        verbose_name_plural = 'Liability Waiver Acceptances'
+    
+    def __str__(self):
+        return f"{self.user.username} accepted waiver on {self.accepted_at.strftime('%Y-%m-%d %H:%M:%S UTC')}"

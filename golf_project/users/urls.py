@@ -25,5 +25,10 @@ urlpatterns = [
     
     # Member list endpoint (staff/admin only)
     path('member-list/', views.member_list, name='member_list'),
+    
+    # Liability waiver endpoints
+    path('liability-waiver/', views.get_active_waiver, name='get_active_waiver'),
+    path('liability-waiver/check/', views.check_waiver_acceptance, name='check_waiver_acceptance'),
+    path('liability-waiver/accept/', views.accept_waiver, name='accept_waiver'),
 ] + router.urls
 

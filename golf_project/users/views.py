@@ -18,7 +18,7 @@ try:
 except ImportError:
     CELERY_AVAILABLE = False
     sync_user_contact_task = None
-from .models import User
+from .models import User, LiabilityWaiverAcceptance
 from .serializers import (
     PhoneLoginSerializer, 
     VerifyOTPSerializer, 
@@ -1024,4 +1024,165 @@ def member_list(request):
         logger.error(f"Error in member_list: {e}", exc_info=True)
         return Response({
             'error': 'Failed to fetch member list'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def get_active_waiver(request):
+    """
+    Get the active liability waiver for display to users.
+    Returns None if no active waiver exists.
+    """
+    try:
+        from admin_panel.models import LiabilityWaiver
+        waiver = LiabilityWaiver.objects.filter(is_active=True).first()
+        
+        if not waiver:
+            return Response({
+                'waiver': None,
+                'message': 'No active waiver found'
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            'waiver': {
+                'id': waiver.id,
+                'content': waiver.content,
+                'content_hash': waiver.get_content_hash(),
+                'created_at': waiver.created_at.isoformat(),
+                'updated_at': waiver.updated_at.isoformat(),
+            }
+        }, status=status.HTTP_200_OK)
+    except Exception as e:
+        logger.error(f"Error fetching active waiver: {e}", exc_info=True)
+        return Response({
+            'error': 'Failed to fetch waiver'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def check_waiver_acceptance(request):
+    """
+    Check if the current user has accepted the active waiver.
+    Returns acceptance status and whether waiver content has changed.
+    """
+    try:
+        from admin_panel.models import LiabilityWaiver
+        from django.utils import timezone
+        
+        user = request.user
+        waiver = LiabilityWaiver.objects.filter(is_active=True).first()
+        
+        if not waiver:
+            return Response({
+                'waiver_exists': False,
+                'accepted': False,
+                'needs_acceptance': False
+            }, status=status.HTTP_200_OK)
+        
+        # Check if user has accepted this waiver
+        acceptance = LiabilityWaiverAcceptance.objects.filter(
+            user=user,
+            waiver=waiver
+        ).first()
+        
+        if acceptance:
+            # Check if content has changed since acceptance
+            current_hash = waiver.get_content_hash()
+            content_changed = acceptance.waiver_content_hash != current_hash
+            
+            return Response({
+                'waiver_exists': True,
+                'accepted': True,
+                'needs_acceptance': content_changed,
+                'accepted_at': acceptance.accepted_at.isoformat(),
+                'content_changed': content_changed
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            'waiver_exists': True,
+            'accepted': False,
+            'needs_acceptance': True
+        }, status=status.HTTP_200_OK)
+    except Exception as e:
+        logger.error(f"Error checking waiver acceptance: {e}", exc_info=True)
+        return Response({
+            'error': 'Failed to check waiver acceptance'
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def accept_waiver(request):
+    """
+    Accept the active liability waiver.
+    Accepts timestamp from frontend (Halifax timezone) and converts to UTC for storage.
+    """
+    try:
+        from admin_panel.models import LiabilityWaiver
+        from django.utils import timezone
+        from datetime import datetime
+        import pytz
+        
+        user = request.user
+        waiver = LiabilityWaiver.objects.filter(is_active=True).first()
+        
+        if not waiver:
+            return Response({
+                'error': 'No active waiver found'
+            }, status=status.HTTP_404_NOT_FOUND)
+        
+        # Get timestamp from frontend (should be in Halifax timezone)
+        accepted_at_str = request.data.get('accepted_at')
+        
+        if accepted_at_str:
+            # Parse the timestamp from frontend (Halifax timezone)
+            # Frontend sends ISO string without timezone (assumed Halifax)
+            try:
+                halifax_tz = pytz.timezone('America/Halifax')
+                
+                # Parse the datetime string (format: YYYY-MM-DDTHH:mm:ss)
+                if 'T' in accepted_at_str:
+                    # Has time component
+                    accepted_at_naive = datetime.fromisoformat(accepted_at_str.split('+')[0].split('Z')[0])
+                else:
+                    # Date only, use current time
+                    accepted_at_naive = datetime.fromisoformat(accepted_at_str)
+                
+                # Localize to Halifax timezone
+                accepted_at = halifax_tz.localize(accepted_at_naive)
+                
+                # Convert to UTC for storage
+                accepted_at = accepted_at.astimezone(pytz.UTC)
+            except (ValueError, TypeError) as e:
+                logger.error(f"Error parsing accepted_at timestamp: {e}")
+                # Fallback to current UTC time if parsing fails
+                accepted_at = timezone.now()
+        else:
+            # Use current UTC time if not provided
+            accepted_at = timezone.now()
+        
+        # Get content hash
+        content_hash = waiver.get_content_hash()
+        
+        # Create or update acceptance
+        acceptance, created = LiabilityWaiverAcceptance.objects.update_or_create(
+            user=user,
+            waiver=waiver,
+            defaults={
+                'accepted_at': accepted_at,
+                'waiver_content_hash': content_hash
+            }
+        )
+        
+        return Response({
+            'message': 'Waiver accepted successfully',
+            'accepted_at': acceptance.accepted_at.isoformat(),
+            'waiver_id': waiver.id
+        }, status=status.HTTP_200_OK)
+    except Exception as e:
+        logger.error(f"Error accepting waiver: {e}", exc_info=True)
+        return Response({
+            'error': 'Failed to accept waiver'
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

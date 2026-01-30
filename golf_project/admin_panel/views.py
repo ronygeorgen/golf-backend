@@ -18,7 +18,8 @@ from simulators.models import Simulator, SimulatorCredit
 from bookings.models import Booking
 from users.serializers import UserSerializer, StaffSerializer, StaffAvailabilitySerializer, StaffDayAvailabilitySerializer
 from bookings.serializers import BookingSerializer
-from .serializers import CoachingSessionAdjustmentSerializer, SimulatorCreditGrantSerializer, ClosedDaySerializer
+from .serializers import CoachingSessionAdjustmentSerializer, SimulatorCreditGrantSerializer, ClosedDaySerializer, LiabilityWaiverSerializer
+from .models import ClosedDay, LiabilityWaiver
 from simulators.serializers import SimulatorCreditSerializer
 from .models import ClosedDay
 
@@ -1188,4 +1189,163 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
             'datetime': datetime_str,
             'is_closed': is_closed,
             'message': message
+        })
+
+
+class LiabilityWaiverViewSet(viewsets.ModelViewSet):
+    """
+    ViewSet for managing liability waivers.
+    Only accessible by admin and superadmin users.
+    Only one active waiver can exist at a time.
+    """
+    queryset = LiabilityWaiver.objects.all().order_by('-created_at')
+    serializer_class = LiabilityWaiverSerializer
+    permission_classes = [IsAuthenticated]
+    
+    def get_queryset(self):
+        """Filter waivers based on query parameters"""
+        queryset = LiabilityWaiver.objects.all().order_by('-created_at')
+        
+        # Filter by active status
+        is_active = self.request.query_params.get('is_active', None)
+        if is_active is not None:
+            is_active_bool = is_active.lower() == 'true'
+            queryset = queryset.filter(is_active=is_active_bool)
+        
+        return queryset
+    
+    def list(self, request, *args, **kwargs):
+        """List all waivers"""
+        # Check if user is admin or superadmin
+        if not (request.user.role in ['admin', 'superadmin'] or request.user.is_superuser):
+            raise PermissionDenied("Administrator privileges are required.")
+        
+        return super().list(request, *args, **kwargs)
+    
+    def create(self, request, *args, **kwargs):
+        """Create a new waiver"""
+        # Check if user is admin or superadmin
+        if not (request.user.role in ['admin', 'superadmin'] or request.user.is_superuser):
+            raise PermissionDenied("Administrator privileges are required.")
+        
+        # Check if there's already an active waiver
+        is_active = request.data.get('is_active', True)
+        if is_active:
+            existing_active = LiabilityWaiver.objects.filter(is_active=True).exists()
+            if existing_active:
+                return Response({
+                    'error': 'An active waiver already exists. Only one active waiver can exist at a time. Please deactivate the existing waiver first or update it instead.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+        
+        return super().create(request, *args, **kwargs)
+    
+    def update(self, request, *args, **kwargs):
+        """Update a waiver"""
+        # Check if user is admin or superadmin
+        if not (request.user.role in ['admin', 'superadmin'] or request.user.is_superuser):
+            raise PermissionDenied("Administrator privileges are required.")
+        
+        return super().update(request, *args, **kwargs)
+    
+    def partial_update(self, request, *args, **kwargs):
+        """Partially update a waiver"""
+        # Check if user is admin or superadmin
+        if not (request.user.role in ['admin', 'superadmin'] or request.user.is_superuser):
+            raise PermissionDenied("Administrator privileges are required.")
+        
+        return super().partial_update(request, *args, **kwargs)
+    
+    def destroy(self, request, *args, **kwargs):
+        """Delete a waiver"""
+        # Check if user is admin or superadmin
+        if not (request.user.role in ['admin', 'superadmin'] or request.user.is_superuser):
+            raise PermissionDenied("Administrator privileges are required.")
+        
+        return super().destroy(request, *args, **kwargs)
+    
+    @action(detail=True, methods=['get'], url_path='acceptances')
+    def acceptances(self, request, pk=None):
+        """
+        Get all users who have accepted (or not accepted) this waiver.
+        Supports pagination and search by name, email, phone.
+        """
+        # Check if user is admin or superadmin
+        if not (request.user.role in ['admin', 'superadmin'] or request.user.is_superuser):
+            raise PermissionDenied("Administrator privileges are required.")
+        
+        from users.models import LiabilityWaiverAcceptance, User
+        from rest_framework.pagination import PageNumberPagination
+        from django.db.models import Q
+        
+        waiver = self.get_object()
+        
+        # Get search query
+        search_query = request.query_params.get('search', '').strip()
+        
+        # Get page number
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        
+        # Get all users (both accepted and not accepted)
+        # Start with all users
+        users = User.objects.filter(role='client')
+        
+        # Apply search filter if provided
+        if search_query:
+            users = users.filter(
+                Q(first_name__icontains=search_query) |
+                Q(last_name__icontains=search_query) |
+                Q(email__icontains=search_query) |
+                Q(phone__icontains=search_query) |
+                Q(username__icontains=search_query)
+            )
+        
+        # Get all acceptances for this waiver
+        acceptances = LiabilityWaiverAcceptance.objects.filter(waiver=waiver).select_related('user')
+        accepted_user_ids = set(acceptances.values_list('user_id', flat=True))
+        
+        # Create list of users with acceptance status
+        user_list = []
+        for user in users:
+            acceptance = acceptances.filter(user=user).first()
+            user_list.append({
+                'id': user.id,
+                'first_name': user.first_name or '',
+                'last_name': user.last_name or '',
+                'email': user.email or '',
+                'phone': user.phone,
+                'username': user.username,
+                'accepted': user.id in accepted_user_ids,
+                'accepted_at': acceptance.accepted_at.isoformat() if acceptance else None,
+                'content_changed': acceptance and acceptance.waiver_content_hash != waiver.get_content_hash() if acceptance else False,
+            })
+        
+        # Sort: Accepted users first (by accepted_at descending - latest first), then non-accepted by name
+        accepted_users = [u for u in user_list if u['accepted']]
+        non_accepted_users = [u for u in user_list if not u['accepted']]
+        
+        # Sort accepted users by accepted_at descending (latest first)
+        accepted_users.sort(key=lambda x: x['accepted_at'] or '', reverse=True)
+        
+        # Sort non-accepted users by name
+        non_accepted_users.sort(key=lambda x: (x['last_name'], x['first_name']))
+        
+        # Combine: accepted first, then non-accepted
+        user_list = accepted_users + non_accepted_users
+        
+        # Apply pagination
+        total_count = len(user_list)
+        total_pages = (total_count + page_size - 1) // page_size
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        paginated_users = user_list[start_idx:end_idx]
+        
+        return Response({
+            'count': total_count,
+            'total_pages': total_pages,
+            'current_page': page,
+            'page_size': page_size,
+            'next': page < total_pages,
+            'previous': page > 1,
+            'users': paginated_users
         })

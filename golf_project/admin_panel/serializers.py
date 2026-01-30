@@ -3,7 +3,7 @@ from decimal import Decimal
 from coaching.models import CoachingPackagePurchase
 from simulators.models import SimulatorCredit
 from users.models import User
-from .models import ClosedDay
+from .models import ClosedDay, LiabilityWaiver
 
 
 class ClientLookupMixin:
@@ -315,5 +315,30 @@ class ClosedDaySerializer(serializers.ModelSerializer):
                         'conflicts': True  # Custom flag for frontend to detect this specific error
                     })
         
+        return attrs
+
+
+class LiabilityWaiverSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LiabilityWaiver
+        fields = [
+            'id',
+            'content',
+            'is_active',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ['created_at', 'updated_at']
+    
+    def validate(self, attrs):
+        # Check if there's already an active waiver when creating a new one
+        if self.instance is None:  # Creating new waiver
+            is_active = attrs.get('is_active', True)
+            if is_active:
+                existing_active = LiabilityWaiver.objects.filter(is_active=True).exists()
+                if existing_active:
+                    raise serializers.ValidationError({
+                        'is_active': 'An active waiver already exists. Only one active waiver can exist at a time. Please deactivate the existing waiver first or update it instead.'
+                    })
         return attrs
 
