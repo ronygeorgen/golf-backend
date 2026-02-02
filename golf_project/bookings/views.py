@@ -1082,17 +1082,39 @@ class BookingViewSet(viewsets.ModelViewSet):
                 if not assigned_simulator:
                     raise serializers.ValidationError("No bay available for this coaching session (Coaching bays and Simulators are full for this time slot).")
 
-                purchase = self._consume_package_session(package, use_organization=use_organization_package, user=target_user)
+                # Check for coach conflicts with row-level locking to prevent race conditions
+                # Wrap coach check, session consumption, and booking creation in a transaction to ensure atomicity
+                coach = booking_data.get('coach')
                 # Check if package is TPI assessment
                 is_tpi_assessment = package.is_tpi_assessment if hasattr(package, 'is_tpi_assessment') else False
-                booking_instance = serializer.save(
-                    client=target_user,
-                    location_id=location_id,
-                    package_purchase=purchase,
-                    total_price=booking_data.get('total_price', 0),
-                    is_tpi_assessment=is_tpi_assessment,
-                    simulator=assigned_simulator
-                )
+                
+                # Perform coach conflict check, session consumption, and booking creation atomically
+                with transaction.atomic():
+                    if coach:
+                        # Lock existing bookings for this coach at this time to prevent concurrent bookings
+                        conflicting_coach_bookings = Booking.objects.select_for_update().filter(
+                            coach=coach,
+                            start_time__lt=end_time,
+                            end_time__gt=start_time,
+                            status__in=['confirmed', 'completed']
+                        )
+                        if conflicting_coach_bookings.exists():
+                            raise serializers.ValidationError("This time slot is already booked for the selected coach")
+                    
+                    # Consume session within the same transaction
+                    # This ensures if coach conflict check fails, session is not consumed
+                    purchase = self._consume_package_session(package, use_organization=use_organization_package, user=target_user)
+                    
+                    # Create booking within the same transaction
+                    # This ensures the coach conflict check, session consumption, and booking creation are all atomic
+                    booking_instance = serializer.save(
+                        client=target_user,
+                        location_id=location_id,
+                        package_purchase=purchase,
+                        total_price=booking_data.get('total_price', 0),
+                        is_tpi_assessment=is_tpi_assessment,
+                        simulator=assigned_simulator
+                    )
                 # Ensure location_id is saved (in case serializer didn't include it)
                 if location_id and not booking_instance.location_id:
                     booking_instance.location_id = location_id

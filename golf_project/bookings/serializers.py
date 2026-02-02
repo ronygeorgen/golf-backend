@@ -103,13 +103,8 @@ class BookingCreateSerializer(serializers.ModelSerializer):
                 if conflicting_bookings.exists():
                     raise serializers.ValidationError("This time slot is already booked for the selected simulator")
             
-            if booking_type == 'coaching' and coach:
-                conflicting_bookings = conflicting_bookings.filter(
-                    coach=coach,
-                    booking_type='coaching'
-                )
-                if conflicting_bookings.exists():
-                    raise serializers.ValidationError("This time slot is already booked for the selected coach")
+            # Note: Coach conflict check is moved to perform_create() in views.py
+            # to prevent race conditions using select_for_update() locking
         
         # Booking-type specific validation
         if booking_type == 'coaching':
