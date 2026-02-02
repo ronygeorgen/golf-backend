@@ -96,9 +96,10 @@ class BookingCreateSerializer(serializers.ModelSerializer):
                 conflicting_bookings = conflicting_bookings.exclude(id=exclude_id)
             
             if booking_type == 'simulator' and simulator:
+                # Check for ALL booking types (simulator and coaching) on this simulator
+                # because coaching sessions can use regular simulator bays when coaching bays are full
                 conflicting_bookings = conflicting_bookings.filter(
-                    simulator=simulator,
-                    booking_type='simulator'
+                    simulator=simulator
                 )
                 if conflicting_bookings.exists():
                     raise serializers.ValidationError("This time slot is already booked for the selected simulator")
