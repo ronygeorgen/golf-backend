@@ -982,19 +982,16 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
         if force_override:
             start_date = serializer.validated_data.get('start_date')
             end_date = serializer.validated_data.get('end_date')
+            start_time = serializer.validated_data.get('start_time')
+            end_time = serializer.validated_data.get('end_time')
             recurrence = serializer.validated_data.get('recurrence', 'one_time')
             
             # 1. Cancel conflicting bookings
-            # Filter bookings in the range
-            # Note: For recurring closed days, this is complex.
-            # Assuming 'force_override' mainly targets the immediate conflicts identified by the serializer.
-            # The serializer checks for conflicts on specific dates.
-            # We will cancel bookings that fall within the DATE RANGE of this created closed day instance.
-            # (Handling future recurring conflicts for creating a recurring closed day is a much larger scope, 
-            # usually we just handle the immediate ones or matching ones).
-            # Given the request, we will focus on the range [start_date, end_date].
+            # Only cancel bookings that actually overlap with the closed time range
+            # If it's a full day closure (no times), cancel all bookings on those dates
+            # If it's a partial closure (has times), only cancel bookings that overlap with the time range
             
-            # Finding bookings in range
+            # Base query for bookings in the date range
             bookings = Booking.objects.filter(
                 start_time__date__gte=start_date,
                 start_time__date__lte=end_date,
@@ -1003,6 +1000,45 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
             
             if location_id:
                 bookings = bookings.filter(location_id=location_id)
+            
+            # If closure has time range, filter to only bookings that overlap with the time range
+            if start_time and end_time:
+                # For each date in the range, check bookings that overlap with the closed time window
+                conflicting_bookings = []
+                current_date = start_date
+                
+                while current_date <= end_date:
+                    # Create datetime objects for the closed time window on this date
+                    closure_start_dt = django_timezone.make_aware(
+                        datetime.combine(current_date, start_time),
+                        dt_timezone.utc
+                    )
+                    closure_end_dt = django_timezone.make_aware(
+                        datetime.combine(current_date, end_time),
+                        dt_timezone.utc
+                    )
+                    
+                    # Handle midnight crossover (if end_time < start_time, end is next day)
+                    if end_time < start_time:
+                        closure_end_dt += timedelta(days=1)
+                    
+                    # Find bookings on this date that overlap with the closed time window
+                    # Overlap condition: booking.start_time < closure.end_time AND booking.end_time > closure.start_time
+                    date_bookings = bookings.filter(
+                        start_time__date=current_date
+                    ).filter(
+                        start_time__lt=closure_end_dt,
+                        end_time__gt=closure_start_dt
+                    )
+                    
+                    conflicting_bookings.extend(list(date_bookings))
+                    current_date += timedelta(days=1)
+                
+                # Use the filtered list
+                bookings = conflicting_bookings
+            else:
+                # Full day closure - cancel all bookings on these dates
+                bookings = list(bookings)
 
             for booking in bookings:
                 booking.status = 'cancelled'
@@ -1134,19 +1170,41 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
         else:
             closed_days = ClosedDay.objects.filter(is_active=True)
         
-        is_closed = False
+        is_closed = False  # True only if full day closure exists
+        has_partial_closure = False  # True if any partial closure exists
         closure_title = None
+        partial_closures = []  # List of partial closures with time ranges
+        
         for closure in closed_days:
             if closure.is_date_closed(check_date):
-                is_closed = True
-                closure_title = closure.title
-                break
+                # Check if it's a full day closure (no time range)
+                if not closure.start_time or not closure.end_time:
+                    is_closed = True
+                    if not closure_title:
+                        closure_title = closure.title
+                else:
+                    # Partial closure - add to list
+                    has_partial_closure = True
+                    partial_closures.append({
+                        'title': closure.title,
+                        'start_time': closure.start_time.strftime('%H:%M') if closure.start_time else None,
+                        'end_time': closure.end_time.strftime('%H:%M') if closure.end_time else None,
+                    })
+                    if not closure_title and not is_closed:
+                        closure_title = closure.title
         
-        return Response({
+        response_data = {
             'date': date_str,
             'is_closed': is_closed,
+            'has_partial_closure': has_partial_closure,
             'closure_title': closure_title
-        })
+        }
+        
+        # Include partial closure details if any exist
+        if partial_closures:
+            response_data['partial_closures'] = partial_closures
+        
+        return Response(response_data)
     
     @action(detail=False, methods=['get'], url_path='check-datetime')
     def check_datetime(self, request):
