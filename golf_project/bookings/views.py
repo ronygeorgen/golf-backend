@@ -1913,6 +1913,7 @@ class BookingViewSet(viewsets.ModelViewSet):
         date_str = request.query_params.get('date')
         duration_minutes = request.query_params.get('duration', 60)
         simulator_count = request.query_params.get('simulator_count', 1)  # Default to 1 for backward compatibility
+        exclude_booking_id = request.query_params.get('exclude_booking_id')  # For rescheduling
         show_bay_details = request.user.role in ['admin', 'staff']
         
         if not date_str:
@@ -2079,6 +2080,13 @@ class BookingViewSet(viewsets.ModelViewSet):
                         end_time__gt=slot_start,
                         status__in=['confirmed', 'completed']
                     )
+                    # Exclude the current booking if rescheduling
+                    if exclude_booking_id:
+                        try:
+                            exclude_id = int(exclude_booking_id)
+                            conflicting_bookings = conflicting_bookings.exclude(id=exclude_id)
+                        except (ValueError, TypeError):
+                            pass  # Invalid exclude_booking_id, ignore it
 
                     # Check for conflicting temp bookings
                     conflicting_temp_bookings = TempBooking.objects.filter(
@@ -2198,6 +2206,7 @@ class BookingViewSet(viewsets.ModelViewSet):
         date_str = request.query_params.get('date')
         package_id = request.query_params.get('package_id')
         coach_id = request.query_params.get('coach_id')
+        exclude_booking_id = request.query_params.get('exclude_booking_id')  # For rescheduling
         
         if not date_str:
             return Response(
@@ -2315,6 +2324,13 @@ class BookingViewSet(viewsets.ModelViewSet):
         )
         if location_id:
             relevant_bookings = relevant_bookings.filter(location_id=location_id)
+        # Exclude the current booking if rescheduling
+        if exclude_booking_id:
+            try:
+                exclude_id = int(exclude_booking_id)
+                relevant_bookings = relevant_bookings.exclude(id=exclude_id)
+            except (ValueError, TypeError):
+                pass  # Invalid exclude_booking_id, ignore it
         relevant_bookings = list(relevant_bookings.select_related('simulator', 'coach'))
 
         relevant_temps = TempBooking.objects.filter(
