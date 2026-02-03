@@ -1649,7 +1649,9 @@ class BookingViewSet(viewsets.ModelViewSet):
             if booking.coach_id:
                 incoming_data.setdefault('coach', booking.coach_id)
         elif booking.booking_type == 'simulator' and booking.simulator_id:
-            incoming_data.setdefault('simulator', booking.simulator_id)
+            # Do not enforce keeping the same simulator when rescheduling.
+            # This allows the system to find an optimal available simulator for the new time.
+            pass
         
         serializer = BookingCreateSerializer(
             data=incoming_data,
