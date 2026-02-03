@@ -1662,6 +1662,9 @@ class BookingViewSet(viewsets.ModelViewSet):
             # Get consistent location_id
             loc_id = booking.location_id or get_location_id_from_request(request)
             
+            # Initialize update_fields with fields that are always updated
+            update_fields = ['start_time', 'end_time', 'duration_minutes', 'updated_at']
+            
             # Lock the coach and ALL simulator rows at this location to prevent concurrent moves/bookings
             if booking.booking_type == 'coaching' and validated.get('coach'):
                 User.objects.select_for_update().filter(id=validated['coach'].id).exists()
