@@ -2046,6 +2046,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                 next_day = booking_date + timedelta(days=1)
                 
                 from special_events.models import SpecialEvent
+                # Get location_id once at the start (already retrieved at line 1943, but ensure it's in scope)
                 location_id = get_location_id_from_request(request)
                 active_events = SpecialEvent.objects.filter(is_active=True)
                 if location_id:
@@ -2080,6 +2081,9 @@ class BookingViewSet(viewsets.ModelViewSet):
                         end_time__gt=slot_start,
                         status__in=['confirmed', 'completed']
                     )
+                    # Filter by location_id to ensure we only check bookings at the same location
+                    if location_id:
+                        conflicting_bookings = conflicting_bookings.filter(location_id=location_id)
                     # Exclude the current booking if rescheduling
                     if exclude_booking_id:
                         try:
@@ -2096,6 +2100,9 @@ class BookingViewSet(viewsets.ModelViewSet):
                         status='reserved',
                         expires_at__gt=timezone.now()
                     )
+                    # Filter by location_id to ensure we only check temp bookings at the same location
+                    if location_id:
+                        conflicting_temp_bookings = conflicting_temp_bookings.filter(location_id=location_id)
                     
                     # Check for special event conflict
                     has_special_event = False
@@ -2106,7 +2113,6 @@ class BookingViewSet(viewsets.ModelViewSet):
                     
                     # Check if facility is closed
                     from admin_panel.models import ClosedDay
-                    location_id = get_location_id_from_request(request)
                     is_closed, closed_message = ClosedDay.check_if_closed(slot_start, location_id=location_id)
                     
                     if not conflicting_bookings.exists() and not conflicting_temp_bookings.exists() and not is_closed and not has_special_event:
