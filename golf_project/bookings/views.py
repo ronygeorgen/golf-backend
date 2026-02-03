@@ -1630,7 +1630,7 @@ class BookingViewSet(viewsets.ModelViewSet):
             )
         
         lock_applies = self._lock_applies(booking)
-        if lock_applies and not (force_override and self._is_admin(request.user)):
+        if lock_applies and not self._is_admin(request.user):
             return Response(
                 {
                     'error': 'Bookings within 24 hours cannot be rescheduled online. Contact an admin for assistance.',
