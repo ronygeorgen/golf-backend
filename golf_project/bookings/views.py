@@ -2422,8 +2422,13 @@ class BookingViewSet(viewsets.ModelViewSet):
         day_events = SpecialEvent.objects.filter(is_active=True)
         if location_id:
             day_events = day_events.filter(location_id=location_id)
-        # Filter events that could potentially occur on this day
-        day_events = [e for e in day_events if booking_date in e.get_occurrences(start_date=booking_date, end_date=booking_date)]
+        # Filter events that could potentially occur on this day OR next day (for UTC crossover)
+        # Late night slots in local time might be next day in UTC
+        next_day = booking_date + timedelta(days=1)
+        day_events = [
+            e for e in day_events 
+            if e.get_occurrences(start_date=booking_date, end_date=next_day)
+        ]
 
         while current_slot_start_naive < day_end_naive:
             slot_start = timezone.make_aware(current_slot_start_naive)
