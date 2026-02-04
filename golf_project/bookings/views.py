@@ -1088,6 +1088,13 @@ class BookingViewSet(viewsets.ModelViewSet):
                 # Check if package is TPI assessment
                 is_tpi_assessment = package.is_tpi_assessment if hasattr(package, 'is_tpi_assessment') else False
                 
+                # Validate that the selected staff is actually assigned to the package
+                if coach and package and not package.staff_members.filter(id=coach.id).exists():
+                     coach_name = f"{coach.first_name} {coach.last_name}".strip()
+                     raise serializers.ValidationError(
+                        f"Coach {coach_name} is not assigned to package '{package.title}'."
+                    )
+                
                 # Perform coach conflict check, session consumption, and booking creation atomically
                 with transaction.atomic():
                     if coach:
@@ -2583,6 +2590,94 @@ class BookingViewSet(viewsets.ModelViewSet):
             'available_slots': available_slots
         }
         
+        return Response(response_data)
+    
+    @action(detail=False, methods=['get'])
+    def staff_daily_schedule(self, request):
+        """Get daily schedule for all staff members"""
+        # Admin/Staff only
+        if request.user.role not in ['admin', 'staff', 'superadmin']:
+             return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
+
+        date_str = request.query_params.get('date')
+        if not date_str:
+            return Response({'error': 'Date is required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            query_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        except ValueError:
+             return Response({'error': 'Invalid date format'}, status=status.HTTP_400_BAD_REQUEST)
+
+        location_id = get_location_id_from_request(request)
+        
+        from users.models import User, StaffAvailability, StaffDayAvailability
+        
+        staff_qs = User.objects.filter(role__in=['staff', 'admin'], is_active=True)
+        if location_id:
+            staff_qs = staff_qs.filter(ghl_location_id=location_id)
+        
+        staff_members = list(staff_qs.distinct())
+        response_data = []
+        
+        # Prefetch bookings
+        bookings = Booking.objects.filter(
+            start_time__date=query_date,
+            status__in=['confirmed', 'completed'],
+            booking_type='coaching'
+        ).select_related('client', 'simulator')
+        if location_id:
+            bookings = bookings.filter(location_id=location_id)
+            
+        bookings_by_staff = {}
+        for b in bookings:
+            if b.coach_id not in bookings_by_staff:
+                bookings_by_staff[b.coach_id] = []
+            bookings_by_staff[b.coach_id].append(b)
+            
+        day_of_week = query_date.weekday()
+        
+        for staff in staff_members:
+            # 1. Get working hours
+            working_hours = None
+            
+            # Check specific day override first
+            day_avail = StaffDayAvailability.objects.filter(staff=staff, date=query_date).first()
+            if day_avail:
+                if not day_avail.is_off_day:
+                     working_hours = {'start': day_avail.start_time, 'end': day_avail.end_time}
+            else:
+                # Check recurring
+                recur_avail = StaffAvailability.objects.filter(staff=staff, day_of_week=day_of_week).first()
+                if recur_avail:
+                    working_hours = {'start': recur_avail.start_time, 'end': recur_avail.end_time}
+            
+            # 2. Get bookings
+            staff_bookings = bookings_by_staff.get(staff.id, [])
+            booking_data = []
+            for b in staff_bookings:
+                booking_data.append({
+                    'id': b.id,
+                    'start_time': b.start_time.isoformat(),
+                    'end_time': b.end_time.isoformat(),
+                    'client_name': f"{b.client.first_name} {b.client.last_name}",
+                    'simulator': b.simulator.name if b.simulator else None
+                })
+            
+            # Format working hours
+            formatted_hours = None
+            if working_hours:
+                formatted_hours = {
+                    'start': working_hours['start'].strftime('%H:%M:%S'),
+                    'end': working_hours['end'].strftime('%H:%M:%S')
+                }
+
+            response_data.append({
+                'id': staff.id,
+                'name': f"{staff.first_name} {staff.last_name}",
+                'working_hours': formatted_hours,
+                'bookings': booking_data
+            })
+            
         return Response(response_data)
 
 
