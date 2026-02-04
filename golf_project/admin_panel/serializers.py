@@ -30,8 +30,8 @@ class CoachingSessionAdjustmentSerializer(serializers.Serializer, ClientLookupMi
     client_identifier = serializers.CharField(required=False, allow_blank=True)
     package_purchase_id = serializers.IntegerField(required=False)
     package_id = serializers.IntegerField(required=False)
-    session_count = serializers.IntegerField(min_value=1, default=1)
-    simulator_hours = serializers.DecimalField(max_digits=6, decimal_places=2, min_value=Decimal('0'), required=False, default=Decimal('0'))
+    session_count = serializers.IntegerField(default=1)
+    simulator_hours = serializers.DecimalField(max_digits=6, decimal_places=2, required=False, default=Decimal('0'))
     note = serializers.CharField(required=False, allow_blank=True)
     create_if_missing = serializers.BooleanField(required=False, default=False)
     
@@ -87,7 +87,7 @@ class CoachingSessionAdjustmentSerializer(serializers.Serializer, ClientLookupMi
 class SimulatorCreditGrantSerializer(serializers.Serializer, ClientLookupMixin):
     client_id = serializers.IntegerField(required=False)
     client_identifier = serializers.CharField(required=False, allow_blank=True)
-    hours = serializers.DecimalField(max_digits=6, decimal_places=2, min_value=Decimal('0.01'), required=False)
+    hours = serializers.DecimalField(max_digits=6, decimal_places=2, required=False)
     token_count = serializers.IntegerField(min_value=1, required=False)  # Deprecated, kept for backward compatibility
     reason = serializers.ChoiceField(choices=SimulatorCredit.Reason.choices, default=SimulatorCredit.Reason.MANUAL)
     note = serializers.CharField(required=False, allow_blank=True)
