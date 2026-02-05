@@ -3,7 +3,7 @@ from django.contrib.auth import authenticate
 from django.contrib.auth.password_validation import validate_password
 from django.utils import timezone
 from datetime import datetime, time as dt_time
-from .models import User, StaffAvailability, StaffDayAvailability
+from .models import User, StaffAvailability, StaffDayAvailability, StaffBlockedDate
 
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
@@ -420,3 +420,64 @@ class StaffDayAvailabilitySerializer(serializers.ModelSerializer):
                 except ValueError:
                     pass
         return super().to_internal_value(data)
+
+
+class StaffBlockedDateSerializer(serializers.ModelSerializer):
+    """Serializer for staff blocked dates (full-day or partial-day)"""
+    staff_name = serializers.SerializerMethodField(read_only=True)
+    created_by_name = serializers.SerializerMethodField(read_only=True)
+    is_full_day_block = serializers.SerializerMethodField(read_only=True)
+    
+    class Meta:
+        model = StaffBlockedDate
+        fields = [
+            'id', 'staff', 'staff_name', 'date', 
+            'start_time', 'end_time', 'is_full_day_block',
+            'reason', 'created_at', 'created_by', 'created_by_name'
+        ]
+        read_only_fields = ['id', 'created_at', 'created_by']
+    
+    def get_staff_name(self, obj):
+        """Return staff member's full name"""
+        if obj.staff:
+            return f"{obj.staff.first_name} {obj.staff.last_name}".strip()
+        return None
+    
+    def get_created_by_name(self, obj):
+        """Return admin's full name who created the block"""
+        if obj.created_by:
+            return f"{obj.created_by.first_name} {obj.created_by.last_name}".strip()
+        return None
+    
+    def get_is_full_day_block(self, obj):
+        """Return whether this is a full-day block"""
+        return obj.is_full_day_block()
+    
+    def validate_date(self, value):
+        """Ensure date is not in the past"""
+        from datetime import date as date_type
+        today = date_type.today()
+        if value < today:
+            raise serializers.ValidationError("Cannot block dates in the past.")
+        return value
+    
+    def validate(self, attrs):
+        """Validate time range for partial-day blocks"""
+        start_time = attrs.get('start_time')
+        end_time = attrs.get('end_time')
+        
+        # Both times must be provided together, or both must be None
+        if (start_time is None) != (end_time is None):
+            raise serializers.ValidationError({
+                'start_time': 'Both start_time and end_time must be provided for partial-day blocks, or leave both empty for full-day blocks.'
+            })
+        
+        # If times are provided, validate the range
+        if start_time and end_time:
+            if start_time >= end_time:
+                raise serializers.ValidationError({
+                    'end_time': 'End time must be after start time.'
+                })
+        
+        return attrs
+

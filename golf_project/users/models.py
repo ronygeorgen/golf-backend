@@ -62,6 +62,69 @@ class StaffDayAvailability(models.Model):
         return f"{self.staff.username} - {self.date} ({self.start_time} - {self.end_time})"
 
 
+class StaffBlockedDate(models.Model):
+    """
+    Tracks specific dates/times when a staff member is blocked/unavailable.
+    Supports both full-day and partial-day blocks.
+    
+    Examples:
+    - Full-day block: date=2026-02-16, start_time=None, end_time=None
+    - Partial-day block: date=2026-02-16, start_time=10:00, end_time=15:00
+    """
+    staff = models.ForeignKey(User, on_delete=models.CASCADE, limit_choices_to={'role': 'staff'}, related_name='blocked_dates')
+    date = models.DateField(help_text="Date when staff is blocked/unavailable")
+    start_time = models.TimeField(
+        null=True, 
+        blank=True, 
+        help_text="Start time of block (leave empty for full-day block). Stored in local timezone (America/Halifax)."
+    )
+    end_time = models.TimeField(
+        null=True, 
+        blank=True, 
+        help_text="End time of block (leave empty for full-day block). Stored in local timezone (America/Halifax)."
+    )
+    reason = models.CharField(max_length=255, blank=True, null=True, help_text="Optional reason for blocking")
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='staff_blocks_created', help_text="Admin who created this block")
+    
+    class Meta:
+        # Allow multiple blocks per staff per date (for different time ranges)
+        # But prevent duplicate blocks for the same time range
+        unique_together = ['staff', 'date', 'start_time', 'end_time']
+        verbose_name = 'Staff Blocked Date'
+        verbose_name_plural = 'Staff Blocked Dates'
+        ordering = ['date', 'start_time']
+    
+    def is_full_day_block(self):
+        """Returns True if this is a full-day block (no specific times)"""
+        return self.start_time is None and self.end_time is None
+    
+    def conflicts_with_time(self, check_start_time, check_end_time):
+        """
+        Check if a given time range conflicts with this block.
+        
+        Args:
+            check_start_time: time object to check (start of slot)
+            check_end_time: time object to check (end of slot)
+            
+        Returns:
+            bool: True if there's a conflict, False otherwise
+        """
+        # Full-day block conflicts with everything
+        if self.is_full_day_block():
+            return True
+        
+        # Partial-day block: check for time overlap
+        # Two time ranges overlap if: start1 < end2 AND start2 < end1
+        return self.start_time < check_end_time and check_start_time < self.end_time
+    
+    def __str__(self):
+        if self.is_full_day_block():
+            return f"{self.staff.username} - Blocked on {self.date} (Full Day)"
+        else:
+            return f"{self.staff.username} - Blocked on {self.date} ({self.start_time.strftime('%H:%M')} - {self.end_time.strftime('%H:%M')})"
+
+
 class LiabilityWaiverAcceptance(models.Model):
     """
     Model to track user acceptance of liability waivers.

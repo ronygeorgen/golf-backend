@@ -344,6 +344,251 @@ class StaffViewSet(viewsets.ModelViewSet):
             serializer = StaffDayAvailabilitySerializer(updated_availability, many=True, context={'location_id': location_id})
             return Response(serializer.data)
     
+    @action(detail=True, methods=['get', 'post', 'delete'], url_path='blocked-dates')
+    def blocked_dates(self, request, pk=None):
+        """
+        Handle blocked dates for staff.
+        GET: Returns all blocked dates for the staff member
+        POST: Block a specific date (cancels all bookings for that staff on that date)
+        DELETE: Unblock a specific date
+        """
+        staff = self.get_object()
+        
+        # Verify staff belongs to admin's location
+        location_id = get_location_id_from_request(request)
+        if location_id and staff.ghl_location_id != location_id:
+            raise PermissionDenied("You can only manage blocked dates for staff in your location.")
+        
+        if request.method == 'GET':
+            # Get all blocked dates for this staff member
+            from users.models import StaffBlockedDate
+            from users.serializers import StaffBlockedDateSerializer
+            
+            blocked_dates = StaffBlockedDate.objects.filter(staff=staff).order_by('date')
+            serializer = StaffBlockedDateSerializer(blocked_dates, many=True)
+            return Response(serializer.data)
+        
+        elif request.method == 'POST':
+            # Block a specific date (full-day or partial-day) and cancel conflicting bookings
+            from users.models import StaffBlockedDate
+            from users.serializers import StaffBlockedDateSerializer
+            from datetime import datetime as dt, time as dt_time
+            from django.db import transaction
+            from django.db.models import F
+            from decimal import Decimal
+            import pytz
+            
+            date_str = request.data.get('date')
+            start_time_str = request.data.get('start_time')  # Optional: "10:00" for partial-day block
+            end_time_str = request.data.get('end_time')      # Optional: "15:00" for partial-day block
+            reason = request.data.get('reason', '')
+            
+            if not date_str:
+                return Response(
+                    {'error': 'Date is required'}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            try:
+                # Parse date
+                block_date = dt.strptime(date_str, '%Y-%m-%d').date()
+            except ValueError:
+                return Response(
+                    {'error': 'Invalid date format. Use YYYY-MM-DD'}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Parse times if provided (for partial-day block)
+            start_time = None
+            end_time = None
+            is_full_day = True
+            
+            if start_time_str and end_time_str:
+                try:
+                    start_time = dt.strptime(start_time_str, '%H:%M').time()
+                    end_time = dt.strptime(end_time_str, '%H:%M').time()
+                    is_full_day = False
+                    
+                    if start_time >= end_time:
+                        return Response(
+                            {'error': 'End time must be after start time'},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+                except ValueError:
+                    return Response(
+                        {'error': 'Invalid time format. Use HH:MM (e.g., 10:00)'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+            elif start_time_str or end_time_str:
+                # One time provided but not the other
+                return Response(
+                    {'error': 'Both start_time and end_time must be provided for partial-day blocks'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Check for duplicate blocks
+            # For full-day: check if any block exists for this date
+            # For partial-day: check if exact same time range exists
+            if is_full_day:
+                # Check if there's already a full-day block
+                if StaffBlockedDate.objects.filter(
+                    staff=staff, 
+                    date=block_date,
+                    start_time__isnull=True,
+                    end_time__isnull=True
+                ).exists():
+                    return Response(
+                        {'error': 'A full-day block already exists for this date'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+            else:
+                # Check if exact same partial-day block exists
+                if StaffBlockedDate.objects.filter(
+                    staff=staff,
+                    date=block_date,
+                    start_time=start_time,
+                    end_time=end_time
+                ).exists():
+                    return Response(
+                        {'error': 'This time range is already blocked'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+            
+            # Create blocked date entry
+            blocked_date = StaffBlockedDate.objects.create(
+                staff=staff,
+                date=block_date,
+                start_time=start_time,
+                end_time=end_time,
+                reason=reason,
+                created_by=request.user
+            )
+            
+            # Find and cancel conflicting coaching bookings
+            from bookings.models import Booking
+            
+            # PROJECT STANDARD: Use America/Halifax for business logic date interpretation
+            tz = pytz.timezone('America/Halifax')
+            
+            if is_full_day:
+                # Full-day block: cancel all bookings on this date
+                start_of_day_local = tz.localize(dt.combine(block_date, dt_time.min))
+                end_of_day_local = tz.localize(dt.combine(block_date, dt_time.max))
+                
+                bookings_to_cancel = Booking.objects.filter(
+                    coach=staff,
+                    booking_type='coaching',
+                    start_time__range=(start_of_day_local, end_of_day_local),
+                    status='confirmed'
+                ).select_related('client', 'package_purchase', 'coaching_package')
+            else:
+                # Partial-day block: cancel only bookings that overlap with the blocked time range
+                # Convert block times to datetime for comparison
+                block_start_dt = tz.localize(dt.combine(block_date, start_time))
+                block_end_dt = tz.localize(dt.combine(block_date, end_time))
+                
+                bookings_to_cancel = Booking.objects.filter(
+                    coach=staff,
+                    booking_type='coaching',
+                    start_time__date=block_date,  # Same date
+                    status='confirmed'
+                ).select_related('client', 'package_purchase', 'coaching_package')
+                
+                # Filter for time overlap: booking_start < block_end AND booking_end > block_start
+                bookings_to_cancel = [
+                    b for b in bookings_to_cancel
+                    if b.start_time < block_end_dt and b.end_time > block_start_dt
+                ]
+            
+            cancelled_count = 0
+            refunded_sessions = 0
+            refunded_hours = Decimal('0')
+            
+            with transaction.atomic():
+                for booking in bookings_to_cancel:
+                    # Cancel the booking
+                    booking.status = 'cancelled'
+                    booking.save()
+                    
+                    # Refund credits based on booking type
+                    if booking.package_purchase:
+                        # Refund coaching session
+                        purchase = booking.package_purchase
+                        purchase.sessions_remaining = F('sessions_remaining') + 1
+                        purchase.save()
+                        purchase.refresh_from_db()
+                        refunded_sessions += 1
+                        
+                        # If it's a combo package with simulator hours, refund those too
+                        if booking.duration_minutes and purchase.package and purchase.package.simulator_hours:
+                            hours_to_refund = Decimal(str(booking.duration_minutes)) / Decimal('60')
+                            purchase.simulator_hours_remaining = F('simulator_hours_remaining') + hours_to_refund
+                            purchase.save()
+                            purchase.refresh_from_db()
+                            refunded_hours += hours_to_refund
+                    
+                    cancelled_count += 1
+                    
+                    # Log the cancellation
+                    print(
+                        f"Cancelled booking {booking.id} for {booking.client.username} "
+                        f"due to staff {staff.username} being blocked on {block_date}"
+                    )
+            
+            
+            # Prepare response
+            serializer = StaffBlockedDateSerializer(blocked_date)
+            
+            # Create appropriate message based on block type
+            if is_full_day:
+                block_description = f"full day on {date_str}"
+            else:
+                block_description = f"{date_str} from {start_time_str} to {end_time_str}"
+            
+            return Response({
+                'blocked_date': serializer.data,
+                'cancelled_bookings': cancelled_count,
+                'refunded_sessions': refunded_sessions,
+                'refunded_simulator_hours': float(refunded_hours),
+                'message': f'Successfully blocked {block_description} for {staff.first_name} {staff.last_name}. '
+                          f'Cancelled {cancelled_count} booking(s) and refunded credits to clients.'
+            }, status=status.HTTP_201_CREATED)
+        
+        elif request.method == 'DELETE':
+            # Unblock a specific date
+            from users.models import StaffBlockedDate
+            
+            date_str = request.data.get('date') or request.query_params.get('date')
+            
+            if not date_str:
+                return Response(
+                    {'error': 'Date is required'}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            try:
+                # Parse date
+                unblock_date = dt.strptime(date_str, '%Y-%m-%d').date()
+            except ValueError:
+                return Response(
+                    {'error': 'Invalid date format. Use YYYY-MM-DD'}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Find and delete the blocked date
+            try:
+                blocked_date = StaffBlockedDate.objects.get(staff=staff, date=unblock_date)
+                blocked_date.delete()
+                return Response({
+                    'message': f'Successfully unblocked {date_str} for {staff.first_name} {staff.last_name}'
+                }, status=status.HTTP_200_OK)
+            except StaffBlockedDate.DoesNotExist:
+                return Response(
+                    {'error': 'This date is not blocked for this staff member'}, 
+                    status=status.HTTP_404_NOT_FOUND
+                )
+
+    
     @action(detail=True, methods=['get'], url_path='referrals')
     def referrals(self, request, pk=None):
         """

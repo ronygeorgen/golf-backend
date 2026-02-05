@@ -1098,6 +1098,53 @@ class BookingViewSet(viewsets.ModelViewSet):
                 # Perform coach conflict check, session consumption, and booking creation atomically
                 with transaction.atomic():
                     if coach:
+                        # CRITICAL: Check if coach has this date blocked (staff unavailability)
+                        # This prevents bookings even if someone bypasses the frontend
+                        from users.models import StaffBlockedDate
+                        import pytz
+                        
+                        # IMPORTANT: Convert UTC times to Halifax timezone for date/time extraction
+                        # Blocked dates are stored in local timezone (Halifax)
+                        # If we use UTC date, late-night Halifax bookings appear as next day
+                        tz = pytz.timezone('America/Halifax')
+                        start_time_local = start_time.astimezone(tz)
+                        end_time_local = end_time.astimezone(tz)
+                        
+                        booking_date = start_time_local.date()
+                        booking_start_time = start_time_local.time()
+                        booking_end_time = end_time_local.time()
+                        
+                        # Check for full-day blocks
+                        if StaffBlockedDate.objects.filter(
+                            staff=coach, 
+                            date=booking_date,
+                            start_time__isnull=True,
+                            end_time__isnull=True
+                        ).exists():
+                            coach_name = f"{coach.first_name} {coach.last_name}".strip()
+                            raise serializers.ValidationError(
+                                f"Coach {coach_name} is not available on {booking_date.strftime('%Y-%m-%d')} (full day blocked). "
+                                f"Please select a different date or coach."
+                            )
+                        
+                        # Check for partial-day blocks that overlap with booking time
+                        partial_blocks = StaffBlockedDate.objects.filter(
+                            staff=coach,
+                            date=booking_date,
+                            start_time__isnull=False,
+                            end_time__isnull=False
+                        )
+                        
+                        for block in partial_blocks:
+                            # Check if booking time overlaps with blocked time
+                            # Overlap if: booking_start < block_end AND booking_end > block_start
+                            if booking_start_time < block.end_time and booking_end_time > block.start_time:
+                                coach_name = f"{coach.first_name} {coach.last_name}".strip()
+                                raise serializers.ValidationError(
+                                    f"Coach {coach_name} is not available during {block.start_time.strftime('%H:%M')}-{block.end_time.strftime('%H:%M')} on {booking_date.strftime('%Y-%m-%d')}. "
+                                    f"Please select a different time or coach."
+                                )
+                        
                         # Lock existing bookings for this coach at this time to prevent concurrent bookings
                         conflicting_coach_bookings = Booking.objects.select_for_update().filter(
                             coach=coach,
@@ -1525,6 +1572,10 @@ class BookingViewSet(viewsets.ModelViewSet):
         force_override_value = request.data.get('force_override', False)
         force_override = str(force_override_value).lower() in ['1', 'true', 'yes']
         
+        # New parameter for refunding credit
+        refund_credit_value = request.data.get('refund_credit', True)
+        refund_credit = str(refund_credit_value).lower() in ['1', 'true', 'yes']
+        
         if not self._user_can_manage_booking(request.user, booking):
             return Response(
                 {'error': 'Permission denied'}, 
@@ -1553,53 +1604,56 @@ class BookingViewSet(viewsets.ModelViewSet):
             booking.save(update_fields=['status', 'updated_at'])
             restitution = {}
             
-            if booking.booking_type == 'coaching':
-                remaining = self._restore_coaching_session(booking)
-                restitution['sessions_remaining'] = remaining
-            elif booking.booking_type == 'simulator':
-                from decimal import Decimal
-                hours_to_restore = Decimal(str(booking.duration_minutes)) / Decimal('60')
-                
-                # Case 1: Booking used combo package hours -> restore to same package
-                if booking.package_purchase and not booking.simulator_credit_redemption and not booking.simulator_package_purchase:
-                    purchase = booking.package_purchase
-                    purchase.simulator_hours_remaining = F('simulator_hours_remaining') + hours_to_restore
-                    purchase.save(update_fields=['simulator_hours_remaining', 'updated_at'])
-                    purchase.refresh_from_db(fields=['simulator_hours_remaining'])
-                    restitution['simulator_hours_restored'] = float(purchase.simulator_hours_remaining)
-                # Case 2: Booking used simulator-only package hours -> add to credits (per requirement)
-                elif booking.simulator_package_purchase:
-                    # When simulator-only package booking is cancelled, add hours to credits
-                    credit = self._issue_simulator_credit(
-                        booking,
-                        issued_by=request.user if force_override and self._is_admin(request.user) else None,
-                        reason=SimulatorCredit.Reason.CANCELLATION
-                    )
-                    restitution['simulator_credit_id'] = credit.id
-                    restitution['simulator_credit_hours'] = float(credit.hours)
-                # Case 3: Booking used credit hours -> restore to credit
-                elif booking.simulator_credit_redemption:
-                    credit = booking.simulator_credit_redemption
-                    credit.hours_remaining = F('hours_remaining') + hours_to_restore
-                    credit.status = SimulatorCredit.Status.AVAILABLE
-                    credit.redeemed_at = None
-                    credit.save(update_fields=['hours_remaining', 'status', 'redeemed_at'])
+            # Only restore/refund if refund_credit is True
+            if refund_credit:
+                if booking.booking_type == 'coaching':
+                    remaining = self._restore_coaching_session(booking)
+                    if remaining is not None:
+                        restitution['sessions_remaining'] = remaining
+                elif booking.booking_type == 'simulator':
+                    from decimal import Decimal
+                    hours_to_restore = Decimal(str(booking.duration_minutes)) / Decimal('60')
                     
-                    # Remove the link from the booking to the credit so the credit can be reused
-                    # (Booking.simulator_credit_redemption is OneToOne, so valid for only one booking)
-                    booking.simulator_credit_redemption = None
-                    booking.save(update_fields=['simulator_credit_redemption'])
-                    
-                    credit.refresh_from_db(fields=['hours_remaining', 'status'])
-                    restitution['simulator_credit_hours_restored'] = float(credit.hours_remaining)
-                # Case 4: Booking was paid (no package, no credit) -> issue credit with exact hours
-                else:
-                    credit = self._issue_simulator_credit(
-                        booking,
-                        issued_by=request.user if force_override and self._is_admin(request.user) else None
-                    )
-                    restitution['simulator_credit_id'] = credit.id
-                    restitution['simulator_credit_hours'] = float(credit.hours)
+                    # Case 1: Booking used combo package hours -> restore to same package
+                    if booking.package_purchase and not booking.simulator_credit_redemption and not booking.simulator_package_purchase:
+                        purchase = booking.package_purchase
+                        purchase.simulator_hours_remaining = F('simulator_hours_remaining') + hours_to_restore
+                        purchase.save(update_fields=['simulator_hours_remaining', 'updated_at'])
+                        purchase.refresh_from_db(fields=['simulator_hours_remaining'])
+                        restitution['simulator_hours_restored'] = float(purchase.simulator_hours_remaining)
+                    # Case 2: Booking used simulator-only package hours -> add to credits (per requirement)
+                    elif booking.simulator_package_purchase:
+                        # When simulator-only package booking is cancelled, add hours to credits
+                        credit = self._issue_simulator_credit(
+                            booking,
+                            issued_by=request.user if force_override and self._is_admin(request.user) else None,
+                            reason=SimulatorCredit.Reason.CANCELLATION
+                        )
+                        restitution['simulator_credit_id'] = credit.id
+                        restitution['simulator_credit_hours'] = float(credit.hours)
+                    # Case 3: Booking used credit hours -> restore to credit
+                    elif booking.simulator_credit_redemption:
+                        credit = booking.simulator_credit_redemption
+                        credit.hours_remaining = F('hours_remaining') + hours_to_restore
+                        credit.status = SimulatorCredit.Status.AVAILABLE
+                        credit.redeemed_at = None
+                        credit.save(update_fields=['hours_remaining', 'status', 'redeemed_at'])
+                        
+                        # Remove the link from the booking to the credit so the credit can be reused
+                        # (Booking.simulator_credit_redemption is OneToOne, so valid for only one booking)
+                        booking.simulator_credit_redemption = None
+                        booking.save(update_fields=['simulator_credit_redemption'])
+                        
+                        credit.refresh_from_db(fields=['hours_remaining', 'status'])
+                        restitution['simulator_credit_hours_restored'] = float(credit.hours_remaining)
+                    # Case 4: Booking was paid (no package, no credit) -> issue credit with exact hours
+                    else:
+                        credit = self._issue_simulator_credit(
+                            booking,
+                            issued_by=request.user if force_override and self._is_admin(request.user) else None
+                        )
+                        restitution['simulator_credit_id'] = credit.id
+                        restitution['simulator_credit_hours'] = float(credit.hours)
         
         # Update GHL custom fields after booking cancellation
         try:
@@ -1620,6 +1674,7 @@ class BookingViewSet(viewsets.ModelViewSet):
             'booking': serializer.data,
             'lock_applies': lock_applies,
             'lock_overridden': lock_applies and force_override and self._is_admin(request.user),
+            'refund_credit': refund_credit,
             'restitution': restitution
         })
 
@@ -2371,11 +2426,36 @@ class BookingViewSet(viewsets.ModelViewSet):
                     return True
             return False
 
-        # Pre-process coach availabilities into a map for fast lookup
+        # Pre-process coach availabilities and blocked times into maps for fast lookup
+        from users.models import StaffBlockedDate
+        
         availability_by_staff = {}
+        blocked_times_by_staff = {}  # Store blocked time ranges for each coach
         day_of_week = booking_date.weekday()
         
         for coach in coaches:
+            # Get all blocked date/time ranges for this coach on this date
+            blocked_dates = StaffBlockedDate.objects.filter(staff=coach, date=booking_date)
+            
+            # Check if there's a full-day block
+            has_full_day_block = blocked_dates.filter(
+                start_time__isnull=True,
+                end_time__isnull=True
+            ).exists()
+            
+            if has_full_day_block:
+                # Skip this coach entirely - they're blocked for the whole day
+                continue
+            
+            # Store partial-day blocks for later checking
+            partial_blocks = blocked_dates.filter(
+                start_time__isnull=False,
+                end_time__isnull=False
+            ).values('start_time', 'end_time')
+            
+            if partial_blocks:
+                blocked_times_by_staff[coach.id] = list(partial_blocks)
+            
             # First check for specific date availability
             availabilities = list(StaffDayAvailability.objects.filter(
                 staff=coach,
@@ -2521,6 +2601,24 @@ class BookingViewSet(viewsets.ModelViewSet):
                 
                 if not is_on_shift:
                     continue
+                
+                # Check if this slot conflicts with any blocked time ranges for this coach
+                is_blocked = False
+                blocked_times = blocked_times_by_staff.get(coach.id, [])
+                for block in blocked_times:
+                    # Check if slot overlaps with blocked time range
+                    # Overlap if: slot_start < block_end AND slot_end > block_start
+                    block_start_time = block['start_time']
+                    block_end_time = block['end_time']
+                    slot_start_time = slot_start.time()
+                    slot_end_time = slot_end.time()
+                    
+                    if slot_start_time < block_end_time and slot_end_time > block_start_time:
+                        is_blocked = True
+                        break
+                
+                if is_blocked:
+                    continue  # Skip this coach - they're blocked during this time
                 
                 # Check if coach is already booked
                 is_booked = False
@@ -3517,7 +3615,54 @@ class GuestBookingCreateView(APIView):
                 if event.conflicts_with_range(start_time, end_time):
                     return Response({'error': f"Slot conflicts with special event: {event.title}"}, status=status.HTTP_400_BAD_REQUEST)
 
-            # 2. Check Coach Conflict
+
+            # 2. Check if coach has this date blocked (staff unavailability)
+            if coach:
+                from users.models import StaffBlockedDate
+                import pytz
+                
+                # IMPORTANT: Convert UTC times to Halifax timezone for date/time extraction
+                # Blocked dates are stored in local timezone (Halifax)
+                # If we use UTC date, late-night Halifax bookings appear as next day
+                tz = pytz.timezone('America/Halifax')
+                start_time_local = start_time.astimezone(tz)
+                end_time_local = end_time.astimezone(tz)
+                
+                booking_date = start_time_local.date()
+                booking_start_time = start_time_local.time()
+                booking_end_time = end_time_local.time()
+                
+                # Check for full-day blocks
+                if StaffBlockedDate.objects.filter(
+                    staff=coach,
+                    date=booking_date,
+                    start_time__isnull=True,
+                    end_time__isnull=True
+                ).exists():
+                    coach_name = f"{coach.first_name} {coach.last_name}".strip()
+                    return Response(
+                        {'error': f"Coach {coach_name} is not available on {booking_date.strftime('%Y-%m-%d')} (full day blocked). Please select a different date or coach."},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+                
+                # Check for partial-day blocks that overlap with booking time
+                partial_blocks = StaffBlockedDate.objects.filter(
+                    staff=coach,
+                    date=booking_date,
+                    start_time__isnull=False,
+                    end_time__isnull=False
+                )
+                
+                for block in partial_blocks:
+                    # Check if booking time overlaps with blocked time
+                    if booking_start_time < block.end_time and booking_end_time > block.start_time:
+                        coach_name = f"{coach.first_name} {coach.last_name}".strip()
+                        return Response(
+                            {'error': f"Coach {coach_name} is not available during {block.start_time.strftime('%H:%M')}-{block.end_time.strftime('%H:%M')} on {booking_date.strftime('%Y-%m-%d')}. Please select a different time or coach."},
+                            status=status.HTTP_400_BAD_REQUEST
+                        )
+
+            # 3. Check Coach Conflict
             coach_conflict_qs = Booking.objects.filter(
                 start_time__lt=end_time,
                 end_time__gt=start_time,

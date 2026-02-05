@@ -1,6 +1,6 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
-from .models import User, StaffAvailability, StaffDayAvailability
+from .models import User, StaffAvailability, StaffDayAvailability, StaffBlockedDate
 
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):
@@ -29,3 +29,10 @@ class StaffDayAvailabilityAdmin(admin.ModelAdmin):
     list_display = ('staff', 'date', 'start_time', 'end_time')
     list_filter = ('date', 'staff')
     date_hierarchy = 'date'
+
+@admin.register(StaffBlockedDate)
+class StaffBlockedDateAdmin(admin.ModelAdmin):
+    list_display = ('staff', 'date', 'reason', 'created_by', 'created_at')
+    list_filter = ('staff', 'date', 'created_by')
+    date_hierarchy = 'date'
+    readonly_fields = ('created_at',)
