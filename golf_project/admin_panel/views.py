@@ -359,10 +359,13 @@ class StaffViewSet(viewsets.ModelViewSet):
         if location_id and staff.ghl_location_id != location_id:
             raise PermissionDenied("You can only manage blocked dates for staff in your location.")
         
+        from users.models import StaffBlockedDate
+        from users.serializers import StaffBlockedDateSerializer
+        from datetime import datetime as dt, time as dt_time
+        import pytz
+
         if request.method == 'GET':
             # Get all blocked dates for this staff member
-            from users.models import StaffBlockedDate
-            from users.serializers import StaffBlockedDateSerializer
             
             blocked_dates = StaffBlockedDate.objects.filter(staff=staff).order_by('date')
             serializer = StaffBlockedDateSerializer(blocked_dates, many=True)
@@ -370,14 +373,6 @@ class StaffViewSet(viewsets.ModelViewSet):
         
         elif request.method == 'POST':
             # Block a specific date (full-day or partial-day) and cancel conflicting bookings
-            from users.models import StaffBlockedDate
-            from users.serializers import StaffBlockedDateSerializer
-            from datetime import datetime as dt, time as dt_time
-            from django.db import transaction
-            from django.db.models import F
-            from decimal import Decimal
-            import pytz
-            
             date_str = request.data.get('date')
             start_time_str = request.data.get('start_time')  # Optional: "10:00" for partial-day block
             end_time_str = request.data.get('end_time')      # Optional: "15:00" for partial-day block
@@ -465,7 +460,6 @@ class StaffViewSet(viewsets.ModelViewSet):
             )
             
             # Find and cancel conflicting coaching bookings
-            from bookings.models import Booking
             
             # PROJECT STANDARD: Use America/Halifax for business logic date interpretation
             tz = pytz.timezone('America/Halifax')
@@ -518,14 +512,6 @@ class StaffViewSet(viewsets.ModelViewSet):
                         purchase.save()
                         purchase.refresh_from_db()
                         refunded_sessions += 1
-                        
-                        # If it's a combo package with simulator hours, refund those too
-                        if booking.duration_minutes and purchase.package and purchase.package.simulator_hours:
-                            hours_to_refund = Decimal(str(booking.duration_minutes)) / Decimal('60')
-                            purchase.simulator_hours_remaining = F('simulator_hours_remaining') + hours_to_refund
-                            purchase.save()
-                            purchase.refresh_from_db()
-                            refunded_hours += hours_to_refund
                     
                     cancelled_count += 1
                     
@@ -556,8 +542,6 @@ class StaffViewSet(viewsets.ModelViewSet):
         
         elif request.method == 'DELETE':
             # Unblock a specific date
-            from users.models import StaffBlockedDate
-            
             date_str = request.data.get('date') or request.query_params.get('date')
             
             if not date_str:
@@ -1413,25 +1397,25 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
                             notes=f"Credit from force-cancelled booking {booking.id} due to Closed Day creation"
                         )
 
-            # 2. Cancel/Deactivate Special Events
-            from special_events.models import SpecialEvent
-            events = SpecialEvent.objects.filter(
-                date__gte=start_date,
-                date__lte=end_date,
-                is_active=True
-            )
-            if location_id:
-                events = events.filter(location_id=location_id)
-            
-            # For Recurring closed days, maybe we need to be more aggressive, but let's stick to the range
-            events.update(is_active=False)
-            
-            # 3. Remove Staff Day Availability
-            # We delete specific day overrides that might exist
-            StaffDayAvailability.objects.filter(
-                date__gte=start_date,
-                date__lte=end_date
-            ).delete()
+            # 2. Cancel/Deactivate Special Events (only for full-day closures)
+            # For partial closures, the booking logic will naturally block overlapping slots
+            if not start_time or not end_time:
+                from special_events.models import SpecialEvent
+                events = SpecialEvent.objects.filter(
+                    date__gte=start_date,
+                    date__lte=end_date,
+                    is_active=True
+                )
+                if location_id:
+                    events = events.filter(location_id=location_id)
+                events.update(is_active=False)
+                
+                # 3. Remove Staff Day Availability
+                # We delete specific day overrides that might exist
+                StaffDayAvailability.objects.filter(
+                    date__gte=start_date,
+                    date__lte=end_date
+                ).delete()
 
         if location_id:
             serializer.save(location_id=location_id)

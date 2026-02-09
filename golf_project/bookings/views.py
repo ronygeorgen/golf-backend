@@ -12,6 +12,7 @@ from django.utils import timezone
 from django.conf import settings
 from datetime import datetime, timedelta
 import logging
+import pytz
 from .models import Booking, TempBooking
 from .serializers import BookingSerializer, BookingCreateSerializer
 from users.models import User
@@ -2419,7 +2420,12 @@ class BookingViewSet(viewsets.ModelViewSet):
             active_closures = active_closures.filter(Q(location_id=location_id) | Q(location_id__isnull=True))
         active_closures = list(active_closures)
 
+        # Use Halifax timezone
+        halifax_tz = pytz.timezone('America/Halifax')
+
         def is_facility_closed(check_time):
+            # ClosedDay stores times in UTC (converted by frontend during creation)
+            # check_time is already in UTC
             for closure in active_closures:
                 is_closed, _ = closure.is_datetime_closed(check_time)
                 if is_closed:
@@ -2430,8 +2436,10 @@ class BookingViewSet(viewsets.ModelViewSet):
         from users.models import StaffBlockedDate
         
         availability_by_staff = {}
-        blocked_times_by_staff = {}  # Store blocked time ranges for each coach
+        blocked_times_by_staff = {}  # Store blocked time ranges for each coach (UTC)
         day_of_week = booking_date.weekday()
+        
+        # halifax_tz defined above
         
         for coach in coaches:
             # Get all blocked date/time ranges for this coach on this date
@@ -2447,16 +2455,30 @@ class BookingViewSet(viewsets.ModelViewSet):
                 # Skip this coach entirely - they're blocked for the whole day
                 continue
             
-            # Store partial-day blocks for later checking
+            # Store partial-day blocks in UTC
             partial_blocks = blocked_dates.filter(
                 start_time__isnull=False,
                 end_time__isnull=False
             ).values('start_time', 'end_time')
             
             if partial_blocks:
-                blocked_times_by_staff[coach.id] = list(partial_blocks)
+                utc_blocks = []
+                for b in partial_blocks:
+                    # Convert Halifax times to UTC
+                    s_naive = datetime.combine(booking_date, b['start_time'])
+                    e_naive = datetime.combine(booking_date, b['end_time'])
+                    
+                    # Handle midnight crossover if end time <= start time (rare for blocks but possible)
+                    if b['end_time'] <= b['start_time']:
+                        e_naive += timedelta(days=1)
+                        
+                    s_utc = halifax_tz.localize(s_naive).astimezone(pytz.UTC)
+                    e_utc = halifax_tz.localize(e_naive).astimezone(pytz.UTC)
+                    utc_blocks.append((s_utc, e_utc))
+                    
+                blocked_times_by_staff[coach.id] = utc_blocks
             
-            # First check for specific date availability
+            # First check for specific day availability
             availabilities = list(StaffDayAvailability.objects.filter(
                 staff=coach,
                 date=booking_date
@@ -2470,35 +2492,41 @@ class BookingViewSet(viewsets.ModelViewSet):
                 ).values('start_time', 'end_time'))
             
             if availabilities:
-                availability_by_staff[coach.id] = availabilities
+                utc_avail = []
+                for a in availabilities:
+                    # Convert Halifax times to UTC
+                    s_naive = datetime.combine(booking_date, a['start_time'])
+                    e_naive = datetime.combine(booking_date, a['end_time'])
+                    
+                    # Handle midnight crossover
+                    if a['end_time'] <= a['start_time']:
+                        e_naive += timedelta(days=1)
+                    
+                    s_utc = halifax_tz.localize(s_naive).astimezone(pytz.UTC)
+                    e_utc = halifax_tz.localize(e_naive).astimezone(pytz.UTC)
+                    utc_avail.append((s_utc, e_utc))
+                    
+                availability_by_staff[coach.id] = utc_avail
 
         # We will iterate through all possible 30-minute slots of the day
         # and for each slot, determine which coaches are available and which bays are free.
         
         # Determine the earliest start and latest end across all coaches to bound the search
-        min_start = None
-        max_end_dt = None
+        min_start_utc = None
+        max_end_utc = None
         for staff_id, avail_list in availability_by_staff.items():
-            for a in avail_list:
-                s_time = a['start_time']
-                e_time = a['end_time']
+            for s_utc, e_utc in avail_list:
+                if min_start_utc is None or s_utc < min_start_utc:
+                    min_start_utc = s_utc
                 
-                if min_start is None or s_time < min_start:
-                    min_start = s_time
-                
-                # Create a datetime for the end time to handle comparison across midnight
-                current_e_dt = datetime.combine(booking_date, e_time)
-                if e_time <= s_time: # Midnight or crossover
-                    current_e_dt += timedelta(days=1)
-                
-                if max_end_dt is None or current_e_dt > max_end_dt:
-                    max_end_dt = current_e_dt
+                if max_end_utc is None or e_utc > max_end_utc:
+                    max_end_utc = e_utc
         
-        if not min_start:
+        if not min_start_utc:
             return Response({'available_slots': [], 'message': 'No coach availability found'})
 
-        current_slot_start_naive = datetime.combine(booking_date, min_start)
-        day_end_naive = max_end_dt
+        current_slot_start = min_start_utc
+        day_end = max_end_utc
         
         slot_interval = 30
         available_slots_map = {}
@@ -2517,19 +2545,19 @@ class BookingViewSet(viewsets.ModelViewSet):
             if e.get_occurrences(start_date=booking_date, end_date=next_day)
         ]
 
-        while current_slot_start_naive < day_end_naive:
-            slot_start = timezone.make_aware(current_slot_start_naive)
+        while current_slot_start < day_end:
+            slot_start = current_slot_start
             
             # Skip past slots
             if slot_start < now:
-                current_slot_start_naive += timedelta(minutes=slot_interval)
+                current_slot_start += timedelta(minutes=slot_interval)
                 continue
             
             slot_end = slot_start + timedelta(minutes=duration_minutes)
             
             # Check if facility is closed
             if is_facility_closed(slot_start):
-                current_slot_start_naive += timedelta(minutes=slot_interval)
+                current_slot_start += timedelta(minutes=slot_interval)
                 continue
 
             # Check for special event conflict
@@ -2540,7 +2568,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                     break
             
             if has_special_event:
-                current_slot_start_naive += timedelta(minutes=slot_interval)
+                current_slot_start += timedelta(minutes=slot_interval)
                 continue
 
             # 1. Find all free bays for this slot
@@ -2578,7 +2606,7 @@ class BookingViewSet(viewsets.ModelViewSet):
             
             total_free_bays = free_coaching_bays + free_simulator_bays
             if not total_free_bays:
-                current_slot_start_naive += timedelta(minutes=slot_interval)
+                current_slot_start += timedelta(minutes=slot_interval)
                 continue
 
             # 2. Find all coaches available for this slot
@@ -2587,16 +2615,13 @@ class BookingViewSet(viewsets.ModelViewSet):
                 # Check if coach has shift at this time
                 is_on_shift = False
                 shift_end_time = None
-                coach_availabilities = availability_by_staff.get(coach.id, [])
-                for a in coach_availabilities:
-                    a_start = timezone.make_aware(datetime.combine(booking_date, a['start_time']))
-                    a_end = timezone.make_aware(datetime.combine(booking_date, a['end_time']))
-                    if a['end_time'] <= a['start_time']: # Handle midnight crossover
-                         a_end += timedelta(days=1)
-                    
-                    if a_start <= slot_start and a_end >= slot_end:
+                coach_avail_list = availability_by_staff.get(coach.id, [])
+                
+                # Iterate UTC availability ranges
+                for s_utc, e_utc in coach_avail_list:
+                    if s_utc <= slot_start and e_utc >= slot_end:
                         is_on_shift = True
-                        shift_end_time = a_end
+                        shift_end_time = e_utc
                         break
                 
                 if not is_on_shift:
@@ -2604,16 +2629,12 @@ class BookingViewSet(viewsets.ModelViewSet):
                 
                 # Check if this slot conflicts with any blocked time ranges for this coach
                 is_blocked = False
-                blocked_times = blocked_times_by_staff.get(coach.id, [])
-                for block in blocked_times:
-                    # Check if slot overlaps with blocked time range
-                    # Overlap if: slot_start < block_end AND slot_end > block_start
-                    block_start_time = block['start_time']
-                    block_end_time = block['end_time']
-                    slot_start_time = slot_start.time()
-                    slot_end_time = slot_end.time()
-                    
-                    if slot_start_time < block_end_time and slot_end_time > block_start_time:
+                coach_blocked_list = blocked_times_by_staff.get(coach.id, [])
+                
+                # Iterate UTC blocked ranges
+                for b_start, b_end in coach_blocked_list:
+                    # Overlap logic: slot_start < block_end AND slot_end > block_start
+                    if slot_start < b_end and slot_end > b_start:
                         is_blocked = True
                         break
                 
@@ -2633,7 +2654,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                 slot_coaches.append((coach, shift_end_time))
             
             if not slot_coaches:
-                current_slot_start_naive += timedelta(minutes=slot_interval)
+                current_slot_start += timedelta(minutes=slot_interval)
                 continue
 
             # 3. Associate coaches with bays
@@ -2677,7 +2698,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                 
                 assigned_count += 1
 
-            current_slot_start_naive += timedelta(minutes=slot_interval)
+            current_slot_start += timedelta(minutes=slot_interval)
         
         available_slots = sorted(available_slots_map.values(), key=lambda x: x['start_time'])
         
@@ -2708,7 +2729,7 @@ class BookingViewSet(viewsets.ModelViewSet):
 
         location_id = get_location_id_from_request(request)
         
-        from users.models import User, StaffAvailability, StaffDayAvailability
+        from users.models import User, StaffAvailability, StaffDayAvailability, StaffBlockedDate
         
         staff_qs = User.objects.filter(role__in=['staff', 'admin'], is_active=True)
         if location_id:
@@ -2731,35 +2752,78 @@ class BookingViewSet(viewsets.ModelViewSet):
             if b.coach_id not in bookings_by_staff:
                 bookings_by_staff[b.coach_id] = []
             bookings_by_staff[b.coach_id].append(b)
-            
+
+        # Prefetch blocked dates
+        blocks = StaffBlockedDate.objects.filter(date=query_date, staff__in=staff_members)
+        blocks_by_staff = {}
+        for b in blocks:
+            if b.staff_id not in blocks_by_staff:
+                blocks_by_staff[b.staff_id] = []
+            blocks_by_staff[b.staff_id].append(b)
+
         day_of_week = query_date.weekday()
         
+        # Use Halifax timezone
+        halifax_tz = pytz.timezone('America/Halifax')
+
         for staff in staff_members:
             # 1. Get working hours
             working_hours = None
             
-            # Check specific day override first
-            day_avail = StaffDayAvailability.objects.filter(staff=staff, date=query_date).first()
-            if day_avail:
-                if not day_avail.is_off_day:
-                     working_hours = {'start': day_avail.start_time, 'end': day_avail.end_time}
-            else:
-                # Check recurring
-                recur_avail = StaffAvailability.objects.filter(staff=staff, day_of_week=day_of_week).first()
-                if recur_avail:
-                    working_hours = {'start': recur_avail.start_time, 'end': recur_avail.end_time}
+            # Check for full-day blocks first
+            staff_blocks = blocks_by_staff.get(staff.id, [])
+            is_full_day_blocked = any(b.is_full_day_block() for b in staff_blocks)
+
+            if not is_full_day_blocked:
+                # Check specific day override first
+                day_avail = StaffDayAvailability.objects.filter(staff=staff, date=query_date).first()
+                if day_avail:
+                    # Note: removed .is_off_day check as it doesn't exist on the model
+                    working_hours = {'start': day_avail.start_time, 'end': day_avail.end_time}
+                else:
+                    # Check recurring
+                    recur_avail = StaffAvailability.objects.filter(staff=staff, day_of_week=day_of_week).first()
+                    if recur_avail:
+                        working_hours = {'start': recur_avail.start_time, 'end': recur_avail.end_time}
             
             # 2. Get bookings
             staff_bookings = bookings_by_staff.get(staff.id, [])
             booking_data = []
+            
+            # halifax_tz defined above
+            
             for b in staff_bookings:
+                # Convert to Halifax local time for display
+                local_start = b.start_time.astimezone(halifax_tz)
+                local_end = b.end_time.astimezone(halifax_tz)
+                
                 booking_data.append({
                     'id': b.id,
-                    'start_time': b.start_time.isoformat(),
-                    'end_time': b.end_time.isoformat(),
+                    'start_time': local_start.isoformat(),
+                    'end_time': local_end.isoformat(),
                     'client_name': f"{b.client.first_name} {b.client.last_name}",
                     'simulator': b.simulator.name if b.simulator else None
                 })
+            
+            # Add partial blocks to the schedule
+            for block in staff_blocks:
+                if not block.is_full_day_block():
+                    # Combine query_date with block times
+                    # block.start_time/end_time are in Halifax local time
+                    block_start = datetime.combine(query_date, block.start_time)
+                    block_end = datetime.combine(query_date, block.end_time)
+                    
+                    # Localize to Halifax to get proper ISO format with offset
+                    block_start_local = halifax_tz.localize(block_start)
+                    block_end_local = halifax_tz.localize(block_end)
+
+                    booking_data.append({
+                        'id': f"block-{block.id}",
+                        'start_time': block_start_local.isoformat(),
+                        'end_time': block_end_local.isoformat(),
+                        'client_name': "BLOCKED",
+                        'simulator': block.reason or "Unavailable"
+                    })
             
             # Format working hours
             formatted_hours = None

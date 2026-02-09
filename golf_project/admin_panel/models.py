@@ -62,8 +62,12 @@ class ClosedDay(models.Model):
         from django.core.exceptions import ValidationError
         if self.end_date < self.start_date:
             raise ValidationError("End date cannot be before start date.")
-        if self.start_time and self.end_time and self.end_time <= self.start_time:
-            raise ValidationError("End time must be after start time.")
+        if self.start_time and self.end_time:
+            # Combine date and time to handle midnight crossovers
+            start_dt = datetime.combine(self.start_date, self.start_time)
+            end_dt = datetime.combine(self.end_date, self.end_time)
+            if end_dt <= start_dt:
+                raise ValidationError("End date and time must be after start date and time.")
     
     def save(self, *args, **kwargs):
         self.clean()
@@ -87,16 +91,31 @@ class ClosedDay(models.Model):
             return self.start_date <= check_date <= self.end_date
         
         elif self.recurrence == 'weekly':
-            # Weekly recurring: check if the day of week matches
-            # Get the day of week from start_date (0=Monday, 6=Sunday)
-            start_day_of_week = self.start_date.weekday()
-            check_day_of_week = check_date.weekday()
-            return start_day_of_week == check_day_of_week
+            # Weekly recurring: check if the day of week falls within the range
+            # Get the day of week from start and end dates (0=Monday, 6=Sunday)
+            start_dow = self.start_date.weekday()
+            end_dow = self.end_date.weekday()
+            check_dow = check_date.weekday()
+            
+            if start_dow <= end_dow:
+                # Normal range within a week (e.g., Mon-Wed)
+                return start_dow <= check_dow <= end_dow
+            else:
+                # Spans across Sunday-Monday boundary (e.g., Sat-Tue)
+                return check_dow >= start_dow or check_dow <= end_dow
         
         elif self.recurrence == 'yearly':
-            # Yearly recurring: check if month and day match
-            return (self.start_date.month == check_date.month and 
-                    self.start_date.day == check_date.day)
+            # Yearly recurring: check if month and day match a date in the range
+            # For simplicity, we compare (month, day) tuples
+            start_md = (self.start_date.month, self.start_date.day)
+            end_md = (self.end_date.month, self.end_date.day)
+            check_md = (check_date.month, check_date.day)
+            
+            if start_md <= end_md:
+                return start_md <= check_md <= end_md
+            else:
+                # Spans across New Year (e.g., Dec 30 - Jan 2)
+                return check_md >= start_md or check_md <= end_md
         
         return False
     
@@ -124,9 +143,71 @@ class ClosedDay(models.Model):
         if not self.start_time or not self.end_time:
             return (True, f"{self.title}: Facility is closed on this day.")
         
-        # Check if time falls within the closed time range
-        if self.start_time <= check_time < self.end_time:
-            return (True, f"{self.title}: Facility is closed from {self.start_time} to {self.end_time}.")
+        # For one_time closures, we can check the exact range with datetimes
+        if self.recurrence == 'one_time':
+            start_dt = datetime.combine(self.start_date, self.start_time)
+            end_dt = datetime.combine(self.end_date, self.end_time)
+            
+            # Ensure both are either naive or aware to allow comparison
+            if check_datetime.tzinfo:
+                start_dt = start_dt.replace(tzinfo=check_datetime.tzinfo)
+                end_dt = end_dt.replace(tzinfo=check_datetime.tzinfo)
+                
+            if start_dt <= check_datetime < end_dt:
+                return (True, f"{self.title}: Facility is closed from {self.start_time.strftime('%H:%M')} to {self.end_time.strftime('%H:%M')}.")
+            return (False, None)
+            
+        # For recurring closures, check if time falls within the range
+        # If it's a multi-day closure, the check depends on which part of the range we're on
+        
+        # Normalized day of week for range checks
+        start_dow = self.start_date.weekday()
+        end_dow = self.end_date.weekday()
+        check_dow = check_date.weekday()
+        
+        is_multi_day = self.start_date != self.end_date
+        
+        if not is_multi_day:
+            # Single day range: start_time <= check_time < end_time
+            # (Note: we already know check_date matches)
+            if self.start_time <= check_time < self.end_time:
+                return (True, f"{self.title}: Facility is closed from {self.start_time.strftime('%H:%M')} to {self.end_time.strftime('%H:%M')}.")
+        else:
+            # Multi-day range
+            # 1. If it's the start date: check check_time >= start_time
+            # 2. If it's the end date: check check_time < end_time
+            # 3. If it's a day in between: it's closed regardless of time
+            
+            # Use recurrence-specific matching for start/end days
+            if self.recurrence == 'weekly':
+                if check_dow == start_dow:
+                    if check_time >= self.start_time:
+                        return (True, f"{self.title}: Facility is closed (starts {self.start_time.strftime('%H:%M')}).")
+                    return (False, None)
+                elif check_dow == end_dow:
+                    if check_time < self.end_time:
+                        return (True, f"{self.title}: Facility is closed (until {self.end_time.strftime('%H:%M')}).")
+                    return (False, None)
+                else:
+                    # middle day
+                    return (True, f"{self.title}: Facility is closed.")
+            
+            elif self.recurrence == 'yearly':
+                check_md = (check_date.month, check_date.day)
+                start_md = (self.start_date.month, self.start_date.day)
+                end_md = (self.end_date.month, self.end_date.day)
+                
+                if check_md == start_md:
+                    if check_time >= self.start_time:
+                        return (True, f"{self.title}: Facility is closed (starts {self.start_time.strftime('%H:%M')}).")
+                    return (False, None)
+                elif check_md == end_md:
+                    if check_time < self.end_time:
+                        return (True, f"{self.title}: Facility is closed (until {self.end_time.strftime('%H:%M')}).")
+                    return (False, None)
+                else:
+                    # middle day
+                    return (True, f"{self.title}: Facility is closed.")
         
         return (False, None)
     

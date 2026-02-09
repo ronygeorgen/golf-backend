@@ -142,7 +142,15 @@ class ClosedDaySerializer(serializers.ModelSerializer):
                 })
         
         if start_time and end_time:
-            if end_time <= start_time:
+            if start_date and end_date:
+                # Combine date and time for comparison to handle midnight crossovers
+                start_dt = datetime.combine(start_date, start_time)
+                end_dt = datetime.combine(end_date, end_time)
+                if end_dt <= start_dt:
+                    raise serializers.ValidationError({
+                        'end_time': 'End date and time must be after start date and time.'
+                    })
+            elif end_time <= start_time:
                 raise serializers.ValidationError({
                     'end_time': 'End time must be after start time.'
                 })
