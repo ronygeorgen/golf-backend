@@ -48,6 +48,7 @@ INSTALLED_APPS = [
     'admin_panel',
     'ghl',
     'special_events',
+    'banners',
 ]
 
 MIDDLEWARE = [
