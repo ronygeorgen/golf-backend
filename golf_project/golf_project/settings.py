@@ -49,6 +49,7 @@ INSTALLED_APPS = [
     'ghl',
     'special_events',
     'banners',
+    'dashboard',
 ]
 
 MIDDLEWARE = [

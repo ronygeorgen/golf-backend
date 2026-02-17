@@ -27,4 +27,5 @@ urlpatterns = [
     path('api/ghlpage/', include('ghl.urls')),
     path('api/special-events/', include('special_events.urls')),
     path('api/banners/', include('banners.urls')),
+    path('api/dashboard/', include('dashboard.urls')),
 ]
