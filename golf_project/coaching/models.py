@@ -635,6 +635,14 @@ class SimulatorPackagePurchase(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
     gift_expires_at = models.DateTimeField(null=True, blank=True, help_text="Expiration date for gift claim")
     expiry_date = models.DateField(null=True, blank=True, help_text="Expiry date for this purchase. After this date, the package cannot be used.")
+    referral_id = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='referred_simulator_purchases',
+        help_text="Staff member who referred this purchase (optional)"
+    )
     
     class Meta:
         ordering = ['-purchased_at']

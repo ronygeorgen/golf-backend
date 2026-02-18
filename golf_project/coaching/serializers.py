@@ -573,6 +573,7 @@ class SimulatorPackagePurchaseSerializer(serializers.ModelSerializer):
             'updated_at',
             'gift_expires_at',
             'expiry_date',
+            'referral_id',
         ]
         read_only_fields = [
             'client', 'hours_remaining', 'purchased_at', 'updated_at',

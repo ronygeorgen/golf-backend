@@ -975,23 +975,39 @@ def member_list(request):
             total_hours = calculate_total_simulator_hours(client)
             last_package = get_last_active_package(client)
             
-            # Get staff/admin-referred purchases
-            from coaching.models import CoachingPackagePurchase
-            staff_referred_purchases = CoachingPackagePurchase.objects.filter(
+            # Get staff/admin-referred purchases (both coaching and simulator)
+            from coaching.models import CoachingPackagePurchase, SimulatorPackagePurchase
+            
+            # Get coaching package purchases
+            coaching_purchases = CoachingPackagePurchase.objects.filter(
                 referral_id=staff_or_admin_user_id,
                 client=client,
                 package_status='active'
             ).values('id', 'package__title', 'purchase_name', 'purchased_at')
             
-            staff_referred_purchases = [
-                {
+            # Get simulator package purchases
+            simulator_purchases = SimulatorPackagePurchase.objects.filter(
+                referral_id=staff_or_admin_user_id,
+                client=client,
+                package_status='active'
+            ).values('id', 'package__title', 'purchase_name', 'purchased_at')
+            
+            # Combine and format both types of purchases
+            staff_referred_purchases = []
+            for p in coaching_purchases:
+                staff_referred_purchases.append({
                     'id': p['id'],
                     'package_name': p['package__title'],
                     'purchase_name': p['purchase_name'] or p['package__title'],
                     'purchased_at': p['purchased_at'].isoformat() if p['purchased_at'] else None
-                }
-                for p in staff_referred_purchases
-            ]
+                })
+            for p in simulator_purchases:
+                staff_referred_purchases.append({
+                    'id': p['id'],
+                    'package_name': p['package__title'],
+                    'purchase_name': p['purchase_name'] or p['package__title'],
+                    'purchased_at': p['purchased_at'].isoformat() if p['purchased_at'] else None
+                })
             
             member_list_data.append({
                 'id': client.id,
@@ -999,6 +1015,7 @@ def member_list(request):
                 'last_name': client.last_name or '',
                 'email': client.email or '',
                 'phone': client.phone,
+                'role': client.role or '',
                 'custom_fields': {
                     'total_coaching_session': str(total_sessions),
                     'total_simulator_hour': str(total_hours),

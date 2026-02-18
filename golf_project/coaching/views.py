@@ -1559,9 +1559,10 @@ class PackagePurchaseWebhookView(APIView):
                         package_status='active',
                         gift_status=None,
                         expiry_date=(
-                            (django_timezone.now().date() + timedelta(days=simulator_package.validity_days))
+                            (timezone.now().date() + timedelta(days=simulator_package.validity_days))
                             if simulator_package.validity_days else None
-                        )
+                        ),
+                        referral_id=temp_purchase.referral_id  # Copy referral_id from temp_purchase
                     )
                     
                     logger.info(f"Simulator package purchase created via webhook: User {buyer.phone}, Package {simulator_package.id}, Purchase ID {purchase.id}")
@@ -1660,11 +1661,12 @@ class PackagePurchaseWebhookView(APIView):
                         original_owner=buyer,
                         recipient_phone=recipient_phone,
                         expiry_date=(
-                            (django_timezone.now().date() + timedelta(days=simulator_package.validity_days))
+                            (timezone.now().date() + timedelta(days=simulator_package.validity_days))
                             if simulator_package.validity_days else None
                         ),
                         gift_token=SimulatorPackagePurchase().generate_gift_token(),
-                        gift_expires_at=timezone.now() + timedelta(days=30)
+                        gift_expires_at=timezone.now() + timedelta(days=30),
+                        referral_id=temp_purchase.referral_id  # Copy referral_id from temp_purchase
                     )
                 else:
                     simulator_hours = Decimal(str(package.simulator_hours)) if package.simulator_hours else Decimal('0')
