@@ -5,6 +5,7 @@ from rest_framework.permissions import IsAuthenticated
 from django.db.models import Sum, Count, Q
 from django.utils import timezone
 from datetime import datetime, timedelta
+import pytz
 
 # Import from other apps
 from users.utils import get_location_id_from_request
@@ -47,6 +48,7 @@ class DashboardViewSet(viewsets.ViewSet):
         """
         Returns heatmap data for busy & quiet times
         Format: {day_of_week: {hour: activity_count}}
+        Times are converted from UTC (stored in DB) to Halifax timezone
         """
         location_id = get_location_id_from_request(request)
         start_date, end_date = self._get_date_range(request)
@@ -68,11 +70,23 @@ class DashboardViewSet(viewsets.ViewSet):
             for hour in range(24):
                 heatmap_data[day][hour] = 0
         
+        # Get Halifax timezone
+        halifax_tz = pytz.timezone('America/Halifax')
+        
         # Aggregate bookings by day of week and hour
         for booking in bookings:
-            booking_time = booking.start_time
-            day_of_week = booking_time.weekday()  # 0=Monday, 6=Sunday
-            hour = booking_time.hour
+            # booking.start_time is stored in UTC (timezone-aware)
+            # Convert to Halifax timezone
+            if timezone.is_aware(booking.start_time):
+                # If timezone-aware, convert to Halifax
+                halifax_time = booking.start_time.astimezone(halifax_tz)
+            else:
+                # If naive, assume UTC and make aware, then convert
+                utc_time = timezone.make_aware(booking.start_time, pytz.UTC)
+                halifax_time = utc_time.astimezone(halifax_tz)
+            
+            day_of_week = halifax_time.weekday()  # 0=Monday, 6=Sunday
+            hour = halifax_time.hour
             
             heatmap_data[day_of_week][hour] += 1
         
