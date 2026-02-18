@@ -2711,7 +2711,7 @@ class BookingViewSet(viewsets.ModelViewSet):
         
         return Response(response_data)
     
-    @action(detail=False, methods=['get'])
+    @action(detail=False, methods=['get'], url_path='staff-daily-schedule')
     def staff_daily_schedule(self, request):
         """Get daily schedule for all staff members"""
         # Admin/Staff only
