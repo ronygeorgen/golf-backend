@@ -2389,8 +2389,24 @@ class BookingViewSet(viewsets.ModelViewSet):
 
         # Prefetch ALL relevant bookings and temp bookings for this date and location
         # This eliminates thousands of database queries in the loops below
+        #
+        # IMPORTANT: Bookings are stored in UTC. Halifax is UTC-4 (AST) or UTC-3 (ADT).
+        # A booking that starts at 8pm Halifax = midnight UTC (next UTC day).
+        # Using start_time__date=booking_date (UTC) would MISS those late-evening bookings,
+        # causing them to appear available and allowing double-bookings.
+        # Fix: fetch bookings that OVERLAP the full UTC window of this Halifax day.
+        # Halifax day spans from midnight Halifax (UTC+4h) to midnight Halifax next day (UTC+4h),
+        # so we use a generous window: booking_date UTC-midnight to booking_date+2 UTC-midnight.
+        # The overlap check (start_time < day_utc_end AND end_time > day_utc_start) handles the rest.
+        # Use the actual UTC range covered by the Halifax day:
+        # Halifax (AST=UTC-4, ADT=UTC-3:30): midnight Halifax = 03:30 or 04:00 UTC.
+        # Use 03:00 UTC as the safe lower bound, and 06:00 UTC the next day as upper bound,
+        # which fully covers any Halifax-day booking (latest possible = 9pm Halifax = 01:00 UTC).
+        booking_day_utc_start = pytz.UTC.localize(datetime(booking_date.year, booking_date.month, booking_date.day, 3, 0, 0))
+        booking_day_utc_end = pytz.UTC.localize(datetime(booking_date.year, booking_date.month, booking_date.day, 3, 0, 0) + timedelta(days=1, hours=3))
         relevant_bookings = Booking.objects.filter(
-            start_time__date=booking_date,
+            start_time__lt=booking_day_utc_end,
+            end_time__gt=booking_day_utc_start,
             status__in=['confirmed', 'completed']
         )
         if location_id:
@@ -2405,7 +2421,8 @@ class BookingViewSet(viewsets.ModelViewSet):
         relevant_bookings = list(relevant_bookings.select_related('simulator', 'coach'))
 
         relevant_temps = TempBooking.objects.filter(
-            start_time__date=booking_date,
+            start_time__lt=booking_day_utc_end,
+            end_time__gt=booking_day_utc_start,
             status='reserved',
             expires_at__gt=timezone.now()
         )
@@ -2548,8 +2565,9 @@ class BookingViewSet(viewsets.ModelViewSet):
         while current_slot_start < day_end:
             slot_start = current_slot_start
             
-            # Skip past slots
-            if slot_start < now:
+            # Skip slots that have already started or passed (compare in UTC)
+            # Use <= now so that a slot starting exactly at the current second is also skipped
+            if slot_start <= now:
                 current_slot_start += timedelta(minutes=slot_interval)
                 continue
             
