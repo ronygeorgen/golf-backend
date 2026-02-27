@@ -116,6 +116,7 @@ CORS_ALLOW_HEADERS = [
     'user-agent',
     'x-csrftoken',
     'x-requested-with',
+    'ngrok-skip-browser-warning',
 ]   
 CORS_PREFLIGHT_MAX_AGE = 86400
 
