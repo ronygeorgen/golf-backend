@@ -82,6 +82,9 @@ MIDDLEWARE = [
 #     "https://unscavenged-uncalumnious-desmond.ngrok-free.dev",
 # ]
 
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+USE_X_FORWARDED_HOST = True
+
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_ALL_ORIGINS = False
 
