@@ -1294,6 +1294,12 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
         force_override = self.request.data.get('force_override', False)
         
         if force_override:
+            from golf_project.timezone_utils import get_center_timezone
+            import pytz
+            from datetime import datetime, timedelta, time as dt_time
+            
+            center_tz = get_center_timezone(location_id)
+            
             start_date = serializer.validated_data.get('start_date')
             end_date = serializer.validated_data.get('end_date')
             start_time = serializer.validated_data.get('start_time')
@@ -1301,58 +1307,60 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
             recurrence = serializer.validated_data.get('recurrence', 'one_time')
             
             # 1. Cancel conflicting bookings
-            # Only cancel bookings that actually overlap with the closed time range
-            # If it's a full day closure (no times), cancel all bookings on those dates
-            # If it's a partial closure (has times), only cancel bookings that overlap with the time range
+            # Calculate the full UTC range for the closed dates based on the center's timezone
+            start_of_period_local = center_tz.localize(datetime.combine(start_date, dt_time.min))
+            end_of_period_local = center_tz.localize(datetime.combine(end_date, dt_time.max))
+            start_of_period_utc = start_of_period_local.astimezone(pytz.utc)
+            end_of_period_utc = end_of_period_local.astimezone(pytz.utc)
             
-            # Base query for bookings in the date range
-            bookings = Booking.objects.filter(
-                start_time__date__gte=start_date,
-                start_time__date__lte=end_date,
+            # Base query for bookings in the precise UTC time range boundary
+            bookings_qs = Booking.objects.filter(
+                start_time__gte=start_of_period_utc,
+                start_time__lte=end_of_period_utc,
                 status__in=['confirmed', 'completed']
             )
             
             if location_id:
-                bookings = bookings.filter(location_id=location_id)
+                bookings_qs = bookings_qs.filter(location_id=location_id)
             
             # If closure has time range, filter to only bookings that overlap with the time range
             if start_time and end_time:
-                # For each date in the range, check bookings that overlap with the closed time window
                 conflicting_bookings = []
                 current_date = start_date
                 
+                # Fetch all potential bookings into memory
+                all_range_bookings = list(bookings_qs)
+                
                 while current_date <= end_date:
-                    # Create datetime objects for the closed time window on this date
-                    closure_start_dt = django_timezone.make_aware(
-                        datetime.combine(current_date, start_time),
-                        dt_timezone.utc
+                    # Create datetime objects for the closed time window on this date in local time
+                    closure_start_dt = center_tz.localize(
+                        datetime.combine(current_date, start_time)
                     )
-                    closure_end_dt = django_timezone.make_aware(
-                        datetime.combine(current_date, end_time),
-                        dt_timezone.utc
+                    closure_end_dt = center_tz.localize(
+                        datetime.combine(current_date, end_time)
                     )
                     
                     # Handle midnight crossover (if end_time < start_time, end is next day)
                     if end_time < start_time:
                         closure_end_dt += timedelta(days=1)
                     
-                    # Find bookings on this date that overlap with the closed time window
-                    # Overlap condition: booking.start_time < closure.end_time AND booking.end_time > closure.start_time
-                    date_bookings = bookings.filter(
-                        start_time__date=current_date
-                    ).filter(
-                        start_time__lt=closure_end_dt,
-                        end_time__gt=closure_start_dt
-                    )
+                    # Convert to UTC for strict comparison with booking start_time/end_time
+                    closure_start_utc = closure_start_dt.astimezone(pytz.utc)
+                    closure_end_utc = closure_end_dt.astimezone(pytz.utc)
                     
-                    conflicting_bookings.extend(list(date_bookings))
+                    # Find bookings strictly overlapping with closed hours
+                    for b in all_range_bookings:
+                        if b.start_time < closure_end_utc and b.end_time > closure_start_utc:
+                            if b not in conflicting_bookings:
+                                conflicting_bookings.append(b)
+                    
                     current_date += timedelta(days=1)
                 
                 # Use the filtered list
                 bookings = conflicting_bookings
             else:
                 # Full day closure - cancel all bookings on these dates
-                bookings = list(bookings)
+                bookings = list(bookings_qs)
 
             for booking in bookings:
                 booking.status = 'cancelled'
