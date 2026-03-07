@@ -1290,146 +1290,148 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         """Set location_id when creating closed day and handle conflicts if forced"""
         location_id = get_location_id_from_request(self.request)
+        self._handle_force_cancellations(serializer, location_id)
         
-        force_override = self.request.data.get('force_override', False)
-        
-        if force_override:
-            from golf_project.timezone_utils import get_center_timezone
-            import pytz
-            from datetime import datetime, timedelta, time as dt_time
-            
-            center_tz = get_center_timezone(location_id)
-            
-            start_date = serializer.validated_data.get('start_date')
-            end_date = serializer.validated_data.get('end_date')
-            start_time = serializer.validated_data.get('start_time')
-            end_time = serializer.validated_data.get('end_time')
-            recurrence = serializer.validated_data.get('recurrence', 'one_time')
-            
-            # 1. Cancel conflicting bookings
-            # Calculate the full UTC range for the closed dates based on the center's timezone
-            start_of_period_local = center_tz.localize(datetime.combine(start_date, dt_time.min))
-            end_of_period_local = center_tz.localize(datetime.combine(end_date, dt_time.max))
-            start_of_period_utc = start_of_period_local.astimezone(pytz.utc)
-            end_of_period_utc = end_of_period_local.astimezone(pytz.utc)
-            
-            # Base query for bookings in the precise UTC time range boundary
-            bookings_qs = Booking.objects.filter(
-                start_time__gte=start_of_period_utc,
-                start_time__lte=end_of_period_utc,
-                status__in=['confirmed', 'completed']
-            )
-            
-            if location_id:
-                bookings_qs = bookings_qs.filter(location_id=location_id)
-            
-            # If closure has time range, filter to only bookings that overlap with the time range
-            if start_time and end_time:
-                conflicting_bookings = []
-                current_date = start_date
-                
-                # Fetch all potential bookings into memory
-                all_range_bookings = list(bookings_qs)
-                
-                while current_date <= end_date:
-                    # Create datetime objects for the closed time window on this date in local time
-                    closure_start_dt = center_tz.localize(
-                        datetime.combine(current_date, start_time)
-                    )
-                    closure_end_dt = center_tz.localize(
-                        datetime.combine(current_date, end_time)
-                    )
-                    
-                    # Handle midnight crossover (if end_time < start_time, end is next day)
-                    if end_time < start_time:
-                        closure_end_dt += timedelta(days=1)
-                    
-                    # Convert to UTC for strict comparison with booking start_time/end_time
-                    closure_start_utc = closure_start_dt.astimezone(pytz.utc)
-                    closure_end_utc = closure_end_dt.astimezone(pytz.utc)
-                    
-                    # Find bookings strictly overlapping with closed hours
-                    for b in all_range_bookings:
-                        if b.start_time < closure_end_utc and b.end_time > closure_start_utc:
-                            if b not in conflicting_bookings:
-                                conflicting_bookings.append(b)
-                    
-                    current_date += timedelta(days=1)
-                
-                # Use the filtered list
-                bookings = conflicting_bookings
-            else:
-                # Full day closure - cancel all bookings on these dates
-                bookings = list(bookings_qs)
-
-            for booking in bookings:
-                booking.status = 'cancelled'
-                booking.save(update_fields=['status', 'updated_at'])
-                
-                # Restore credits/sessions (Logic duplicated from BookingViewSet.cancel)
-                if booking.booking_type == 'coaching':
-                    if booking.package_purchase:
-                        purchase = booking.package_purchase
-                        purchase.sessions_remaining = F('sessions_remaining') + 1
-                        purchase.save(update_fields=['sessions_remaining', 'updated_at'])
-                elif booking.booking_type == 'simulator':
-                    hours_to_restore = Decimal(str(booking.duration_minutes)) / Decimal('60')
-                    
-                    if booking.package_purchase and not booking.simulator_credit_redemption and not booking.simulator_package_purchase:
-                        purchase = booking.package_purchase
-                        purchase.simulator_hours_remaining = F('simulator_hours_remaining') + hours_to_restore
-                        purchase.save(update_fields=['simulator_hours_remaining', 'updated_at'])
-                    elif booking.simulator_package_purchase:
-                        SimulatorCredit.objects.create(
-                            client=booking.client,
-                            issued_by=self.request.user,
-                            reason=SimulatorCredit.Reason.CANCELLATION,
-                            hours=hours_to_restore,
-                            hours_remaining=hours_to_restore,
-                            notes=f"Credit from force-cancelled booking {booking.id} due to Closed Day creation"
-                        )
-                    elif booking.simulator_credit_redemption:
-                        credit = booking.simulator_credit_redemption
-                        credit.hours_remaining = F('hours_remaining') + hours_to_restore
-                        credit.status = SimulatorCredit.Status.AVAILABLE
-                        credit.redeemed_at = None
-                        credit.save(update_fields=['hours_remaining', 'status', 'redeemed_at'])
-                        booking.simulator_credit_redemption = None
-                        booking.save(update_fields=['simulator_credit_redemption'])
-                    else:
-                        SimulatorCredit.objects.create(
-                            client=booking.client,
-                            issued_by=self.request.user,
-                            reason=SimulatorCredit.Reason.CANCELLATION,
-                            hours=hours_to_restore,
-                            hours_remaining=hours_to_restore,
-                            notes=f"Credit from force-cancelled booking {booking.id} due to Closed Day creation"
-                        )
-
-            # 2. Cancel/Deactivate Special Events (only for full-day closures)
-            # For partial closures, the booking logic will naturally block overlapping slots
-            if not start_time or not end_time:
-                from special_events.models import SpecialEvent
-                events = SpecialEvent.objects.filter(
-                    date__gte=start_date,
-                    date__lte=end_date,
-                    is_active=True
-                )
-                if location_id:
-                    events = events.filter(location_id=location_id)
-                events.update(is_active=False)
-                
-                # 3. Remove Staff Day Availability
-                # We delete specific day overrides that might exist
-                StaffDayAvailability.objects.filter(
-                    date__gte=start_date,
-                    date__lte=end_date
-                ).delete()
-
         if location_id:
             serializer.save(location_id=location_id)
         else:
             serializer.save()
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        """Handle conflicts if forced during update"""
+        location_id = get_location_id_from_request(self.request)
+        self._handle_force_cancellations(serializer, location_id)
+        serializer.save()
+
+    def _handle_force_cancellations(self, serializer, location_id):
+        """Shared logic to cancel bookings when forge_override is True"""
+        force_override = self.request.data.get('force_override', False)
+        if not force_override:
+            return
+
+        from golf_project.timezone_utils import get_center_timezone
+        from bookings.models import Booking
+        from simulators.models import SimulatorCredit
+        from coaching.models import CoachingPackagePurchase, SimulatorPackagePurchase, StaffDayAvailability
+        from django.db.models import F, Q
+        from decimal import Decimal
+        import pytz
+        from datetime import datetime, timedelta, time as dt_time
+        
+        center_tz = get_center_timezone(location_id)
+        
+        start_date = serializer.validated_data.get('start_date')
+        end_date = serializer.validated_data.get('end_date')
+        start_time = serializer.validated_data.get('start_time')
+        end_time = serializer.validated_data.get('end_time')
+        
+        # Calculate the full UTC range for the closed dates based on the center's timezone
+        start_of_period_local = center_tz.localize(datetime.combine(start_date, dt_time.min))
+        end_of_period_local = center_tz.localize(datetime.combine(end_date, dt_time.max))
+        start_of_period_utc = start_of_period_local.astimezone(pytz.utc)
+        end_of_period_utc = end_of_period_local.astimezone(pytz.utc)
+        
+        # Base query for bookings in the precise UTC time range boundary
+        bookings_qs = Booking.objects.filter(
+            start_time__gte=start_of_period_utc,
+            start_time__lte=end_of_period_utc,
+            status__in=['confirmed', 'completed']
+        )
+        
+        if location_id:
+            # Catch both exact match and any missing location_id bookings
+            bookings_qs = bookings_qs.filter(Q(location_id=location_id) | Q(location_id__isnull=True) | Q(location_id=''))
+        
+        # If closure has time range, filter to only bookings that overlap with the time range
+        if start_time and end_time:
+            conflicting_bookings = []
+            current_date = start_date
+            
+            # Fetch all potential bookings into memory
+            all_range_bookings = list(bookings_qs)
+            
+            while current_date <= end_date:
+                closure_start_dt = center_tz.localize(datetime.combine(current_date, start_time))
+                closure_end_dt = center_tz.localize(datetime.combine(current_date, end_time))
+                
+                if end_time < start_time:
+                    closure_end_dt += timedelta(days=1)
+                
+                closure_start_utc = closure_start_dt.astimezone(pytz.utc)
+                closure_end_utc = closure_end_dt.astimezone(pytz.utc)
+                
+                for b in all_range_bookings:
+                    if b.start_time < closure_end_utc and b.end_time > closure_start_utc:
+                        if b not in conflicting_bookings:
+                            conflicting_bookings.append(b)
+                
+                current_date += timedelta(days=1)
+            bookings = conflicting_bookings
+        else:
+            bookings = list(bookings_qs)
+
+        for booking in bookings:
+            booking.status = 'cancelled'
+            booking.save(update_fields=['status', 'updated_at'])
+            
+            # Restore credits/sessions
+            if booking.booking_type == 'coaching':
+                if booking.package_purchase:
+                    purchase = booking.package_purchase
+                    purchase.sessions_remaining = F('sessions_remaining') + 1
+                    purchase.save(update_fields=['sessions_remaining', 'updated_at'])
+            elif booking.booking_type == 'simulator':
+                hours_to_restore = Decimal(str(booking.duration_minutes)) / Decimal('60')
+                
+                if booking.package_purchase and not booking.simulator_credit_redemption and not booking.simulator_package_purchase:
+                    purchase = booking.package_purchase
+                    purchase.simulator_hours_remaining = F('simulator_hours_remaining') + hours_to_restore
+                    purchase.save(update_fields=['simulator_hours_remaining', 'updated_at'])
+                elif booking.simulator_package_purchase:
+                    SimulatorCredit.objects.create(
+                        client=booking.client,
+                        issued_by=self.request.user,
+                        reason=SimulatorCredit.Reason.CANCELLATION,
+                        hours=hours_to_restore,
+                        hours_remaining=hours_to_restore,
+                        notes=f"Credit from force-cancelled booking {booking.id} due to Closed Day creation"
+                    )
+                elif booking.simulator_credit_redemption:
+                    credit = booking.simulator_credit_redemption
+                    credit.hours_remaining = F('hours_remaining') + hours_to_restore
+                    credit.status = SimulatorCredit.Status.AVAILABLE
+                    credit.redeemed_at = None
+                    credit.save(update_fields=['hours_remaining', 'status', 'redeemed_at'])
+                    booking.simulator_credit_redemption = None
+                    booking.save(update_fields=['simulator_credit_redemption'])
+                else:
+                    SimulatorCredit.objects.create(
+                        client=booking.client,
+                        issued_by=self.request.user,
+                        reason=SimulatorCredit.Reason.CANCELLATION,
+                        hours=hours_to_restore,
+                        hours_remaining=hours_to_restore,
+                        notes=f"Credit from force-cancelled booking {booking.id} due to Closed Day creation"
+                    )
+
+        # 2. Cancel/Deactivate Special Events (only for full-day closures)
+        if not start_time or not end_time:
+            from special_events.models import SpecialEvent
+            events = SpecialEvent.objects.filter(
+                date__gte=start_date,
+                date__lte=end_date,
+                is_active=True
+            )
+            if location_id:
+                events = events.filter(location_id=location_id)
+            events.update(is_active=False)
+            
+            # 3. Remove Staff Day Availability
+            StaffDayAvailability.objects.filter(
+                date__gte=start_date,
+                date__lte=end_date
+            ).delete()
     
     def list(self, request, *args, **kwargs):
         """List all closed days"""
