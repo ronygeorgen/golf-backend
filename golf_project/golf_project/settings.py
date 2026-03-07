@@ -62,20 +62,42 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
-CORS_ALLOWED_ORIGINS = [
-    'http://localhost:5173',
-    'http://127.0.0.1:5173',
-    'https://portal.hole9golf.com'
-]
 
-CORS_TRUSTED_ORIGINS = [
-    'http://localhost:5173',
-    'http://127.0.0.1:5173',
-    'https://portal.hole9golf.com/'
-]
+# CORS_ALLOW_ALL_ORIGINS = True
+# CORS_ALLOW_CREDENTIALS = True
 
-CORS_ALLOW_ALL_ORIGINS = True
+# CORS_ALLOWED_ORIGINS = [
+#     'http://localhost:5173',
+#     'http://127.0.0.1:5173',
+#     'https://portal.hole9golf.com',
+#     "https://golf-frontend-six.vercel.app",
+#     "https://unscavenged-uncalumnious-desmond.ngrok-free.dev",
+# ]
+
+# CORS_TRUSTED_ORIGINS = [
+#     'http://localhost:5173',
+#     'http://127.0.0.1:5173',
+#     'https://portal.hole9golf.com/',
+#     "https://golf-frontend-six.vercel.app",
+#     "https://unscavenged-uncalumnious-desmond.ngrok-free.dev",
+# ]
+
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+USE_X_FORWARDED_HOST = True
+
 CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOW_ALL_ORIGINS = False
+
+CORS_ALLOWED_ORIGINS = [
+    "https://golf-frontend-six.vercel.app",
+    "https://unscavenged-uncalumnious-desmond.ngrok-free.dev",
+]
+
+CSRF_TRUSTED_ORIGINS = [
+    "https://golf-frontend-six.vercel.app",
+    "https://unscavenged-uncalumnious-desmond.ngrok-free.dev",
+]
+
 CORS_ALLOW_METHODS = [
     'DELETE',
     'GET',
@@ -94,6 +116,7 @@ CORS_ALLOW_HEADERS = [
     'user-agent',
     'x-csrftoken',
     'x-requested-with',
+    'ngrok-skip-browser-warning',
 ]   
 CORS_PREFLIGHT_MAX_AGE = 86400
 
