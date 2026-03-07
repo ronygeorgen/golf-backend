@@ -76,12 +76,12 @@ class StaffBlockedDate(models.Model):
     start_time = models.TimeField(
         null=True, 
         blank=True, 
-        help_text="Start time of block (leave empty for full-day block). Stored in local timezone (America/Halifax)."
+        help_text="Start time of block (leave empty for full-day block). Stored as wall-clock time in the center's local timezone."
     )
     end_time = models.TimeField(
         null=True, 
         blank=True, 
-        help_text="End time of block (leave empty for full-day block). Stored in local timezone (America/Halifax)."
+        help_text="End time of block (leave empty for full-day block). Stored as wall-clock time in the center's local timezone."
     )
     reason = models.CharField(max_length=255, blank=True, null=True, help_text="Optional reason for blocking")
     created_at = models.DateTimeField(auto_now_add=True)

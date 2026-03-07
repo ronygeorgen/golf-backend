@@ -1158,13 +1158,15 @@ def get_first_upcoming_special_event(user, location_id=None):
     return result
 
 
-def format_booking_datetime(booking):
+def format_booking_datetime(booking, location_id=None):
     """
     Format booking start_time to a readable date and time string.
-    Converts UTC time to Canada timezone (America/Halifax - Atlantic Time) before formatting.
+    Converts UTC time to the booking center's local timezone (from GHLLocation.timezone).
+    Falls back to America/Halifax if location not found.
     
     Args:
         booking: Booking instance
+        location_id: Optional location_id to resolve timezone (uses booking.location_id if not provided)
     
     Returns:
         Formatted string like "21-OCT-2021 08:30 AM" or empty string if no booking
@@ -1173,64 +1175,64 @@ def format_booking_datetime(booking):
         return ''
     
     from django.utils import timezone
-    from zoneinfo import ZoneInfo
+    from golf_project.timezone_utils import get_center_timezone
     
-    # Convert to local timezone if needed
+    # Resolve location for timezone lookup
+    resolved_location = location_id or getattr(booking, 'location_id', None)
+    center_tz = get_center_timezone(resolved_location)
+    
     start_time = booking.start_time
     
-    # Convert UTC to Canada timezone (America/Halifax handles AST/ADT automatically)
-    canada_tz = ZoneInfo('America/Halifax')
-    
     if timezone.is_aware(start_time):
-        # Convert from UTC (or current timezone) to Canada Atlantic Time
-        # Django stores datetimes in UTC when USE_TZ=True, so convert to UTC first if needed
-        start_time = start_time.astimezone(ZoneInfo('UTC'))
-        # Then convert from UTC to Canada timezone
-        start_time = start_time.astimezone(canada_tz)
+        # Convert UTC to center's local timezone (handles DST automatically)
+        local_time = start_time.astimezone(center_tz)
     else:
-        # If naive, assume UTC and convert to Canada timezone
-        start_time = timezone.make_aware(start_time, ZoneInfo('UTC'))
-        start_time = start_time.astimezone(canada_tz)
+        # If naive, assume UTC and convert to center's local timezone
+        import pytz
+        local_time = pytz.utc.localize(start_time).astimezone(center_tz)
     
     # Format: "DD-MMM-YYYY HH:MM AM/PM" (e.g., "21-OCT-2021 08:30 AM")
-    day = start_time.strftime("%d")
-    month = start_time.strftime("%b").upper()  # Uppercase 3-letter month abbreviation
-    year = start_time.strftime("%Y")
-    time_str = start_time.strftime("%I:%M %p")  # 12-hour format with AM/PM
+    day = local_time.strftime("%d")
+    month = local_time.strftime("%b").upper()  # Uppercase 3-letter month abbreviation
+    year = local_time.strftime("%Y")
+    time_str = local_time.strftime("%I:%M %p")  # 12-hour format with AM/PM
     
     formatted_date = f"{day}-{month}-{year} {time_str}"
     return formatted_date
 
 
-def format_special_event_datetime(registration):
+def format_special_event_datetime(registration, location_id=None):
     """
     Format a special event registration to a readable date and time string.
-    Converts stored UTC time to Canada timezone (America/Halifax - Atlantic Time).
+    Converts stored UTC-equivalent time to the center's local timezone.
     """
     if not registration or not registration.occurrence_date or not registration.event.start_time:
         return ''
     
     from datetime import datetime
     from django.utils import timezone
-    from zoneinfo import ZoneInfo
+    from golf_project.timezone_utils import get_center_timezone
+    import pytz
+    
+    # Resolve location for timezone lookup
+    resolved_location = location_id or getattr(registration.event, 'location_id', None)
+    center_tz = get_center_timezone(resolved_location)
     
     occurrence_date = registration.occurrence_date
     start_time = registration.event.start_time
     
-    # Combine date and time
-    # Treat the stored time as UTC
+    # Combine date and time, treat as UTC
     dt = datetime.combine(occurrence_date, start_time)
-    dt_utc = timezone.make_aware(dt, ZoneInfo('UTC'))
+    dt_utc = pytz.utc.localize(dt)
     
-    # Convert to Canada timezone (America/Halifax handles AST/ADT automatically)
-    canada_tz = ZoneInfo('America/Halifax')
-    dt_ast = dt_utc.astimezone(canada_tz)
+    # Convert to center's local timezone (handles DST automatically)
+    dt_local = dt_utc.astimezone(center_tz)
     
     # Format: "DD-MMM-YYYY HH:MM AM/PM"
-    day = dt_ast.strftime("%d")
-    month = dt_ast.strftime("%b").upper()
-    year = dt_ast.strftime("%Y")
-    time_str = dt_ast.strftime("%I:%M %p")
+    day = dt_local.strftime("%d")
+    month = dt_local.strftime("%b").upper()
+    year = dt_local.strftime("%Y")
+    time_str = dt_local.strftime("%I:%M %p")
     
     return f"{day}-{month}-{year} {time_str}"
 

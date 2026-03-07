@@ -440,14 +440,14 @@ def list_all_ghl_locations(request):
 @permission_classes([IsAuthenticated])
 def update_ghl_location_company_name(request, location_id):
     """
-    Update company name for a GHL location.
-    Only superadmin can update company names.
+    Update company name and/or timezone for a GHL location.
+    Only superadmin can update these settings.
     PUT/PATCH /api/ghlpage/admin/locations/<location_id>/company-name/
-    Body: {"company_name": "New Company Name"}
+    Body: {"company_name": "New Company Name", "timezone": "America/Halifax"}
     """
     # Only superadmin can access this
     if request.user.role != 'superadmin':
-        raise PermissionDenied("Only superadmin can update company names.")
+        raise PermissionDenied("Only superadmin can update location settings.")
     
     try:
         location = GHLLocation.objects.get(location_id=location_id)
@@ -457,13 +457,32 @@ def update_ghl_location_company_name(request, location_id):
             status=status.HTTP_404_NOT_FOUND
         )
     
-    company_name = request.data.get('company_name', '').strip()
-    location.company_name = company_name
-    location.save(update_fields=['company_name', 'updated_at'])
+    update_fields = ['updated_at']
+    
+    company_name = request.data.get('company_name')
+    if company_name is not None:
+        location.company_name = company_name.strip()
+        update_fields.append('company_name')
+    
+    timezone_str = request.data.get('timezone')
+    if timezone_str is not None:
+        # Validate IANA timezone string
+        import pytz
+        try:
+            pytz.timezone(timezone_str)
+        except pytz.UnknownTimeZoneError:
+            return Response(
+                {'error': f'Invalid timezone: "{timezone_str}". Please use a valid IANA timezone name (e.g. America/Halifax, America/Toronto).'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        location.timezone = timezone_str
+        update_fields.append('timezone')
+    
+    location.save(update_fields=update_fields)
     
     serializer = GHLLocationSerializer(location)
     return Response({
-        'message': 'Company name updated successfully.',
+        'message': 'Location settings updated successfully.',
         'location': serializer.data
     }, status=status.HTTP_200_OK)
 

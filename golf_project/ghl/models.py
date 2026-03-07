@@ -5,6 +5,11 @@ from django.utils import timezone
 class GHLLocation(models.Model):
     location_id = models.CharField(max_length=100, unique=True)
     company_name = models.CharField(max_length=255, blank=True)
+    timezone = models.CharField(
+        max_length=100,
+        default='America/Halifax',
+        help_text="IANA timezone for this golf center (e.g. America/Halifax, America/Toronto, Asia/Dubai)"
+    )
     status = models.CharField(max_length=50, blank=True)
     webhook_url = models.URLField(blank=True)
     webhook_secret = models.CharField(max_length=255, blank=True)

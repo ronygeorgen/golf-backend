@@ -461,13 +461,14 @@ class StaffViewSet(viewsets.ModelViewSet):
             
             # Find and cancel conflicting coaching bookings
             
-            # PROJECT STANDARD: Use America/Halifax for business logic date interpretation
-            tz = pytz.timezone('America/Halifax')
+            # Use center timezone (DST-aware — reads from GHLLocation.timezone)
+            from golf_project.timezone_utils import get_center_timezone
+            center_tz = get_center_timezone(location_id)
             
             if is_full_day:
                 # Full-day block: cancel all bookings on this date
-                start_of_day_local = tz.localize(dt.combine(block_date, dt_time.min))
-                end_of_day_local = tz.localize(dt.combine(block_date, dt_time.max))
+                start_of_day_local = center_tz.localize(dt.combine(block_date, dt_time.min))
+                end_of_day_local = center_tz.localize(dt.combine(block_date, dt_time.max))
                 
                 bookings_to_cancel = Booking.objects.filter(
                     coach=staff,
@@ -478,8 +479,8 @@ class StaffViewSet(viewsets.ModelViewSet):
             else:
                 # Partial-day block: cancel only bookings that overlap with the blocked time range
                 # Convert block times to datetime for comparison
-                block_start_dt = tz.localize(dt.combine(block_date, start_time))
-                block_end_dt = tz.localize(dt.combine(block_date, end_time))
+                block_start_dt = center_tz.localize(dt.combine(block_date, start_time))
+                block_end_dt = center_tz.localize(dt.combine(block_date, end_time))
                 
                 bookings_to_cancel = Booking.objects.filter(
                     coach=staff,

@@ -1,6 +1,7 @@
 from django.db import models
 from django.utils import timezone
 from datetime import datetime, timedelta
+import pytz
 
 
 class ClosedDay(models.Model):
@@ -122,9 +123,13 @@ class ClosedDay(models.Model):
     def is_datetime_closed(self, check_datetime):
         """
         Check if a specific datetime is closed based on this closure rule.
+
+        IMPORTANT: check_datetime must be in the CENTER'S LOCAL TIMEZONE (not UTC).
+        The caller (check_if_closed) is responsible for converting UTC to local first.
+        ClosedDay stores date/time as local wall-clock times.
         
         Args:
-            check_datetime: datetime.datetime object to check
+            check_datetime: datetime.datetime object in center's LOCAL timezone
             
         Returns:
             tuple: (is_closed: bool, message: str)
@@ -214,21 +219,39 @@ class ClosedDay(models.Model):
     @classmethod
     def check_if_closed(cls, check_datetime, location_id=None):
         """
-        Check if a datetime is closed by any active closure rule.
+        Check if a UTC datetime is closed by any active closure rule.
+
+        TIMEZONE HANDLING:
+        - check_datetime is expected to be UTC-aware (from bookings).
+        - ClosedDay stores date + time as LOCAL wall-clock times.
+        - We convert check_datetime to the center's local timezone (from GHLLocation.timezone)
+          before comparing. This correctly handles DST transitions automatically.
         
         Args:
-            check_datetime: datetime.datetime object to check
-            location_id: Optional location_id to filter closures
+            check_datetime: UTC-aware datetime.datetime object to check
+            location_id: Optional location_id to filter closures and resolve timezone
             
         Returns:
             tuple: (is_closed: bool, message: str or None)
         """
+        from golf_project.timezone_utils import get_center_timezone
+
+        # Convert UTC datetime to center's local time for comparison
+        center_tz = get_center_timezone(location_id)
+        if check_datetime.tzinfo is None:
+            # Treat naive datetime as UTC
+            check_datetime_utc = pytz.utc.localize(check_datetime)
+        else:
+            check_datetime_utc = check_datetime
+        local_dt = check_datetime_utc.astimezone(center_tz)
+
         active_closures = cls.objects.filter(is_active=True)
         if location_id:
             active_closures = active_closures.filter(location_id=location_id)
         
         for closure in active_closures:
-            is_closed, message = closure.is_datetime_closed(check_datetime)
+            # Pass local datetime — is_datetime_closed works with local times
+            is_closed, message = closure.is_datetime_closed(local_dt)
             if is_closed:
                 return (True, message)
         
@@ -237,10 +260,14 @@ class ClosedDay(models.Model):
     @classmethod
     def check_if_date_closed(cls, check_date, location_id=None):
         """
-        Check if a date is closed (any time during the day).
+        Check if a UTC date is closed (any time during the day).
+
+        If check_date is a date object (no timezone), pass it as-is.
+        For UTC datetimes, the caller should convert to local date first using
+        get_today_local(location_id) from timezone_utils.
         
         Args:
-            check_date: datetime.date object to check
+            check_date: datetime.date object to check (in CENTER's local timezone)
             location_id: Optional location_id to filter closures
             
         Returns:

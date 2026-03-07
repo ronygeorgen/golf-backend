@@ -70,23 +70,22 @@ class DashboardViewSet(viewsets.ViewSet):
             for hour in range(24):
                 heatmap_data[day][hour] = 0
         
-        # Get Halifax timezone
-        halifax_tz = pytz.timezone('America/Halifax')
+        # Use center timezone (DST-aware — reads from GHLLocation.timezone)
+        from golf_project.timezone_utils import get_center_timezone
+        center_tz = get_center_timezone(location_id)
         
         # Aggregate bookings by day of week and hour
         for booking in bookings:
             # booking.start_time is stored in UTC (timezone-aware)
-            # Convert to Halifax timezone
+            # Convert to center's local timezone (DST handled automatically by pytz)
             if timezone.is_aware(booking.start_time):
-                # If timezone-aware, convert to Halifax
-                halifax_time = booking.start_time.astimezone(halifax_tz)
+                local_time = booking.start_time.astimezone(center_tz)
             else:
-                # If naive, assume UTC and make aware, then convert
                 utc_time = timezone.make_aware(booking.start_time, pytz.UTC)
-                halifax_time = utc_time.astimezone(halifax_tz)
+                local_time = utc_time.astimezone(center_tz)
             
-            day_of_week = halifax_time.weekday()  # 0=Monday, 6=Sunday
-            hour = halifax_time.hour
+            day_of_week = local_time.weekday()  # 0=Monday, 6=Sunday
+            hour = local_time.hour
             
             heatmap_data[day_of_week][hour] += 1
         

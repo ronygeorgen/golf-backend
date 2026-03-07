@@ -283,6 +283,19 @@ def verify_otp(request):
                     'needs_dob': not bool(user.date_of_birth)  # True if DOB is missing
                 }
                 
+                # Include the center's IANA timezone so the frontend can
+                # display all times correctly (DST-aware) without extra calls.
+                location_timezone = 'America/Halifax'  # fallback default
+                if resolved_location:
+                    try:
+                        from ghl.models import GHLLocation
+                        loc = GHLLocation.objects.filter(location_id=resolved_location).first()
+                        if loc and loc.timezone:
+                            location_timezone = loc.timezone
+                    except Exception:
+                        pass
+                response_data['location_timezone'] = location_timezone
+                
                 return Response(response_data)
             else:
                 return Response({
@@ -645,10 +658,22 @@ def login(request):
         # Get or create authentication token
         token, created = Token.objects.get_or_create(user=user)
         
+        # Include location timezone for DST-aware display on the frontend
+        location_timezone = 'America/Halifax'
+        try:
+            if hasattr(user, 'ghl_location_id') and user.ghl_location_id:
+                from ghl.models import GHLLocation
+                loc = GHLLocation.objects.filter(location_id=user.ghl_location_id).first()
+                if loc and loc.timezone:
+                    location_timezone = loc.timezone
+        except Exception:
+            pass
+        
         return Response({
             'message': 'Login successful',
             'token': token.key,
-            'user': UserSerializer(user).data
+            'user': UserSerializer(user).data,
+            'location_timezone': location_timezone,
         }, status=status.HTTP_200_OK)
     
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -1154,27 +1179,22 @@ def accept_waiver(request):
         accepted_at_str = request.data.get('accepted_at')
         
         if accepted_at_str:
-            # Parse the timestamp from frontend (Halifax timezone)
-            # Frontend sends ISO string without timezone (assumed Halifax)
+            # Parse the timestamp from frontend (center's local timezone)
             try:
-                halifax_tz = pytz.timezone('America/Halifax')
+                from golf_project.timezone_utils import get_center_timezone
+                import pytz
+                center_tz = get_center_timezone(getattr(user, 'ghl_location_id', None))
                 
                 # Parse the datetime string (format: YYYY-MM-DDTHH:mm:ss)
                 if 'T' in accepted_at_str:
-                    # Has time component
                     accepted_at_naive = datetime.fromisoformat(accepted_at_str.split('+')[0].split('Z')[0])
                 else:
-                    # Date only, use current time
                     accepted_at_naive = datetime.fromisoformat(accepted_at_str)
                 
-                # Localize to Halifax timezone
-                accepted_at = halifax_tz.localize(accepted_at_naive)
-                
-                # Convert to UTC for storage
-                accepted_at = accepted_at.astimezone(pytz.UTC)
+                # Localize to center's timezone (DST-aware) then convert to UTC
+                accepted_at = center_tz.localize(accepted_at_naive).astimezone(pytz.UTC)
             except (ValueError, TypeError) as e:
                 logger.error(f"Error parsing accepted_at timestamp: {e}")
-                # Fallback to current UTC time if parsing fails
                 accepted_at = timezone.now()
         else:
             # Use current UTC time if not provided

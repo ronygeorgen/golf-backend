@@ -11,6 +11,7 @@ class GHLLocationSerializer(serializers.ModelSerializer):
             'id',
             'location_id',
             'company_name',
+            'timezone',
             'status',
             'webhook_url',
             'webhook_secret',

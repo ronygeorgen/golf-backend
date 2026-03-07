@@ -1104,12 +1104,13 @@ class BookingViewSet(viewsets.ModelViewSet):
                         from users.models import StaffBlockedDate
                         import pytz
                         
-                        # IMPORTANT: Convert UTC times to Halifax timezone for date/time extraction
-                        # Blocked dates are stored in local timezone (Halifax)
-                        # If we use UTC date, late-night Halifax bookings appear as next day
-                        tz = pytz.timezone('America/Halifax')
-                        start_time_local = start_time.astimezone(tz)
-                        end_time_local = end_time.astimezone(tz)
+                        # IMPORTANT: Convert UTC times to center's local timezone for date/time extraction
+                        # Blocked dates are stored in local timezone (center's wall-clock time)
+                        # If we use UTC date, late-night bookings appear as next day
+                        from golf_project.timezone_utils import get_center_timezone
+                        center_tz = get_center_timezone(location_id)
+                        start_time_local = start_time.astimezone(center_tz)
+                        end_time_local = end_time.astimezone(center_tz)
                         
                         booking_date = start_time_local.date()
                         booking_start_time = start_time_local.time()
@@ -2390,18 +2391,6 @@ class BookingViewSet(viewsets.ModelViewSet):
         # Prefetch ALL relevant bookings and temp bookings for this date and location
         # This eliminates thousands of database queries in the loops below
         #
-        # IMPORTANT: Bookings are stored in UTC. Halifax is UTC-4 (AST) or UTC-3 (ADT).
-        # A booking that starts at 8pm Halifax = midnight UTC (next UTC day).
-        # Using start_time__date=booking_date (UTC) would MISS those late-evening bookings,
-        # causing them to appear available and allowing double-bookings.
-        # Fix: fetch bookings that OVERLAP the full UTC window of this Halifax day.
-        # Halifax day spans from midnight Halifax (UTC+4h) to midnight Halifax next day (UTC+4h),
-        # so we use a generous window: booking_date UTC-midnight to booking_date+2 UTC-midnight.
-        # The overlap check (start_time < day_utc_end AND end_time > day_utc_start) handles the rest.
-        # Use the actual UTC range covered by the Halifax day:
-        # Halifax (AST=UTC-4, ADT=UTC-3:30): midnight Halifax = 03:30 or 04:00 UTC.
-        # Use 03:00 UTC as the safe lower bound, and 06:00 UTC the next day as upper bound,
-        # which fully covers any Halifax-day booking (latest possible = 9pm Halifax = 01:00 UTC).
         booking_day_utc_start = pytz.UTC.localize(datetime(booking_date.year, booking_date.month, booking_date.day, 3, 0, 0))
         booking_day_utc_end = pytz.UTC.localize(datetime(booking_date.year, booking_date.month, booking_date.day, 3, 0, 0) + timedelta(days=1, hours=3))
         relevant_bookings = Booking.objects.filter(
@@ -2437,17 +2426,19 @@ class BookingViewSet(viewsets.ModelViewSet):
             active_closures = active_closures.filter(Q(location_id=location_id) | Q(location_id__isnull=True))
         active_closures = list(active_closures)
 
-        # Use Halifax timezone
-        halifax_tz = pytz.timezone('America/Halifax')
+        # NOTE: Replaced the previous hardcoded comment. ClosedDay now converts UTC to center
+        # local time internally via check_if_closed(). The is_facility_closed helper below
+        # just calls that method.
+
+        # Use center timezone (DST-aware — reads from GHLLocation.timezone)
+        from golf_project.timezone_utils import get_center_timezone
+        center_tz = get_center_timezone(location_id)
 
         def is_facility_closed(check_time):
-            # ClosedDay stores times in UTC (converted by frontend during creation)
-            # check_time is already in UTC
-            for closure in active_closures:
-                is_closed, _ = closure.is_datetime_closed(check_time)
-                if is_closed:
-                    return True
-            return False
+            # check_time is UTC-aware. check_if_closed converts to center local time internally.
+            from admin_panel.models import ClosedDay
+            is_closed, _ = ClosedDay.check_if_closed(check_time, location_id=location_id)
+            return is_closed
 
         # Pre-process coach availabilities and blocked times into maps for fast lookup
         from users.models import StaffBlockedDate
@@ -2481,16 +2472,16 @@ class BookingViewSet(viewsets.ModelViewSet):
             if partial_blocks:
                 utc_blocks = []
                 for b in partial_blocks:
-                    # Convert Halifax times to UTC
+                    # StaffBlockedDate stores local wall-clock times. Convert to UTC using center TZ.
                     s_naive = datetime.combine(booking_date, b['start_time'])
                     e_naive = datetime.combine(booking_date, b['end_time'])
                     
-                    # Handle midnight crossover if end time <= start time (rare for blocks but possible)
+                    # Handle midnight crossover if end time <= start time
                     if b['end_time'] <= b['start_time']:
                         e_naive += timedelta(days=1)
                         
-                    s_utc = halifax_tz.localize(s_naive).astimezone(pytz.UTC)
-                    e_utc = halifax_tz.localize(e_naive).astimezone(pytz.UTC)
+                    s_utc = center_tz.localize(s_naive).astimezone(pytz.UTC)
+                    e_utc = center_tz.localize(e_naive).astimezone(pytz.UTC)
                     utc_blocks.append((s_utc, e_utc))
                     
                 blocked_times_by_staff[coach.id] = utc_blocks
@@ -2511,7 +2502,7 @@ class BookingViewSet(viewsets.ModelViewSet):
             if availabilities:
                 utc_avail = []
                 for a in availabilities:
-                    # Convert Halifax times to UTC
+                    # StaffAvailability stores local wall-clock times. Convert to UTC using center TZ.
                     s_naive = datetime.combine(booking_date, a['start_time'])
                     e_naive = datetime.combine(booking_date, a['end_time'])
                     
@@ -2519,8 +2510,8 @@ class BookingViewSet(viewsets.ModelViewSet):
                     if a['end_time'] <= a['start_time']:
                         e_naive += timedelta(days=1)
                     
-                    s_utc = halifax_tz.localize(s_naive).astimezone(pytz.UTC)
-                    e_utc = halifax_tz.localize(e_naive).astimezone(pytz.UTC)
+                    s_utc = center_tz.localize(s_naive).astimezone(pytz.UTC)
+                    e_utc = center_tz.localize(e_naive).astimezone(pytz.UTC)
                     utc_avail.append((s_utc, e_utc))
                     
                 availability_by_staff[coach.id] = utc_avail
@@ -2781,8 +2772,9 @@ class BookingViewSet(viewsets.ModelViewSet):
 
         day_of_week = query_date.weekday()
         
-        # Use Halifax timezone
-        halifax_tz = pytz.timezone('America/Halifax')
+        # Use center timezone (DST-aware — reads from GHLLocation.timezone)
+        from golf_project.timezone_utils import get_center_timezone
+        center_tz = get_center_timezone(location_id)
 
         for staff in staff_members:
             # 1. Get working hours
@@ -2808,12 +2800,15 @@ class BookingViewSet(viewsets.ModelViewSet):
             staff_bookings = bookings_by_staff.get(staff.id, [])
             booking_data = []
             
-            # halifax_tz defined above
+            # Use center timezone (DST-aware — reads from GHLLocation.timezone)
+            from golf_project.timezone_utils import get_center_timezone
+            import pytz
+            center_tz = get_center_timezone(location_id)
             
             for b in staff_bookings:
-                # Convert to Halifax local time for display
-                local_start = b.start_time.astimezone(halifax_tz)
-                local_end = b.end_time.astimezone(halifax_tz)
+                # Convert UTC booking time to center's local timezone for display
+                local_start = b.start_time.astimezone(center_tz)
+                local_end = b.end_time.astimezone(center_tz)
                 
                 booking_data.append({
                     'id': b.id,
@@ -2827,13 +2822,13 @@ class BookingViewSet(viewsets.ModelViewSet):
             for block in staff_blocks:
                 if not block.is_full_day_block():
                     # Combine query_date with block times
-                    # block.start_time/end_time are in Halifax local time
+                    # block.start_time/end_time are wall-clock center local time
                     block_start = datetime.combine(query_date, block.start_time)
                     block_end = datetime.combine(query_date, block.end_time)
                     
-                    # Localize to Halifax to get proper ISO format with offset
-                    block_start_local = halifax_tz.localize(block_start)
-                    block_end_local = halifax_tz.localize(block_end)
+                    # Localize to center timezone to get proper ISO format with offset
+                    block_start_local = center_tz.localize(block_start)
+                    block_end_local = center_tz.localize(block_end)
 
                     booking_data.append({
                         'id': f"block-{block.id}",
@@ -3703,12 +3698,13 @@ class GuestBookingCreateView(APIView):
                 from users.models import StaffBlockedDate
                 import pytz
                 
-                # IMPORTANT: Convert UTC times to Halifax timezone for date/time extraction
-                # Blocked dates are stored in local timezone (Halifax)
-                # If we use UTC date, late-night Halifax bookings appear as next day
-                tz = pytz.timezone('America/Halifax')
-                start_time_local = start_time.astimezone(tz)
-                end_time_local = end_time.astimezone(tz)
+                # IMPORTANT: Convert UTC times to center's local timezone for date/time extraction
+                # Blocked dates are stored in local timezone (center's wall-clock time)
+                # If we use UTC date, late-night bookings appear as next day
+                from golf_project.timezone_utils import get_center_timezone
+                center_tz = get_center_timezone(location_id)
+                start_time_local = start_time.astimezone(center_tz)
+                end_time_local = end_time.astimezone(center_tz)
                 
                 booking_date = start_time_local.date()
                 booking_start_time = start_time_local.time()
