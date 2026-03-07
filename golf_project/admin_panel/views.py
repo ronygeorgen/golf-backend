@@ -1313,7 +1313,8 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
         from golf_project.timezone_utils import get_center_timezone
         from bookings.models import Booking
         from simulators.models import SimulatorCredit
-        from coaching.models import CoachingPackagePurchase, SimulatorPackagePurchase, StaffDayAvailability
+        from coaching.models import CoachingPackagePurchase, SimulatorPackagePurchase
+        from users.models import StaffDayAvailability
         from django.db.models import F, Q
         from decimal import Decimal
         import pytz
