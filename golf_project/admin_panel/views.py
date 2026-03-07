@@ -1328,8 +1328,9 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
         end_time = serializer.validated_data.get('end_time')
         
         # Calculate the full UTC range for the closed dates based on the center's timezone
-        start_of_period_local = center_tz.localize(datetime.combine(start_date, dt_time.min))
-        end_of_period_local = center_tz.localize(datetime.combine(end_date, dt_time.max))
+        # Use .replace(tzinfo=None) to ensure we start with naive times before localizing
+        start_of_period_local = center_tz.localize(datetime.combine(start_date, dt_time.min).replace(tzinfo=None))
+        end_of_period_local = center_tz.localize(datetime.combine(end_date, dt_time.max).replace(tzinfo=None))
         start_of_period_utc = start_of_period_local.astimezone(pytz.utc)
         end_of_period_utc = end_of_period_local.astimezone(pytz.utc)
         
@@ -1353,17 +1354,24 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
             all_range_bookings = list(bookings_qs)
             
             while current_date <= end_date:
-                closure_start_dt = center_tz.localize(datetime.combine(current_date, start_time))
-                closure_end_dt = center_tz.localize(datetime.combine(current_date, end_time))
+                # IMPORTANT: ensure start_time/end_time are naive before combining to avoid double timezone offsets
+                naive_start = start_time.replace(tzinfo=None) if hasattr(start_time, 'tzinfo') else start_time
+                naive_end = end_time.replace(tzinfo=None) if hasattr(end_time, 'tzinfo') else end_time
                 
-                if end_time < start_time:
+                closure_start_dt = center_tz.localize(datetime.combine(current_date, naive_start))
+                closure_end_dt = center_tz.localize(datetime.combine(current_date, naive_end))
+                
+                if naive_end < naive_start:
                     closure_end_dt += timedelta(days=1)
                 
                 closure_start_utc = closure_start_dt.astimezone(pytz.utc)
                 closure_end_utc = closure_end_dt.astimezone(pytz.utc)
                 
                 for b in all_range_bookings:
-                    if b.start_time < closure_end_utc and b.end_time > closure_start_utc:
+                    # Strict overlap check: booking starts BEFORE closure ends AND booking ends AFTER closure starts
+                    # We use a 1-second buffer on b.start_time < closure_end_utc to avoid cancelling 
+                    # bookings that start exactly when the closure ends (e.g. closure ends 19:00, booking starts 19:00)
+                    if (b.start_time + timedelta(seconds=1)) < closure_end_utc and b.end_time > closure_start_utc:
                         if b not in conflicting_bookings:
                             conflicting_bookings.append(b)
                 
