@@ -1304,95 +1304,40 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
         self._handle_force_cancellations(serializer, location_id)
         serializer.save()
 
+    def _get_bookings_to_cancel(self, start_date, end_date, start_time, end_time, location_id):
+        """Delegate to shared helper. Used by preview and force cancellation."""
+        from .closed_days_utils import get_bookings_for_closed_day
+        return get_bookings_for_closed_day(start_date, end_date, start_time, end_time, location_id)
+
     def _handle_force_cancellations(self, serializer, location_id):
-        """Shared logic to cancel bookings when forge_override is True"""
+        """Cancel bookings when force_override is True. Uses _get_bookings_to_cancel."""
         force_override = self.request.data.get('force_override', False)
         if not force_override:
             return
 
-        from golf_project.timezone_utils import get_center_timezone
-        from bookings.models import Booking
-        from simulators.models import SimulatorCredit
-        from coaching.models import CoachingPackagePurchase, SimulatorPackagePurchase
-        from users.models import StaffDayAvailability
-        from django.db.models import F, Q
+        from django.db.models import F
         from decimal import Decimal
-        import pytz
-        from datetime import datetime, timedelta, time as dt_time
-        
-        center_tz = get_center_timezone(location_id)
-        
+        from users.models import StaffDayAvailability
+
         start_date = serializer.validated_data.get('start_date')
         end_date = serializer.validated_data.get('end_date')
         start_time = serializer.validated_data.get('start_time')
         end_time = serializer.validated_data.get('end_time')
-        
-        # Calculate the full UTC range for the closed dates based on the center's timezone
-        # Use .replace(tzinfo=None) to ensure we start with naive times before localizing
-        start_of_period_local = center_tz.localize(datetime.combine(start_date, dt_time.min).replace(tzinfo=None))
-        end_of_period_local = center_tz.localize(datetime.combine(end_date, dt_time.max).replace(tzinfo=None))
-        start_of_period_utc = start_of_period_local.astimezone(pytz.utc)
-        end_of_period_utc = end_of_period_local.astimezone(pytz.utc)
-        
-        # Base query for bookings in the precise UTC time range boundary
-        bookings_qs = Booking.objects.filter(
-            start_time__gte=start_of_period_utc,
-            start_time__lte=end_of_period_utc,
-            status__in=['confirmed', 'completed']
-        )
-        
-        if location_id:
-            # Catch both exact match and any missing location_id bookings
-            bookings_qs = bookings_qs.filter(Q(location_id=location_id) | Q(location_id__isnull=True) | Q(location_id=''))
-        
-        # If closure has time range, filter to only bookings that overlap with the time range
-        if start_time and end_time:
-            conflicting_bookings = []
-            current_date = start_date
-            
-            # Fetch all potential bookings into memory
-            all_range_bookings = list(bookings_qs)
-            
-            while current_date <= end_date:
-                # IMPORTANT: ensure start_time/end_time are naive before combining to avoid double timezone offsets
-                naive_start = start_time.replace(tzinfo=None) if hasattr(start_time, 'tzinfo') else start_time
-                naive_end = end_time.replace(tzinfo=None) if hasattr(end_time, 'tzinfo') else end_time
-                
-                closure_start_dt = center_tz.localize(datetime.combine(current_date, naive_start))
-                closure_end_dt = center_tz.localize(datetime.combine(current_date, naive_end))
-                
-                if naive_end < naive_start:
-                    closure_end_dt += timedelta(days=1)
-                
-                closure_start_utc = closure_start_dt.astimezone(pytz.utc)
-                closure_end_utc = closure_end_dt.astimezone(pytz.utc)
-                
-                for b in all_range_bookings:
-                    # Strict overlap check: booking starts BEFORE closure ends AND booking ends AFTER closure starts
-                    # We use a 1-second buffer on b.start_time < closure_end_utc to avoid cancelling 
-                    # bookings that start exactly when the closure ends (e.g. closure ends 19:00, booking starts 19:00)
-                    if (b.start_time + timedelta(seconds=1)) < closure_end_utc and b.end_time > closure_start_utc:
-                        if b not in conflicting_bookings:
-                            conflicting_bookings.append(b)
-                
-                current_date += timedelta(days=1)
-            bookings = conflicting_bookings
-        else:
-            bookings = list(bookings_qs)
+
+        bookings = self._get_bookings_to_cancel(start_date, end_date, start_time, end_time, location_id)
 
         for booking in bookings:
             booking.status = 'cancelled'
             booking.save(update_fields=['status', 'updated_at'])
-            
-            # Restore credits/sessions
+
             if booking.booking_type == 'coaching':
                 if booking.package_purchase:
                     purchase = booking.package_purchase
                     purchase.sessions_remaining = F('sessions_remaining') + 1
                     purchase.save(update_fields=['sessions_remaining', 'updated_at'])
             elif booking.booking_type == 'simulator':
+                from simulators.models import SimulatorCredit
                 hours_to_restore = Decimal(str(booking.duration_minutes)) / Decimal('60')
-                
                 if booking.package_purchase and not booking.simulator_credit_redemption and not booking.simulator_package_purchase:
                     purchase = booking.package_purchase
                     purchase.simulator_hours_remaining = F('simulator_hours_remaining') + hours_to_restore
@@ -1424,7 +1369,6 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
                         notes=f"Credit from force-cancelled booking {booking.id} due to Closed Day creation"
                     )
 
-        # 2. Cancel/Deactivate Special Events (only for full-day closures)
         if not start_time or not end_time:
             from special_events.models import SpecialEvent
             events = SpecialEvent.objects.filter(
@@ -1435,8 +1379,6 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
             if location_id:
                 events = events.filter(location_id=location_id)
             events.update(is_active=False)
-            
-            # 3. Remove Staff Day Availability
             StaffDayAvailability.objects.filter(
                 date__gte=start_date,
                 date__lte=end_date
@@ -1474,6 +1416,95 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
         
         return super().destroy(request, *args, **kwargs)
     
+    @action(detail=False, methods=['post'], url_path='preview-cancellations')
+    def preview_cancellations(self, request):
+        """
+        Preview bookings that would be cancelled for the given closed day.
+
+        STORAGE:
+        - Closed day: start_date, end_date, start_time, end_time = LOCAL wall-clock (center timezone)
+        - Bookings: start_time, end_time stored in UTC
+
+        We convert the closed period (local) to UTC, then find overlapping bookings.
+        location_id is taken dynamically from: request body, query params, or user.ghl_location_id.
+        """
+        if not (request.user.role == 'admin' or request.user.is_superuser):
+            raise PermissionDenied("Administrator privileges are required.")
+
+        # Get location_id from request (body, query, or user) - no hardcoding
+        location_id = get_location_id_from_request(request)
+        from datetime import date as date_type, time as dt_time
+
+        start_date_str = request.data.get('start_date')
+        end_date_str = request.data.get('end_date') or start_date_str
+        start_time_val = request.data.get('start_time')
+        end_time_val = request.data.get('end_time')
+
+        if not start_date_str:
+            return Response({'error': 'start_date is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            start_date = date_type.fromisoformat(start_date_str)
+            end_date = date_type.fromisoformat(end_date_str)
+        except (ValueError, TypeError):
+            return Response({'error': 'Invalid date format. Use YYYY-MM-DD'}, status=status.HTTP_400_BAD_REQUEST)
+
+        def to_time(val):
+            if val is None:
+                return None
+            if hasattr(val, 'hour'):
+                return val
+            if isinstance(val, str):
+                parts = val.split(':')
+                return dt_time(int(parts[0]), int(parts[1]), int(parts[2]) if len(parts) > 2 else 0)
+            return val
+
+        start_time = to_time(start_time_val)
+        end_time = to_time(end_time_val)
+
+        from golf_project.timezone_utils import utc_to_local
+
+        # Closed day is LOCAL; bookings are UTC. _get_bookings_to_cancel converts
+        # local closure range to UTC and finds overlapping bookings.
+        bookings = self._get_bookings_to_cancel(start_date, end_date, start_time, end_time, location_id)
+
+        # Group by (date_local, booking_type) and serialize
+        grouped = {}
+        for b in bookings:
+            local_start = utc_to_local(b.start_time, location_id)
+            date_key = local_start.strftime('%Y-%m-%d')
+            type_key = b.booking_type
+            if date_key not in grouped:
+                grouped[date_key] = {'simulator': [], 'coaching': []}
+            entry = {
+                'id': b.id,
+                'client_name': f"{b.client.first_name or ''} {b.client.last_name or ''}".strip() or b.client.username or str(b.client),
+                'start_time': b.start_time.isoformat(),
+                'end_time': b.end_time.isoformat(),
+                'duration_minutes': b.duration_minutes,
+                'status': b.status,
+            }
+            if b.booking_type == 'simulator' and b.simulator:
+                entry['simulator_name'] = b.simulator.name or f"Bay {b.simulator.bay_number}"
+            if b.booking_type == 'coaching' and b.coach:
+                entry['coach_name'] = f"{b.coach.first_name or ''} {b.coach.last_name or ''}".strip() or b.coach.username
+            grouped[date_key][type_key].append(entry)
+
+        result = {'bookings_by_date': grouped}
+        # Include debug info when empty to help troubleshoot (location_id, UTC range used)
+        if not grouped and (location_id or request.query_params.get('debug')):
+            from golf_project.timezone_utils import make_local_datetime
+            start_utc = make_local_datetime(start_date, dt_time.min, location_id)
+            end_utc = make_local_datetime(end_date, dt_time(23, 59, 59, 999999), location_id)
+            result['_debug'] = {
+                'location_id': location_id,
+                'start_date_local': start_date_str,
+                'end_date_local': end_date_str,
+                'start_utc': start_utc.isoformat(),
+                'end_utc': end_utc.isoformat(),
+            }
+        return Response(result)
+
     @action(detail=False, methods=['get'], url_path='check-date')
     def check_date(self, request):
         """

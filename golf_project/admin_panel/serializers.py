@@ -159,7 +159,20 @@ class ClosedDaySerializer(serializers.ModelSerializer):
         if start_date and end_date:
             conflicts = []
             current_date = start_date
-            
+
+            # Resolve location_id once, outside the loop.
+            # NOTE: The ClosedDay.location_id is set in perform_create (not yet in attrs),
+            # so we read it from the request. The priority is:
+            #   1. location_id from request body (frontend now sends it explicitly)
+            #   2. request.user.ghl_location_id
+            from users.utils import get_location_id_from_request
+            from .closed_days_utils import get_bookings_for_closed_day
+            location_id = (
+                get_location_id_from_request(self.context.get('request'))
+                if self.context.get('request')
+                else None
+            )
+
             # Check each date in the range
             while current_date <= end_date:
                 # Check staff day-specific availability
@@ -298,15 +311,16 @@ class ClosedDaySerializer(serializers.ModelSerializer):
                     else:
                         conflicts.append(f"• Special events scheduled on {current_date.strftime('%Y-%m-%d')}: {', '.join(event_titles)}")
                 
-                # Check bookings (simulator and coaching)
-                bookings = Booking.objects.filter(
-                    start_time__date=current_date,
-                    status__in=['confirmed', 'completed']
+                # Check bookings - use same overlap logic as preview/cancellation (center-local →UTC)
+                bookings_list = get_bookings_for_closed_day(
+                    current_date, current_date,
+                    attrs.get('start_time'), attrs.get('end_time'),
+                    location_id
                 )
-                if bookings.exists():
-                    booking_count = bookings.count()
-                    simulator_count = bookings.filter(booking_type='simulator').count()
-                    coaching_count = bookings.filter(booking_type='coaching').count()
+                if bookings_list:
+                    booking_count = len(bookings_list)
+                    simulator_count = sum(1 for b in bookings_list if b.booking_type == 'simulator')
+                    coaching_count = sum(1 for b in bookings_list if b.booking_type == 'coaching')
                     conflicts.append(f"• {booking_count} booking(s) on {current_date.strftime('%Y-%m-%d')} ({simulator_count} simulator, {coaching_count} coaching)")
                 
                 current_date += timedelta(days=1)
