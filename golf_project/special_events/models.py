@@ -165,6 +165,36 @@ class SpecialEvent(models.Model):
         occurrences = [d for d in occurrences if d not in paused_dates]
         
         return occurrences
+
+    def get_adjusted_utc_times(self, occurrence_date):
+        """
+        Dynamically calculates the UTC start and end datetimes for a specific occurrence date,
+        by interpreting the stored UTC time against the timezone offset on the original creation date.
+        This preserves the local wall-clock time across DST shifts.
+        """
+        from golf_project.timezone_utils import get_center_timezone
+        center_tz = get_center_timezone(self.location_id)
+        
+        # 1. Get original UTC datetimes
+        orig_utc_start = datetime.combine(self.date, self.start_time).replace(tzinfo=dt_timezone.utc)
+        orig_utc_end = datetime.combine(self.date, self.end_time).replace(tzinfo=dt_timezone.utc)
+        if self.end_time < self.start_time:
+            orig_utc_end += timedelta(days=1)
+            
+        # 2. Get original local times
+        orig_local_start = orig_utc_start.astimezone(center_tz)
+        orig_local_end = orig_utc_end.astimezone(center_tz)
+        
+        # 3. Construct local datetimes on the occurrence date
+        local_start_dt = center_tz.localize(datetime.combine(occurrence_date, orig_local_start.time()))
+        days_diff = (orig_local_end.date() - orig_local_start.date()).days
+        local_end_dt = center_tz.localize(datetime.combine(occurrence_date + timedelta(days=days_diff), orig_local_end.time()))
+        
+        # 4. Convert back to UTC for the specific occurrence
+        adj_utc_start = local_start_dt.astimezone(dt_timezone.utc)
+        adj_utc_end = local_end_dt.astimezone(dt_timezone.utc)
+        
+        return adj_utc_start, adj_utc_end
     
     def conflicts_with_datetime(self, check_datetime):
         """
@@ -183,20 +213,12 @@ class SpecialEvent(models.Model):
             end_date=check_date + timedelta(days=1)
         )
         
-        if check_date not in occurrences:
-            return False
-        
-        # Check if time overlaps
-        event_start = self.start_time
-        event_end = self.end_time
-        
-        # Handle case where end_time is before start_time (crosses midnight)
-        if event_end < event_start:
-            # Event crosses midnight
-            return check_time >= event_start or check_time <= event_end
-        else:
-            # Normal case
-            return event_start <= check_time < event_end
+        for occ_date in occurrences:
+            adj_utc_start, adj_utc_end = self.get_adjusted_utc_times(occ_date)
+            if adj_utc_start <= check_datetime < adj_utc_end:
+                return True
+                
+        return False
 
     def conflicts_with_range(self, start_datetime, end_datetime):
         """
@@ -235,21 +257,13 @@ class SpecialEvent(models.Model):
             
         for occ_date in occurrences:
             # CRITICAL FIX: The date and times in the database are ALREADY in UTC.
-            # We must NOT use timezone.make_aware() because it would treat them as 
-            # local/naive times and convert them to UTC again (double conversion).
-            # Instead, we directly mark them as UTC using replace(tzinfo=dt_timezone.utc)
-            
-            # Create UTC-aware datetimes from the stored UTC date and times
-            event_start_dt = datetime.combine(occ_date, self.start_time).replace(tzinfo=dt_timezone.utc)
-            event_end_dt = datetime.combine(occ_date, self.end_time).replace(tzinfo=dt_timezone.utc)
-            
-            # Handle midnight crossover
-            if self.end_time < self.start_time:
-                event_end_dt += timedelta(days=1)
+            # But to handle DST shifts properly for recurring events, we must dynamically
+            # compute the UTC time on the specific occurrence date based on the original local time.
+            adj_utc_start, adj_utc_end = self.get_adjusted_utc_times(occ_date)
             
             # Check for overlap: (StartA < EndB) and (EndA > StartB)
             # Standard intersection
-            if start_datetime < event_end_dt and end_datetime > event_start_dt:
+            if start_datetime < adj_utc_end and end_datetime > adj_utc_start:
                 return True
                 
         return False

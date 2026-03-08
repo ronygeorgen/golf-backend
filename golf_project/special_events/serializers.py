@@ -92,19 +92,24 @@ class SpecialEventSerializer(serializers.ModelSerializer):
         return None
     
     def to_representation(self, instance):
-        """Return UTC times as-is (no conversion)"""
+        """Dynamic DST adjustment: compute UTC strings adjusted for occurrence date"""
         representation = super().to_representation(instance)
+        
+        # Get the targeted occurrence date for this serialization
+        occurrence_date_str = representation.get('next_occurrence_date') or representation.get('date')
+        if occurrence_date_str and isinstance(occurrence_date_str, str):
+            occurrence_date = datetime.strptime(occurrence_date_str, '%Y-%m-%d').date()
+        elif occurrence_date_str:
+            occurrence_date = occurrence_date_str
+        else:
+            occurrence_date = instance.date
+            
+        adj_utc_start, adj_utc_end = instance.get_adjusted_utc_times(occurrence_date)
+        
         # Format times as HH:MM:SS for consistency
-        if representation.get('start_time'):
-            if isinstance(representation['start_time'], str):
-                pass  # Already a string
-            else:
-                representation['start_time'] = representation['start_time'].strftime('%H:%M:%S')
-        if representation.get('end_time'):
-            if isinstance(representation['end_time'], str):
-                pass  # Already a string
-            else:
-                representation['end_time'] = representation['end_time'].strftime('%H:%M:%S')
+        representation['start_time'] = adj_utc_start.strftime('%H:%M:%S')
+        representation['end_time'] = adj_utc_end.strftime('%H:%M:%S')
+
         # Format date as YYYY-MM-DD
         if representation.get('date'):
             if isinstance(representation['date'], str):

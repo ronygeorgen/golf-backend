@@ -2005,8 +2005,10 @@ class BookingViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Get location_id for filtering
         location_id = get_location_id_from_request(request)
+        from golf_project.timezone_utils import get_center_timezone
+        import pytz
+        center_tz = get_center_timezone(location_id)
         
         # Get all active simulators (bays 1-5, excluding coaching bay)
         available_simulators = Simulator.objects.filter(
@@ -2076,27 +2078,29 @@ class BookingViewSet(viewsets.ModelViewSet):
                         continue
                 
                 # Convert to timezone-aware datetime for availability_end_time
-                availability_end_datetime = timezone.make_aware(avail_end)
+                availability_end_datetime = center_tz.localize(avail_end).astimezone(pytz.UTC)
                 
                 # Generate slots at 30-minute intervals (regardless of requested duration)
                 # This allows frontend to validate if selected duration fits
                 current_time = avail_start
-                now = timezone.now()
+                # Use local time for 'now' to correctly compare against local date/time integers
+                now_utc = timezone.now()
+                now_local = now_utc.astimezone(center_tz)
                 
                 # If booking is for today, adjust start time to skip past slots
-                if booking_date == now.date():
+                if booking_date == now_local.date():
                     # Round current time up to next 30-minute interval
-                    current_minute = now.minute
-                    current_second = now.second
-                    current_microsecond = now.microsecond
+                    current_minute = now_local.minute
+                    current_second = now_local.second
+                    current_microsecond = now_local.microsecond
                     
                     # Calculate minutes to add to round up to next 30-minute slot
                     minutes_to_add = 30 - (current_minute % 30)
                     if minutes_to_add == 30 and current_second == 0 and current_microsecond == 0:
                         minutes_to_add = 0  # Already on a 30-minute boundary
                     
-                    # Calculate the next valid slot start time (timezone-aware)
-                    next_slot_time = now + timedelta(minutes=minutes_to_add)
+                    # Calculate the next valid slot start time (local timezone-aware)
+                    next_slot_time = now_local + timedelta(minutes=minutes_to_add)
                     next_slot_time = next_slot_time.replace(second=0, microsecond=0)
                     
                     # Convert to naive datetime for comparison with current_time
@@ -2127,9 +2131,9 @@ class BookingViewSet(viewsets.ModelViewSet):
                         day_events.append(e)
 
                 while current_time < avail_end:
-                    slot_start = timezone.make_aware(current_time)
+                    slot_start = center_tz.localize(current_time).astimezone(pytz.UTC)
                     # Skip slots that have already passed (for today's bookings)
-                    if booking_date == now.date() and slot_start <= now:
+                    if booking_date == now_local.date() and slot_start <= now_utc:
                         current_time += timedelta(minutes=slot_interval)
                         continue
                     
@@ -2194,11 +2198,11 @@ class BookingViewSet(viewsets.ModelViewSet):
                                 end_date=(slot_start + timedelta(days=1)).date()
                             )
                             for occ_date in relevant_dates:
-                                # Convert event start to datetime on this specific occurrence date
-                                event_start_dt = timezone.make_aware(datetime.combine(occ_date, event.start_time))
+                                # Retrieve dynamically adjusted UTC datetimes for event on this occurrence
+                                adj_utc_start, adj_utc_end = event.get_adjusted_utc_times(occ_date)
                                 # Only care about events that constrain this slot (start after it)
-                                if event_start_dt > slot_start and event_start_dt < effective_avail_end:
-                                    effective_avail_end = event_start_dt
+                                if adj_utc_start > slot_start and adj_utc_start < effective_avail_end:
+                                    effective_avail_end = adj_utc_start
                         
                         if not existing_slot:
                             slot_payload = {
