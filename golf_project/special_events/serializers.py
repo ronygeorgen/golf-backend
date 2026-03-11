@@ -104,11 +104,9 @@ class SpecialEventSerializer(serializers.ModelSerializer):
         else:
             occurrence_date = instance.date
             
-        adj_utc_start, adj_utc_end = instance.get_adjusted_utc_times(occurrence_date)
-        
-        # Format times as HH:MM:SS for consistency
-        representation['start_time'] = adj_utc_start.strftime('%H:%M:%S')
-        representation['end_time'] = adj_utc_end.strftime('%H:%M:%S')
+        # Provide naive local strings matching Database Nominal Times instead of dynamic UTC shifts
+        representation['start_time'] = instance.start_time.strftime('%H:%M:%S') if instance.start_time else None
+        representation['end_time'] = instance.end_time.strftime('%H:%M:%S') if instance.end_time else None
 
         # Format date as YYYY-MM-DD
         if representation.get('date'):

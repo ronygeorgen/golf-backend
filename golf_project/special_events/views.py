@@ -279,13 +279,11 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
             if occurrences:
                 # Use the first relevant occurrence found
                 occ_date = occurrences[0]
-                adj_utc_start, adj_utc_end = event.get_adjusted_utc_times(occ_date)
-                
                 data = {
                     'id': event.id,
                     'title': event.title,
-                    'start_time': adj_utc_start.strftime('%H:%M:%S'),
-                    'end_time': adj_utc_end.strftime('%H:%M:%S'),
+                    'start_time': event.start_time.strftime('%H:%M:%S') if event.start_time else None,
+                    'end_time': event.end_time.strftime('%H:%M:%S') if event.end_time else None,
                     'date': occ_date.strftime('%Y-%m-%d'), # Return the ACTUAL UTC occurrence date
                     'is_private': event.is_private,
                 }

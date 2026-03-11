@@ -168,29 +168,21 @@ class SpecialEvent(models.Model):
 
     def get_adjusted_utc_times(self, occurrence_date):
         """
-        Dynamically calculates the UTC start and end datetimes for a specific occurrence date,
-        by interpreting the stored UTC time against the timezone offset on the original creation date.
-        This preserves the local wall-clock time across DST shifts.
+        Dynamically calculates the UTC start and end datetimes for a specific occurrence date.
+        The stored date and start_time/end_time are plain local times for the center.
         """
         from golf_project.timezone_utils import get_center_timezone
         center_tz = get_center_timezone(self.location_id)
         
-        # 1. Get original UTC datetimes
-        orig_utc_start = datetime.combine(self.date, self.start_time).replace(tzinfo=dt_timezone.utc)
-        orig_utc_end = datetime.combine(self.date, self.end_time).replace(tzinfo=dt_timezone.utc)
+        # Combine the occurrence_date with the local start/end times
+        local_start_dt = center_tz.localize(datetime.combine(occurrence_date, self.start_time))
+        local_end_dt = center_tz.localize(datetime.combine(occurrence_date, self.end_time))
+        
+        # Handle events that overnight
         if self.end_time < self.start_time:
-            orig_utc_end += timedelta(days=1)
+            local_end_dt += timedelta(days=1)
             
-        # 2. Get original local times
-        orig_local_start = orig_utc_start.astimezone(center_tz)
-        orig_local_end = orig_utc_end.astimezone(center_tz)
-        
-        # 3. Construct local datetimes on the occurrence date
-        local_start_dt = center_tz.localize(datetime.combine(occurrence_date, orig_local_start.time()))
-        days_diff = (orig_local_end.date() - orig_local_start.date()).days
-        local_end_dt = center_tz.localize(datetime.combine(occurrence_date + timedelta(days=days_diff), orig_local_end.time()))
-        
-        # 4. Convert back to UTC for the specific occurrence
+        # Convert to UTC
         adj_utc_start = local_start_dt.astimezone(dt_timezone.utc)
         adj_utc_end = local_end_dt.astimezone(dt_timezone.utc)
         
@@ -200,10 +192,7 @@ class SpecialEvent(models.Model):
         """
         Check if a given datetime conflicts with this event.
         Returns True if the datetime falls within any occurrence of this event.
-        
-        IMPORTANT: The date and times stored in the database are already in UTC.
-        We must treat them as UTC directly, not apply timezone.make_aware() which
-        would cause a double conversion.
+        check_datetime should be UTC-aware.
         """
         check_date = check_datetime.date()
         check_time = check_datetime.time()
@@ -224,10 +213,7 @@ class SpecialEvent(models.Model):
         """
         Check if a given datetime range conflicts with this event.
         Returns True if any part of the range overlaps with any occurrence of this event.
-        
-        IMPORTANT: The date and times stored in the database are already in UTC.
-        We must treat them as UTC directly, not apply timezone.make_aware() which
-        would cause a double conversion (converting UTC values as if they were local time).
+        start_datetime and end_datetime should be UTC-aware.
         """
         # Get start and end dates to check occurrences
         if isinstance(start_datetime, datetime):
@@ -256,9 +242,7 @@ class SpecialEvent(models.Model):
             return False
             
         for occ_date in occurrences:
-            # CRITICAL FIX: The date and times in the database are ALREADY in UTC.
-            # But to handle DST shifts properly for recurring events, we must dynamically
-            # compute the UTC time on the specific occurrence date based on the original local time.
+            # Get the UTC time on the specific occurrence date based on the stored local time.
             adj_utc_start, adj_utc_end = self.get_adjusted_utc_times(occ_date)
             
             # Check for overlap: (StartA < EndB) and (EndA > StartB)

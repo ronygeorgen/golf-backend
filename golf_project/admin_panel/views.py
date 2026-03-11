@@ -482,14 +482,20 @@ class StaffViewSet(viewsets.ModelViewSet):
                 block_start_dt = center_tz.localize(dt.combine(block_date, start_time))
                 block_end_dt = center_tz.localize(dt.combine(block_date, end_time))
                 
+                # Fetch bookings for the whole local day (converted to UTC range)
+                # Avoid using start_time__date as it compares against UTC date
+                start_of_day_local = center_tz.localize(dt.combine(block_date, dt.min.time()))
+                end_of_day_local = center_tz.localize(dt.combine(block_date, dt.max.time()))
+                
                 bookings_to_cancel = Booking.objects.filter(
                     coach=staff,
                     booking_type='coaching',
-                    start_time__date=block_date,  # Same date
+                    start_time__range=(start_of_day_local, end_of_day_local),
                     status='confirmed'
                 ).select_related('client', 'package_purchase', 'coaching_package')
                 
-                # Filter for time overlap: booking_start < block_end AND booking_end > block_start
+                # Filter for time overlap in memory (to handle exact minutes/seconds properly)
+                # booking_start < block_end AND booking_end > block_start
                 bookings_to_cancel = [
                     b for b in bookings_to_cancel
                     if b.start_time < block_end_dt and b.end_time > block_start_dt

@@ -1221,12 +1221,9 @@ def format_special_event_datetime(registration, location_id=None):
     occurrence_date = registration.occurrence_date
     start_time = registration.event.start_time
     
-    # Combine date and time, treat as UTC
-    dt = datetime.combine(occurrence_date, start_time)
-    dt_utc = pytz.utc.localize(dt)
-    
-    # Convert to center's local timezone (handles DST automatically)
-    dt_local = dt_utc.astimezone(center_tz)
+    # Combine date and time
+    # Special Events store plain local time, so we just use it directly.
+    dt_local = datetime.combine(occurrence_date, start_time)
     
     # Format: "DD-MMM-YYYY HH:MM AM/PM"
     day = dt_local.strftime("%d")

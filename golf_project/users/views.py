@@ -285,15 +285,8 @@ def verify_otp(request):
                 
                 # Include the center's IANA timezone so the frontend can
                 # display all times correctly (DST-aware) without extra calls.
-                location_timezone = 'America/Halifax'  # fallback default
-                if resolved_location:
-                    try:
-                        from ghl.models import GHLLocation
-                        loc = GHLLocation.objects.filter(location_id=resolved_location).first()
-                        if loc and loc.timezone:
-                            location_timezone = loc.timezone
-                    except Exception:
-                        pass
+                from golf_project.timezone_utils import get_center_timezone_name
+                location_timezone = get_center_timezone_name(resolved_location)
                 response_data['location_timezone'] = location_timezone
                 
                 return Response(response_data)
@@ -659,15 +652,8 @@ def login(request):
         token, created = Token.objects.get_or_create(user=user)
         
         # Include location timezone for DST-aware display on the frontend
-        location_timezone = 'America/Halifax'
-        try:
-            if hasattr(user, 'ghl_location_id') and user.ghl_location_id:
-                from ghl.models import GHLLocation
-                loc = GHLLocation.objects.filter(location_id=user.ghl_location_id).first()
-                if loc and loc.timezone:
-                    location_timezone = loc.timezone
-        except Exception:
-            pass
+        from golf_project.timezone_utils import get_center_timezone_name
+        location_timezone = get_center_timezone_name(getattr(user, 'ghl_location_id', None))
         
         return Response({
             'message': 'Login successful',

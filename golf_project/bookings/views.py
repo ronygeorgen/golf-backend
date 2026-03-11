@@ -2176,9 +2176,11 @@ class BookingViewSet(viewsets.ModelViewSet):
                     
                     # Check for special event conflict
                     has_special_event = False
+                    conflict_event_title = None
                     for event in day_events:
                         if event.conflicts_with_range(slot_start, slot_end):
                             has_special_event = True
+                            conflict_event_title = event.title
                             break
                     
                     # Check if facility is closed
@@ -2272,6 +2274,13 @@ class BookingViewSet(viewsets.ModelViewSet):
             'hourly_price': hourly_price,  # Always include hourly_price (can be None)
             'max_available_simulators': max_available_simulators
         }
+
+        # If no slots are available, check if it's because of a special event on that day
+        if not filtered_slots:
+            any_event = day_events[0] if day_events else None
+            # If the entire day is covered or there's at least one active event, provide a message
+            if any_event:
+                response_data['special_event_message'] = f"Slots are unavailable due to a special event: {any_event.title}"
         
         return Response(response_data)
     
@@ -2575,9 +2584,11 @@ class BookingViewSet(viewsets.ModelViewSet):
 
             # Check for special event conflict
             has_special_event = False
+            conflict_event_title = None
             for event in day_events:
                 if event.conflicts_with_range(slot_start, slot_end):
                     has_special_event = True
+                    conflict_event_title = event.title
                     break
             
             if has_special_event:
@@ -2721,6 +2732,12 @@ class BookingViewSet(viewsets.ModelViewSet):
             'coach_id': coach_id,
             'available_slots': available_slots
         }
+
+        # If no slots are available, check if it's because of a special event on that day
+        if not available_slots:
+            any_event = day_events[0] if day_events else None
+            if any_event:
+                response_data['special_event_message'] = f"Slots are unavailable due to a special event: {any_event.title}"
         
         return Response(response_data)
     
@@ -2751,9 +2768,16 @@ class BookingViewSet(viewsets.ModelViewSet):
         staff_members = list(staff_qs.distinct())
         response_data = []
         
-        # Prefetch bookings
+        from golf_project.timezone_utils import get_center_timezone
+        center_tz = get_center_timezone(location_id)
+        
+        # Calculate start and end of the query date in local time, then convert to UTC
+        start_of_day_local = center_tz.localize(datetime.combine(query_date, datetime.min.time()))
+        end_of_day_local = center_tz.localize(datetime.combine(query_date, datetime.max.time()))
+        
+        # Prefetch bookings using range to account for UTC timezone differences
         bookings = Booking.objects.filter(
-            start_time__date=query_date,
+            start_time__range=(start_of_day_local, end_of_day_local),
             status__in=['confirmed', 'completed'],
             booking_type='coaching'
         ).select_related('client', 'simulator')
@@ -2776,9 +2800,7 @@ class BookingViewSet(viewsets.ModelViewSet):
 
         day_of_week = query_date.weekday()
         
-        # Use center timezone (DST-aware — reads from GHLLocation.timezone)
-        from golf_project.timezone_utils import get_center_timezone
-        center_tz = get_center_timezone(location_id)
+        # center_tz is already defined above
 
         for staff in staff_members:
             # 1. Get working hours
