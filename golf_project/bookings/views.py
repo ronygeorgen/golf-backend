@@ -1068,36 +1068,53 @@ class BookingViewSet(viewsets.ModelViewSet):
                 if location_id:
                     candidate_sims_qs = candidate_sims_qs.filter(location_id=location_id)
                 
-                assigned_simulator = None
-                # Lock the simulator rows to prevent race conditions during bay assignment
-                with transaction.atomic():
-                    # We use select_for_update() to ensure serial access to these bay records
-                    locked_sims = list(candidate_sims_qs.select_for_update())
-                    
-                    for simulator in locked_sims:
-                        # Use our atomic check (no need for further locking within the check as we have the rows locked)
-                        if self._check_simulator_availability_atomic(simulator, start_time, end_time, use_locking=False):
-                            assigned_simulator = simulator
-                            break
-                
-                if not assigned_simulator:
-                    raise serializers.ValidationError("No bay available for this coaching session (Coaching bays and Simulators are full for this time slot).")
-
-                # Check for coach conflicts with row-level locking to prevent race conditions
-                # Wrap coach check, session consumption, and booking creation in a transaction to ensure atomicity
+                # Extract these before the atomic block so they are available throughout
                 coach = booking_data.get('coach')
-                # Check if package is TPI assessment
                 is_tpi_assessment = package.is_tpi_assessment if hasattr(package, 'is_tpi_assessment') else False
                 
-                # Validate that the selected staff is actually assigned to the package
+                # Validate coach-package assignment before entering the atomic block
                 if coach and package and not package.staff_members.filter(id=coach.id).exists():
-                     coach_name = f"{coach.first_name} {coach.last_name}".strip()
-                     raise serializers.ValidationError(
+                    coach_name = f"{coach.first_name} {coach.last_name}".strip()
+                    raise serializers.ValidationError(
                         f"Coach {coach_name} is not assigned to package '{package.title}'."
                     )
                 
-                # Perform coach conflict check, session consumption, and booking creation atomically
+                # ONE atomic block covers: bay lock, capacity check, coach checks,
+                # session consumption, and booking creation.  This closes the race-condition
+                # window that existed between the two previously separate inner transactions.
+                assigned_simulator = None
                 with transaction.atomic():
+                    # Lock all bay rows so concurrent requests queue up here
+                    locked_sims = list(candidate_sims_qs.select_for_update())
+                    
+                    # --- Coaching session capacity check ---
+                    # Coaching sessions must not exceed the number of coaching bays.
+                    # This is the primary guard against double-booking a coaching slot.
+                    num_coaching_bays = sum(1 for s in locked_sims if s.is_coaching_bay)
+                    if num_coaching_bays > 0:
+                        concurrent_coaching_qs = Booking.objects.filter(
+                            booking_type='coaching',
+                            start_time__lt=end_time,
+                            end_time__gt=start_time,
+                            status__in=['confirmed', 'completed']
+                        )
+                        if location_id:
+                            concurrent_coaching_qs = concurrent_coaching_qs.filter(location_id=location_id)
+                        if concurrent_coaching_qs.count() >= num_coaching_bays:
+                            raise serializers.ValidationError(
+                                "No coaching session slot available: the coaching bay is already booked for this time slot."
+                            )
+                    
+                    # --- Bay assignment ---
+                    for simulator in locked_sims:
+                        if self._check_simulator_availability_atomic(simulator, start_time, end_time, use_locking=False):
+                            assigned_simulator = simulator
+                            break
+                    
+                    if not assigned_simulator:
+                        raise serializers.ValidationError("No bay available for this coaching session (Coaching bays and Simulators are full for this time slot).")
+
+                    # --- Coach-specific checks (within the same lock) ---
                     if coach:
                         # CRITICAL: Check if coach has this date blocked (staff unavailability)
                         # This prevents bookings even if someone bypasses the frontend
