@@ -1079,33 +1079,18 @@ class BookingViewSet(viewsets.ModelViewSet):
                         f"Coach {coach_name} is not assigned to package '{package.title}'."
                     )
                 
-                # ONE atomic block covers: bay lock, capacity check, coach checks,
-                # session consumption, and booking creation.  This closes the race-condition
-                # window that existed between the two previously separate inner transactions.
+                # ONE atomic block: bay lock + coach checks + session consumption + booking creation.
+                # This closes the race-condition window from the previously separate transactions.
+                # Bay assignment order: coaching bay first, then simulator bays as fallback.
+                # A different coach CAN book a simulator bay if the coaching bay is already taken.
+                # Same-coach double-booking is blocked by the coach conflict check below.
+                # Same-bay double-booking is blocked by select_for_update + _check_simulator_availability_atomic.
                 assigned_simulator = None
                 with transaction.atomic():
                     # Lock all bay rows so concurrent requests queue up here
                     locked_sims = list(candidate_sims_qs.select_for_update())
                     
-                    # --- Coaching session capacity check ---
-                    # Coaching sessions must not exceed the number of coaching bays.
-                    # This is the primary guard against double-booking a coaching slot.
-                    num_coaching_bays = sum(1 for s in locked_sims if s.is_coaching_bay)
-                    if num_coaching_bays > 0:
-                        concurrent_coaching_qs = Booking.objects.filter(
-                            booking_type='coaching',
-                            start_time__lt=end_time,
-                            end_time__gt=start_time,
-                            status__in=['confirmed', 'completed']
-                        )
-                        if location_id:
-                            concurrent_coaching_qs = concurrent_coaching_qs.filter(location_id=location_id)
-                        if concurrent_coaching_qs.count() >= num_coaching_bays:
-                            raise serializers.ValidationError(
-                                "No coaching session slot available: the coaching bay is already booked for this time slot."
-                            )
-                    
-                    # --- Bay assignment ---
+                    # --- Bay assignment (coaching bay first, simulator bays as fallback) ---
                     for simulator in locked_sims:
                         if self._check_simulator_availability_atomic(simulator, start_time, end_time, use_locking=False):
                             assigned_simulator = simulator
