@@ -1090,7 +1090,62 @@ class BookingViewSet(viewsets.ModelViewSet):
                     # Lock all bay rows so concurrent requests queue up here
                     locked_sims = list(candidate_sims_qs.select_for_update())
                     
-                    # --- Bay assignment (coaching bay first, simulator bays as fallback) ---
+                    # --- Coaching session capacity check ---
+                    # Coaching sessions must not exceed the number of coaches who have availability
+                    # covering this exact time slot. Only coaches with their schedule fully covering
+                    # the slot are counted — coaches without any availability configured are ignored.
+                    import pytz as _pytz
+                    from users.models import StaffAvailability as _StaffAvail, StaffDayAvailability as _StaffDayAvail
+                    from golf_project.timezone_utils import get_center_timezone as _get_center_tz
+                    from coaching.models import CoachingPackage as _CoachPkg
+                    _center_tz = _get_center_tz(location_id)
+                    _slot_date_local = start_time.astimezone(_center_tz).date()
+                    _slot_dow = _slot_date_local.weekday()
+
+                    # Determine which coaches are linked to the chosen package
+                    _package_coaches_qs = User.objects.filter(role__in=['staff', 'admin'], is_active=True)
+                    if location_id:
+                        _package_coaches_qs = _package_coaches_qs.filter(ghl_location_id=location_id)
+                    try:
+                        _pkg_obj = _CoachPkg.objects.get(id=package.id)
+                        _package_coaches_qs = _pkg_obj.staff_members.filter(role__in=['staff', 'admin'], is_active=True)
+                    except Exception:
+                        pass
+
+                    _num_available_coaches = 0
+                    for _c in _package_coaches_qs:
+                        # Check specific-date availability first, fall back to recurring
+                        _avails = list(_StaffDayAvail.objects.filter(staff=_c, date=_slot_date_local).values('start_time', 'end_time'))
+                        if not _avails:
+                            _avails = list(_StaffAvail.objects.filter(staff=_c, day_of_week=_slot_dow).values('start_time', 'end_time'))
+                        for _a in _avails:
+                            _s_naive = datetime.combine(_slot_date_local, _a['start_time'])
+                            _e_naive = datetime.combine(_slot_date_local, _a['end_time'])
+                            if _a['end_time'] <= _a['start_time']:
+                                _e_naive += timedelta(days=1)
+                            _s_utc = _center_tz.localize(_s_naive).astimezone(_pytz.UTC)
+                            _e_utc = _center_tz.localize(_e_naive).astimezone(_pytz.UTC)
+                            # Coach must fully cover the slot
+                            if _s_utc <= start_time and _e_utc >= end_time:
+                                _num_available_coaches += 1
+                                break
+
+                    # Only apply the coach-capacity guard when we can determine how many coaches work
+                    if _num_available_coaches > 0:
+                        concurrent_coaching_qs = Booking.objects.filter(
+                            booking_type='coaching',
+                            start_time__lt=end_time,
+                            end_time__gt=start_time,
+                            status__in=['confirmed', 'completed']
+                        )
+                        if location_id:
+                            concurrent_coaching_qs = concurrent_coaching_qs.filter(location_id=location_id)
+                        if concurrent_coaching_qs.count() >= _num_available_coaches:
+                            raise serializers.ValidationError(
+                                "No coaching session slot available: all coaches are already booked for this time slot."
+                            )
+                    
+                    # --- Bay assignment ---
                     for simulator in locked_sims:
                         if self._check_simulator_availability_atomic(simulator, start_time, end_time, use_locking=False):
                             assigned_simulator = simulator
@@ -1607,7 +1662,57 @@ class BookingViewSet(viewsets.ModelViewSet):
             booking.status = 'cancelled'
             booking.save(update_fields=['status', 'updated_at'])
             restitution = {}
-            
+
+            # --- Auto-reallocation on coaching cancellation ---
+            # When a coaching session in the COACHING BAY is cancelled, check if there is
+            # another coaching session currently "overflowed" into a regular simulator bay
+            # that overlaps this slot. If the durations match exactly, move it into the
+            # now-free coaching bay so the simulator bay is released for normal bookings.
+            # If durations differ, we leave the overflowed session in place and the freed
+            # coaching-bay slot will simply become bookable again (handled by the availability check).
+            if booking.booking_type == 'coaching' and booking.simulator_id:
+                try:
+                    _cancelled_sim = booking.simulator
+                    if _cancelled_sim and _cancelled_sim.is_coaching_bay:
+                        # Find an overflowed coaching session (in a non-coaching-bay simulator)
+                        # that overlaps the just-cancelled slot
+                        _overflowed = Booking.objects.filter(
+                            booking_type='coaching',
+                            start_time__lt=booking.end_time,
+                            end_time__gt=booking.start_time,
+                            status__in=['confirmed', 'completed'],
+                            simulator__is_coaching_bay=False,
+                        )
+                        if booking.location_id:
+                            _overflowed = _overflowed.filter(location_id=booking.location_id)
+                        _overflowed_booking = _overflowed.select_related('simulator').first()
+
+                        if _overflowed_booking:
+                            # Only reallocate when durations match exactly
+                            if _overflowed_booking.duration_minutes == booking.duration_minutes:
+                                _overflowed_booking.simulator = _cancelled_sim
+                                _overflowed_booking.save(update_fields=['simulator', 'updated_at'])
+                                restitution['reallocated_booking_id'] = _overflowed_booking.id
+                                restitution['reallocated_to_bay'] = _cancelled_sim.name
+                                logger.info(
+                                    f"Auto-reallocated coaching booking #{_overflowed_booking.id} "
+                                    f"from simulator bay '{_overflowed_booking.simulator.name}' "
+                                    f"to coaching bay '{_cancelled_sim.name}' "
+                                    f"after cancellation of booking #{booking.id}."
+                                )
+                            else:
+                                # Durations differ — leave overflowed session in place.
+                                # The coaching-bay slot is now freed but we do NOT automatically
+                                # open it unless a coach actually covers that window.
+                                restitution['coaching_bay_slot_released'] = True
+                                logger.info(
+                                    f"Coaching booking #{booking.id} cancelled. Duration mismatch with "
+                                    f"overflowed booking #{_overflowed_booking.id} — slot released for new bookings."
+                                )
+                except Exception as _realloc_exc:
+                    # Reallocation is best-effort — never let it block the cancellation
+                    logger.warning(f"Auto-reallocation failed for booking #{booking.id}: {_realloc_exc}")
+
             # Only restore/refund if refund_credit is True
             if refund_credit:
                 if booking.booking_type == 'coaching':
