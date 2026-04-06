@@ -3581,7 +3581,7 @@ class BookingWebhookView(APIView):
                     start_time__lt=temp_booking.end_time,
                     end_time__gt=temp_booking.start_time,
                     status__in=['confirmed', 'completed'],
-                    booking_type='simulator'
+                    # booking_type='simulator'
                 ).exists()
                 
                 if booking_conflict:
