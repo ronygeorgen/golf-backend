@@ -79,6 +79,92 @@ def _get_user_by_phone(phone):
     return None
 
 
+def _subject_user_for_coaching_availability_request(request):
+    """
+    Resolve which user's package entitlement to honor for coaching availability.
+    Staff/admin may pass client_user_id when booking on behalf of a client.
+    Guests are identified by phone (AllowAny + phone on check_coaching_availability).
+    """
+    phone = request.query_params.get('phone')
+    client_user_id = request.query_params.get('client_user_id')
+
+    if request.user.is_authenticated:
+        if client_user_id:
+            role = getattr(request.user, 'role', '') or ''
+            is_privileged = (
+                request.user.is_superuser
+                or role in ('admin', 'staff', 'superadmin')
+            )
+            if is_privileged:
+                try:
+                    return User.objects.get(id=int(client_user_id))
+                except (User.DoesNotExist, ValueError, TypeError):
+                    return None
+        return request.user
+
+    return _get_user_by_phone(phone)
+
+
+def _user_has_usable_coaching_purchase_for_package(user, package_id):
+    """
+    True if the user may consume coaching sessions from this catalog package
+    (personal/gifted or organization member), regardless of CoachingPackage.is_active.
+    """
+    if user is None:
+        return False
+    try:
+        pk = int(package_id)
+    except (TypeError, ValueError):
+        return False
+
+    personal = CoachingPackagePurchase.objects.filter(
+        client=user,
+        package_id=pk,
+        sessions_remaining__gt=0,
+        package_status='active',
+    ).exclude(
+        gift_status='pending'
+    ).exclude(
+        purchase_type='organization'
+    ).exists()
+
+    if personal:
+        return True
+
+    return CoachingPackagePurchase.objects.filter(
+        package_id=pk,
+        purchase_type='organization',
+        sessions_remaining__gt=0,
+        package_status='active',
+        organization_members__phone=user.phone,
+    ).exists()
+
+
+def _get_coaching_package_for_availability_check(request, package_id):
+    """
+    Load CoachingPackage for slot calculation.
+    Active packages: anyone allowed (same as before).
+    Inactive: only if the subject user still has a usable purchase (sessions left).
+    """
+    from coaching.models import CoachingPackage
+
+    try:
+        selected_package = CoachingPackage.objects.get(id=package_id)
+    except (CoachingPackage.DoesNotExist, ValueError, TypeError):
+        return None
+
+    if selected_package.is_active:
+        return selected_package
+
+    subject = _subject_user_for_coaching_availability_request(request)
+    if subject is None:
+        return None
+
+    if _user_has_usable_coaching_purchase_for_package(subject, selected_package.id):
+        return selected_package
+
+    return None
+
 
 class TenPerPagePagination(PageNumberPagination):
     page_size = 10
@@ -2420,7 +2506,6 @@ class BookingViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        from coaching.models import CoachingPackage
         from users.models import StaffAvailability, StaffDayAvailability
         
         # Get location_id for filtering
@@ -2455,14 +2540,13 @@ class BookingViewSet(viewsets.ModelViewSet):
         coaches_qs = User.objects.filter(role__in=['staff', 'admin'], is_active=True)
         if location_id:
             coaches_qs = coaches_qs.filter(ghl_location_id=location_id)
-        try:
-            selected_package = CoachingPackage.objects.get(id=package_id, is_active=True)
-            coaches_qs = selected_package.staff_members.filter(role__in=['staff', 'admin'], is_active=True)
-        except CoachingPackage.DoesNotExist:
+        selected_package = _get_coaching_package_for_availability_check(request, package_id)
+        if not selected_package:
             return Response(
                 {'error': 'Package not found'},
                 status=status.HTTP_404_NOT_FOUND
             )
+        coaches_qs = selected_package.staff_members.filter(role__in=['staff', 'admin'], is_active=True)
         
         if coach_id:
             coaches_qs = coaches_qs.filter(id=coach_id)
@@ -3727,10 +3811,11 @@ class GuestBookingCreateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Get package and verify it's a TPI assessment package
+        # Get package and verify it's a TPI assessment package.
+        # Inactive catalog packages are still allowed when the user has remaining sessions.
         from coaching.models import CoachingPackage, CoachingPackagePurchase
         try:
-            package = CoachingPackage.objects.get(id=package_id, is_active=True)
+            package = CoachingPackage.objects.get(id=package_id)
         except CoachingPackage.DoesNotExist:
             return Response(
                 {'error': 'Package not found.'},
