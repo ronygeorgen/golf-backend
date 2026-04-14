@@ -14,6 +14,8 @@ class BookingCreateSerializer(serializers.ModelSerializer):
     use_organization_package = serializers.BooleanField(write_only=True, required=False, default=False)
     use_prepaid_hours = serializers.BooleanField(write_only=True, required=False, default=None, allow_null=True)
     simulator_count = serializers.IntegerField(write_only=True, required=False, default=1, min_value=1)
+    # Staff/admin only: honored in BookingViewSet.perform_create to skip coach-capacity and same-coach conflict checks.
+    admin_manual_booking = serializers.BooleanField(write_only=True, required=False, default=False)
     location_id = serializers.CharField(required=False, allow_null=True, allow_blank=True)  # Allow location_id to be passed or set in perform_create
     
     class Meta:
@@ -22,6 +24,7 @@ class BookingCreateSerializer(serializers.ModelSerializer):
             'booking_type', 'simulator', 'duration_minutes', 
             'coaching_package', 'coach', 'start_time', 'end_time', 'total_price',
             'use_simulator_credit', 'use_organization_package', 'use_prepaid_hours', 'simulator_count',
+            'admin_manual_booking',
             'location_id'  # Include location_id so it can be saved during booking creation
         ]
     
@@ -143,6 +146,7 @@ class BookingCreateSerializer(serializers.ModelSerializer):
         validated_data.pop('use_organization_package', None)
         validated_data.pop('use_prepaid_hours', None)
         validated_data.pop('simulator_count', None)
+        validated_data.pop('admin_manual_booking', None)
         # location_id should be in validated_data if provided, and will be saved by super().create()
         return super().create(validated_data)
 

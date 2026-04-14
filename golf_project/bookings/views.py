@@ -230,6 +230,16 @@ class BookingViewSet(viewsets.ModelViewSet):
         location_id = get_location_id_from_request(self.request)
         return ClosedDay.check_if_closed(check_datetime, location_id=location_id)
     
+    def _request_user_can_force_coaching_booking(self):
+        """True if the authenticated user may use admin manual / force coaching booking overrides."""
+        user = self.request.user
+        if not getattr(user, 'is_authenticated', False):
+            return False
+        if getattr(user, 'is_superuser', False):
+            return True
+        role = getattr(user, 'role', '') or ''
+        return role in ('admin', 'staff', 'superadmin')
+    
     def get_queryset(self):
         user = self.request.user
         location_id = get_location_id_from_request(self.request)
@@ -826,6 +836,12 @@ class BookingViewSet(viewsets.ModelViewSet):
         use_simulator_credit = booking_data.pop('use_simulator_credit', False)
         use_organization_package = booking_data.pop('use_organization_package', False)
         simulator_count = booking_data.pop('simulator_count', 1)
+        admin_manual_booking = booking_data.pop('admin_manual_booking', False)
+        if admin_manual_booking and not self._request_user_can_force_coaching_booking():
+            raise serializers.ValidationError(
+                "Manual admin booking override is not permitted for this account."
+            )
+        skip_coaching_availability_enforcement = bool(admin_manual_booking)
         redeemed_credit = None
         
         # Determine target user
@@ -1217,7 +1233,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                                 break
 
                     # Only apply the coach-capacity guard when we can determine how many coaches work
-                    if _num_available_coaches > 0:
+                    if not skip_coaching_availability_enforcement and _num_available_coaches > 0:
                         concurrent_coaching_qs = Booking.objects.filter(
                             booking_type='coaching',
                             start_time__lt=end_time,
@@ -1297,7 +1313,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                             end_time__gt=start_time,
                             status__in=['confirmed', 'completed']
                         )
-                        if conflicting_coach_bookings.exists():
+                        if conflicting_coach_bookings.exists() and not skip_coaching_availability_enforcement:
                             raise serializers.ValidationError("This time slot is already booked for the selected coach")
                     
                     # Consume session within the same transaction
