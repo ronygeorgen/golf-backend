@@ -1154,10 +1154,11 @@ class BookingViewSet(viewsets.ModelViewSet):
                 start_time = booking_data.get('start_time')
                 end_time = booking_data.get('end_time')
                 
-                # Check for Special Event conflict
-                has_event_conflict, event_title = self._check_special_event_conflict(start_time, end_time)
-                if has_event_conflict:
-                    raise serializers.ValidationError(f"This slot conflicts with a special event: {event_title}")
+                # Check for Special Event conflict (privileged admin manual / force coaching booking may override)
+                if not skip_coaching_availability_enforcement:
+                    has_event_conflict, event_title = self._check_special_event_conflict(start_time, end_time)
+                    if has_event_conflict:
+                        raise serializers.ValidationError(f"This slot conflicts with a special event: {event_title}")
                 
                 # Check if facility is closed
                 is_closed, closed_message = self._check_closed_day(start_time)

@@ -14,7 +14,8 @@ class BookingCreateSerializer(serializers.ModelSerializer):
     use_organization_package = serializers.BooleanField(write_only=True, required=False, default=False)
     use_prepaid_hours = serializers.BooleanField(write_only=True, required=False, default=None, allow_null=True)
     simulator_count = serializers.IntegerField(write_only=True, required=False, default=1, min_value=1)
-    # Staff/admin only: honored in BookingViewSet.perform_create to skip coach-capacity and same-coach conflict checks.
+    # Staff/admin only: honored in BookingViewSet.perform_create and validate() to skip coach-capacity,
+    # same-coach conflict, and special-event overlap checks for coaching bookings.
     admin_manual_booking = serializers.BooleanField(write_only=True, required=False, default=False)
     location_id = serializers.CharField(required=False, allow_null=True, allow_blank=True)  # Allow location_id to be passed or set in perform_create
     
@@ -33,6 +34,17 @@ class BookingCreateSerializer(serializers.ModelSerializer):
         # Make total_price optional - it will be set automatically in validate()
         if 'total_price' in self.fields:
             self.fields['total_price'].required = False
+    
+    def _request_user_can_admin_manual_booking(self):
+        """Must match BookingViewSet._request_user_can_force_coaching_booking() logic."""
+        request = self.context.get('request') if hasattr(self, 'context') else None
+        if not request or not getattr(request.user, 'is_authenticated', False):
+            return False
+        user = request.user
+        if getattr(user, 'is_superuser', False):
+            return True
+        role = getattr(user, 'role', '') or ''
+        return role in ('admin', 'staff', 'superadmin')
     
     def validate(self, data):
         # Check for booking conflicts
@@ -76,17 +88,23 @@ class BookingCreateSerializer(serializers.ModelSerializer):
                     })
                 current_check += timedelta(minutes=15)
             
-            # Check for special event conflicts
-            from special_events.models import SpecialEvent
-            active_events = SpecialEvent.objects.filter(is_active=True)
-            if location_id:
-                active_events = active_events.filter(location_id=location_id)
-            
-            for event in active_events:
-                if event.conflicts_with_range(start_time, end_time):
-                    raise serializers.ValidationError({
-                        'start_time': f"This time slot conflicts with a special event: {event.title}."
-                    })
+            # Check for special event conflicts (privileged coaching force-book may override)
+            coaching_force_special_override = (
+                data.get('booking_type') == 'coaching'
+                and data.get('admin_manual_booking') is True
+                and self._request_user_can_admin_manual_booking()
+            )
+            if not coaching_force_special_override:
+                from special_events.models import SpecialEvent
+                active_events = SpecialEvent.objects.filter(is_active=True)
+                if location_id:
+                    active_events = active_events.filter(location_id=location_id)
+                
+                for event in active_events:
+                    if event.conflicts_with_range(start_time, end_time):
+                        raise serializers.ValidationError({
+                            'start_time': f"This time slot conflicts with a special event: {event.title}."
+                        })
             
             # Check for overlapping bookings
             conflicting_bookings = Booking.objects.filter(
