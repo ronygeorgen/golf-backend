@@ -42,6 +42,7 @@ INSTALLED_APPS = [
     'rest_framework.authtoken',
     'corsheaders',
     'bookings',
+    'categories',
     'users',
     'coaching',
     'simulators',
