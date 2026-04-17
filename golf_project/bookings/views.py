@@ -350,61 +350,18 @@ class BookingViewSet(viewsets.ModelViewSet):
     def _check_simulator_availability_atomic(self, simulator, start_time, end_time, use_locking=True, exclude_booking_id=None):
         """
         Atomically check if a simulator is available for a given time slot.
-        
-        This method prevents race conditions by:
-        1. Using select_for_update() to lock relevant rows
-        2. Checking both confirmed Bookings AND active TempBookings
-        3. Being called within a transaction
-        
-        Args:
-            simulator: Simulator object to check
-            start_time: Start datetime
-            end_time: End datetime
-            use_locking: If True, use select_for_update() for row-level locking
-            exclude_booking_id: Optional booking ID to exclude from conflict check (for rescheduling)
-            
-        Returns:
-            bool: True if available, False if conflicting booking exists
+
+        Delegates to ``bookings.simulator_slot.is_simulator_slot_available`` (shared with bay reassignment).
         """
-        # Check confirmed/completed bookings
-        booking_query = Booking.objects.filter(
-            simulator=simulator,
-            start_time__lt=end_time,
-            end_time__gt=start_time,
-            status__in=['confirmed', 'completed']
+        from .simulator_slot import is_simulator_slot_available
+
+        return is_simulator_slot_available(
+            simulator,
+            start_time,
+            end_time,
+            exclude_booking_id=exclude_booking_id,
+            use_locking=use_locking,
         )
-        
-        if exclude_booking_id:
-            booking_query = booking_query.exclude(id=exclude_booking_id)
-        
-        if use_locking:
-            # Lock the rows to prevent concurrent modifications
-            booking_query = booking_query.select_for_update()
-        
-        if booking_query.exists():
-            return False
-        
-        # Check active temp bookings (reserved and not expired)
-        # These represent pending payments that are holding slots
-        temp_booking_query = TempBooking.objects.filter(
-            simulator=simulator,
-            start_time__lt=end_time,
-            end_time__gt=start_time,
-            status='reserved',  # Only reserved temp bookings block slots
-            expires_at__gt=timezone.now()  # Not expired
-        )
-        
-        if use_locking:
-            temp_booking_query = temp_booking_query.select_for_update()
-        
-        if temp_booking_query.exists():
-            logger.info(
-                f"Simulator {simulator.bay_number} blocked by active temp booking "
-                f"for time slot {start_time} - {end_time}"
-            )
-            return False
-        
-        return True
     
     def _find_optimal_simulator(self, start_time, end_time):
 
@@ -1611,20 +1568,9 @@ class BookingViewSet(viewsets.ModelViewSet):
         return payment_credit
 
     def _calculate_simulator_price(self, simulator, duration_minutes):
-        if not simulator or not duration_minutes:
-            return Decimal('0.00')
-        if simulator.is_coaching_bay:
-            return Decimal('0.00')
-        if simulator.hourly_price:
-            hours = Decimal(duration_minutes) / Decimal(60)
-            price = (Decimal(simulator.hourly_price) * hours).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-            return price
-        from simulators.models import DurationPrice
-        try:
-            duration_price = DurationPrice.objects.get(duration_minutes=duration_minutes)
-            return Decimal(duration_price.price)
-        except DurationPrice.DoesNotExist:
-            return Decimal('0.00')
+        from .simulator_slot import calculate_simulator_booking_price
+
+        return calculate_simulator_booking_price(simulator, duration_minutes)
     
     def _restore_coaching_session(self, booking):
         purchase = booking.package_purchase

@@ -2,6 +2,7 @@ from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, IsAdminUser, AllowAny
+from rest_framework.exceptions import PermissionDenied
 from django.utils import timezone
 from datetime import datetime
 from .models import Simulator, DurationPrice, SimulatorAvailability, SimulatorCredit
@@ -22,6 +23,9 @@ class SimulatorViewSet(viewsets.ModelViewSet):
         """
         if self.action in ['list', 'retrieve', 'active_simulators']:
             permission_classes = [AllowAny]  # Public access for viewing simulators
+        elif self.action == 'deactivate_and_reassign':
+            # Role check in the action; JWT staff may not have Django is_staff.
+            permission_classes = [IsAuthenticated]
         else:
             permission_classes = [IsAuthenticated, IsAdminUser]  # Admin only for create/update/delete
         return [permission() for permission in permission_classes]
@@ -107,6 +111,53 @@ class SimulatorViewSet(viewsets.ModelViewSet):
             'message': f'Simulator {"activated" if simulator.is_active else "deactivated"}',
             'is_active': simulator.is_active
         })
+
+    def _staff_can_manage_simulators(self, user):
+        if not user or not user.is_authenticated:
+            return False
+        if getattr(user, 'is_superuser', False):
+            return True
+        role = getattr(user, 'role', '') or ''
+        return role in ('admin', 'staff', 'superadmin')
+
+    @action(detail=True, methods=['post'], url_path='deactivate_and_reassign')
+    def deactivate_and_reassign(self, request, pk=None):
+        """
+        Preview or run: move confirmed future bookings on this bay to other active bays
+        (same start/end), optionally allow coaching bays, optionally deactivate this bay after.
+        """
+        if not self._staff_can_manage_simulators(request.user):
+            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
+
+        simulator = self.get_object()
+        from users.utils import get_location_id_from_request
+
+        location_id = get_location_id_from_request(request)
+        if location_id and simulator.location_id and simulator.location_id != location_id:
+            raise PermissionDenied(
+                'You can only manage simulators for your assigned location.'
+            )
+
+        def _as_bool(value, default=False):
+            if value is None:
+                return default
+            return str(value).lower() in ('1', 'true', 'yes', 'on')
+
+        dry_run = _as_bool(request.data.get('dry_run'), default=False)
+        allow_coaching_bay = _as_bool(request.data.get('allow_coaching_bay'), default=False)
+        deactivate = _as_bool(request.data.get('deactivate'), default=True)
+        if not simulator.is_active:
+            deactivate = False
+
+        from bookings.bay_reassignment import run_deactivate_simulator_reassign
+
+        payload = run_deactivate_simulator_reassign(
+            simulator,
+            dry_run=dry_run,
+            allow_coaching_bay=allow_coaching_bay,
+            deactivate=deactivate,
+        )
+        return Response(payload, status=status.HTTP_200_OK)
     
     @action(detail=False, methods=['get'])
     def active_simulators(self, request):
