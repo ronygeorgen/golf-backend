@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
@@ -109,3 +111,97 @@ class ServiceCategoryViewSet(viewsets.ModelViewSet):
         category.save(update_fields=['is_active', 'updated_at'])
         serializer = self.get_serializer(category)
         return Response(serializer.data)
+
+
+# ---------------------------------------------------------------------------
+# Phase E: Slot availability for non-legacy categories
+# ---------------------------------------------------------------------------
+
+
+class CategorySlotsView(APIView):
+    """
+    GET /api/categories/<pk>/slots/?date=YYYY-MM-DD[&package_id=<id>][&coach_id=<id>]
+
+    Returns available time slots for a non-legacy service category
+    (legacy_booking_type=None).  Staff eligibility is determined by
+    StaffCategory assignments rather than CoachingPackage.staff_members.
+
+    If package_id is given, the package's session_duration_minutes is used
+    and (if the package has explicit staff) the staff list is intersected.
+
+    The response shape is intentionally identical to check_coaching_availability
+    so the frontend can share rendering code:
+        {
+            "date": "2024-03-15",
+            "category_id": 7,
+            "package_id": 3,       # echoed or null
+            "coach_id": null,
+            "available_slots": [...],
+            "message": "..."        # only on empty result
+        }
+    """
+
+    permission_classes = [AllowAny]
+
+    def get(self, request, pk=None):
+        # Resolve category
+        try:
+            category = ServiceCategory.objects.get(pk=pk, is_active=True)
+        except ServiceCategory.DoesNotExist:
+            return Response({'error': 'Category not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        date_str = request.query_params.get('date')
+        if not date_str:
+            return Response({'error': 'date is required (YYYY-MM-DD).'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            booking_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+        except ValueError:
+            return Response({'error': 'Invalid date format, use YYYY-MM-DD.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Resolve location_id the same way as the rest of the API
+        location_id = get_location_id_from_request(request) or ''
+        location_id = str(location_id).strip().rstrip('+').strip() if location_id else ''
+        if not location_id:
+            # Fall back to category's own location_id (for default categories)
+            location_id = category.location_id or ''
+
+        # Optional package filter
+        package = None
+        package_id = request.query_params.get('package_id')
+        if package_id:
+            from coaching.models import CoachingPackage
+            try:
+                package = CoachingPackage.objects.get(
+                    pk=package_id,
+                    service_category=category,
+                    is_active=True,
+                )
+            except CoachingPackage.DoesNotExist:
+                return Response(
+                    {'error': 'Package not found for this category.'},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+        # Optional single-coach filter
+        coach_id = request.query_params.get('coach_id')
+
+        from .availability import compute_category_slots
+        slots = compute_category_slots(
+            category_id=category.pk,
+            booking_date=booking_date,
+            location_id=location_id,
+            package=package,
+            coach_id=int(coach_id) if coach_id else None,
+        )
+
+        resp = {
+            'date': date_str,
+            'category_id': category.pk,
+            'package_id': package_id,
+            'coach_id': coach_id,
+            'available_slots': slots,
+        }
+        if not slots:
+            resp['message'] = 'No availability found for this date.'
+
+        return Response(resp)
