@@ -6,6 +6,9 @@ from datetime import datetime, time as dt_time
 from .models import User, StaffAvailability, StaffDayAvailability, StaffBlockedDate
 
 class UserSerializer(serializers.ModelSerializer):
+    # Phase D: category IDs this staff member is assigned to (empty list for non-staff)
+    assigned_category_ids = serializers.SerializerMethodField()
+
     class Meta:
         model = User
         fields = (
@@ -24,6 +27,7 @@ class UserSerializer(serializers.ModelSerializer):
             'ghl_location_id',
             'ghl_contact_id',
             'date_of_birth',
+            'assigned_category_ids',
         )
         read_only_fields = (
             'id',
@@ -34,10 +38,18 @@ class UserSerializer(serializers.ModelSerializer):
             'username',
             'ghl_location_id',
             'ghl_contact_id',
+            'assigned_category_ids',
         )
         extra_kwargs = {
             'date_of_birth': {'required': False, 'allow_null': True},
         }
+
+    def get_assigned_category_ids(self, obj):
+        if obj.role not in ('staff', 'admin'):
+            return []
+        return list(
+            obj.staff_categories.values_list('category_id', flat=True)
+        )
 
 class StaffSerializer(serializers.ModelSerializer):
     """Serializer for creating/updating staff members by admin - auto-generates username"""

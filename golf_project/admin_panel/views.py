@@ -10,7 +10,7 @@ from django.db.models import Count, Sum, Q, F
 from django.utils import timezone as django_timezone
 from datetime import datetime, timedelta, timezone as dt_timezone
 from decimal import Decimal
-from users.models import User, StaffAvailability, StaffDayAvailability
+from users.models import User, StaffAvailability, StaffDayAvailability, StaffCategory
 
 logger = logging.getLogger(__name__)
 from users.utils import get_location_id_from_request, filter_by_location
@@ -241,6 +241,78 @@ class StaffViewSet(viewsets.ModelViewSet):
             serializer = StaffAvailabilitySerializer(all_avail, many=True, context={'location_id': location_id})
             return Response(serializer.data)
     
+    @action(detail=True, methods=['get', 'put'], url_path='categories')
+    def categories(self, request, pk=None):
+        """
+        Phase D: GET/PUT the service categories assigned to a staff member.
+
+        GET  → returns list of assigned categories (id, name, slug, is_primary).
+        PUT  → accepts {"category_ids": [1, 2, 3]} and replaces all assignments.
+               Optionally accepts {"category_ids": [...], "primary_id": <id>} to
+               mark one category as primary.
+        """
+        staff = self.get_object()
+        location_id = get_location_id_from_request(request)
+
+        if request.method == 'GET':
+            assignments = StaffCategory.objects.filter(staff=staff).select_related('category')
+            data = [
+                {
+                    'category_id': a.category_id,
+                    'name': a.category.name,
+                    'slug': a.category.slug,
+                    'customer_label': a.category.customer_label,
+                    'is_primary': a.is_primary,
+                }
+                for a in assignments
+            ]
+            return Response(data)
+
+        # PUT — replace assignments
+        category_ids = request.data.get('category_ids')
+        if not isinstance(category_ids, list):
+            return Response(
+                {'error': 'category_ids must be a list of integer IDs.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        primary_id = request.data.get('primary_id')
+
+        from categories.models import ServiceCategory
+        valid_cats = ServiceCategory.objects.filter(id__in=category_ids, is_active=True)
+        valid_ids = set(valid_cats.values_list('id', flat=True))
+
+        invalid = [cid for cid in category_ids if cid not in valid_ids]
+        if invalid:
+            return Response(
+                {'error': f'Invalid or inactive category IDs: {invalid}'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Replace all assignments atomically
+        from django.db import transaction
+        with transaction.atomic():
+            StaffCategory.objects.filter(staff=staff).delete()
+            for cid in valid_ids:
+                StaffCategory.objects.create(
+                    staff=staff,
+                    category_id=cid,
+                    is_primary=(cid == primary_id),
+                )
+
+        assignments = StaffCategory.objects.filter(staff=staff).select_related('category')
+        data = [
+            {
+                'category_id': a.category_id,
+                'name': a.category.name,
+                'slug': a.category.slug,
+                'customer_label': a.category.customer_label,
+                'is_primary': a.is_primary,
+            }
+            for a in assignments
+        ]
+        return Response(data)
+
     @action(detail=True, methods=['get', 'put'], url_path='day-availability')
     def day_availability(self, request, pk=None):
         """

@@ -26,6 +26,9 @@ class ServiceCategorySerializer(serializers.ModelSerializer):
 class ServiceCategoryAdminSerializer(serializers.ModelSerializer):
     """Writable serializer for the admin CRUD endpoint."""
 
+    # Phase D: how many staff are assigned to this category
+    staff_count = serializers.SerializerMethodField()
+
     class Meta:
         model = ServiceCategory
         fields = (
@@ -38,10 +41,14 @@ class ServiceCategoryAdminSerializer(serializers.ModelSerializer):
             'sort_order',
             'is_active',
             'legacy_booking_type',
+            'staff_count',
             'created_at',
             'updated_at',
         )
-        read_only_fields = ('id', 'created_at', 'updated_at')
+        read_only_fields = ('id', 'staff_count', 'created_at', 'updated_at')
+
+    def get_staff_count(self, obj):
+        return obj.staff_assignments.count()
 
     def validate_slug(self, value):
         if value:

@@ -125,6 +125,40 @@ class StaffBlockedDate(models.Model):
             return f"{self.staff.username} - Blocked on {self.date} ({self.start_time.strftime('%H:%M')} - {self.end_time.strftime('%H:%M')})"
 
 
+class StaffCategory(models.Model):
+    """
+    Phase D: links a staff member to the service categories they can deliver.
+    Used for filtering available staff on the booking UI (future phases) and
+    for display in the admin manage-staff page.
+    """
+
+    staff = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='staff_categories',
+        limit_choices_to={'role__in': ['staff', 'admin']},
+    )
+    category = models.ForeignKey(
+        'categories.ServiceCategory',
+        on_delete=models.CASCADE,
+        related_name='staff_assignments',
+    )
+    is_primary = models.BooleanField(
+        default=False,
+        help_text="Primary category for this staff member (used for display ordering).",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ['staff', 'category']
+        ordering = ['-is_primary', 'category__sort_order', 'category__name']
+        verbose_name = 'Staff Category'
+        verbose_name_plural = 'Staff Categories'
+
+    def __str__(self):
+        return f"{self.staff.username} → {self.category.name}"
+
+
 class LiabilityWaiverAcceptance(models.Model):
     """
     Model to track user acceptance of liability waivers.
