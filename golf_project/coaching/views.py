@@ -93,8 +93,13 @@ class CoachingPackageViewSet(viewsets.ModelViewSet):
         staff_id = self.request.query_params.get('staff_id')
         if staff_id:
             queryset = queryset.filter(staff_members__id=staff_id)
-        
-        return queryset.select_related().prefetch_related('staff_members')
+
+        # Phase C: filter by service category
+        category_id = self.request.query_params.get('category_id')
+        if category_id:
+            queryset = queryset.filter(service_category_id=category_id)
+
+        return queryset.select_related('service_category').prefetch_related('staff_members')
     
     def perform_create(self, serializer):
         from users.utils import get_location_id_from_request
@@ -1948,9 +1953,14 @@ class SimulatorPackageViewSet(viewsets.ModelViewSet):
         is_active = self.request.query_params.get('is_active')
         if is_active is not None:
             queryset = queryset.filter(is_active=is_active.lower() == 'true')
-        
-        return queryset
-    
+
+        # Phase C: filter by service category
+        category_id = self.request.query_params.get('category_id')
+        if category_id:
+            queryset = queryset.filter(service_category_id=category_id)
+
+        return queryset.select_related('service_category')
+
     def perform_create(self, serializer):
         """Set location_id when creating simulator package and handle time restrictions"""
         from users.utils import get_location_id_from_request
