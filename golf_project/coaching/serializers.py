@@ -15,6 +15,7 @@ class CoachingPackageSerializer(serializers.ModelSerializer):
     # legacy computed field — kept for backward compatibility with existing frontend code
     category = serializers.SerializerMethodField()
     service_category_name = serializers.SerializerMethodField()
+    service_category_legacy_type = serializers.SerializerMethodField()
 
     class Meta:
         model = CoachingPackage
@@ -33,6 +34,12 @@ class CoachingPackageSerializer(serializers.ModelSerializer):
     def get_service_category_name(self, obj):
         if obj.service_category_id:
             return obj.service_category.name
+        return None
+
+    def get_service_category_legacy_type(self, obj):
+        """Return the legacy_booking_type of the linked ServiceCategory, or None."""
+        if obj.service_category_id:
+            return obj.service_category.legacy_booking_type
         return None
     
     def __init__(self, *args, **kwargs):
