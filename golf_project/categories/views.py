@@ -35,10 +35,14 @@ class ActiveServiceCategoryListView(APIView):
         base = ServiceCategory.objects.filter(is_active=True)
 
         if location_id:
-            specific = base.filter(location_id=location_id).order_by('sort_order', 'name')
-            if specific.exists():
-                serializer = ServiceCategorySerializer(specific, many=True)
-                return Response(serializer.data)
+            # Return both location-specific categories AND global defaults so that
+            # legacy Simulator/Coaching categories remain visible even when a location
+            # has added its own custom categories (e.g. Fitness).
+            qs = base.filter(
+                location_id__in=[location_id, '']
+            ).order_by('sort_order', 'name').distinct()
+            serializer = ServiceCategorySerializer(qs, many=True)
+            return Response(serializer.data)
 
         defaults = base.filter(location_id='').order_by('sort_order', 'name')
         serializer = ServiceCategorySerializer(defaults, many=True)

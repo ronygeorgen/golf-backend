@@ -21,7 +21,6 @@ from bookings.serializers import BookingSerializer
 from .serializers import CoachingSessionAdjustmentSerializer, SimulatorCreditGrantSerializer, ClosedDaySerializer, LiabilityWaiverSerializer
 from .models import ClosedDay, LiabilityWaiver
 from simulators.serializers import SimulatorCreditSerializer
-from .models import ClosedDay
 
 class AdminDashboardViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'])

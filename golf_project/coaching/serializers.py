@@ -10,10 +10,6 @@ from users.serializers import UserSerializer
 from users.models import User
 
 
-def _get_service_category_qs():
-    from categories.models import ServiceCategory
-    return ServiceCategory.objects.all()
-
 class CoachingPackageSerializer(serializers.ModelSerializer):
     staff_members_details = UserSerializer(source='staff_members', many=True, read_only=True)
     # legacy computed field — kept for backward compatibility with existing frontend code
