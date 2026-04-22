@@ -159,13 +159,17 @@ class CoachingPackageViewSet(viewsets.ModelViewSet):
     def active_packages(self, request):
         # Get filtered queryset (includes location_id filtering from get_queryset)
         queryset = self.get_queryset()
-        
-        # Only return packages that have a redirect_url (for client-side) OR are TPI assessments
+
+        # Return packages that are purchasable by customers:
+        #   1. TPI Assessment packages (legacy)
+        #   2. Packages with a redirect_url (legacy pay-flow)
+        #   3. Packages linked to any ServiceCategory (Phase C+: all sport categories)
         active_packages = queryset.filter(is_active=True).filter(
             Q(is_tpi_assessment=True) |
-            (Q(redirect_url__isnull=False) & ~Q(redirect_url=''))
+            (Q(redirect_url__isnull=False) & ~Q(redirect_url='')) |
+            Q(service_category__isnull=False)
         )
-        
+
         serializer = self.get_serializer(active_packages, many=True)
         return Response(serializer.data)
 
