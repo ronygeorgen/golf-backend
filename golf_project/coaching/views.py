@@ -24,6 +24,7 @@ except ImportError:
     CELERY_AVAILABLE = False
     sync_purchase_with_ghl_task = None
 from users.models import User
+from users.utils import get_location_id_from_request
 from .models import (
     CoachingPackage, CoachingPackagePurchase, SessionTransfer, TempPurchase, PendingRecipient,
     SimulatorPackage, SimulatorPackagePurchase, SimulatorHoursTransfer
@@ -73,7 +74,6 @@ class CoachingPackageViewSet(viewsets.ModelViewSet):
         return [permission() for permission in permission_classes]
     
     def get_queryset(self):
-        from users.utils import get_location_id_from_request
         location_id = get_location_id_from_request(self.request)
         queryset = CoachingPackage.objects.all().order_by('-id')
         
@@ -102,7 +102,6 @@ class CoachingPackageViewSet(viewsets.ModelViewSet):
         return queryset.select_related('service_category').prefetch_related('staff_members')
     
     def perform_create(self, serializer):
-        from users.utils import get_location_id_from_request
         location_id = get_location_id_from_request(self.request)
         package = serializer.save(location_id=location_id)
         
@@ -179,7 +178,6 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     
     def get_queryset(self):
-        from users.utils import get_location_id_from_request
         user = self.request.user
         location_id = get_location_id_from_request(self.request)
         base_qs = CoachingPackagePurchase.objects.select_related(
@@ -1942,7 +1940,6 @@ class SimulatorPackageViewSet(viewsets.ModelViewSet):
         return [permission() for permission in permission_classes]
     
     def get_queryset(self):
-        from users.utils import get_location_id_from_request
         location_id = get_location_id_from_request(self.request)
         queryset = SimulatorPackage.objects.all().order_by('-id')
         
@@ -1967,7 +1964,6 @@ class SimulatorPackageViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         """Set location_id when creating simulator package and handle time restrictions"""
-        from users.utils import get_location_id_from_request
         from coaching.models import SimulatorPackageTimeRestriction
         
         location_id = get_location_id_from_request(self.request)
@@ -2011,7 +2007,6 @@ class SimulatorPackageViewSet(viewsets.ModelViewSet):
     
     def perform_update(self, serializer):
         """Handle time restrictions when updating simulator package"""
-        from users.utils import get_location_id_from_request
         from coaching.models import SimulatorPackageTimeRestriction
         
         package = serializer.save()
@@ -2051,7 +2046,6 @@ class SimulatorPackageViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path='active')
     def active_packages(self, request):
         """Get all active simulator packages"""
-        from users.utils import get_location_id_from_request
         location_id = get_location_id_from_request(request)
         packages = SimulatorPackage.objects.filter(is_active=True)
         
