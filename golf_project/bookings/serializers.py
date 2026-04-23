@@ -178,6 +178,7 @@ class BookingSerializer(serializers.ModelSerializer):
     uses_simulator_credit = serializers.SerializerMethodField()
     coaching_session_price = serializers.SerializerMethodField()
     purchase_type_label = serializers.SerializerMethodField()
+    service_category_name = serializers.SerializerMethodField()
     
     class Meta:
         model = Booking
@@ -225,3 +226,9 @@ class BookingSerializer(serializers.ModelSerializer):
             return 'Personal'
         
         return 'Personal'
+
+    def get_service_category_name(self, obj):
+        """Return the ServiceCategory name for this booking, or None for legacy bookings."""
+        if obj.service_category_id:
+            return obj.service_category.name
+        return None
