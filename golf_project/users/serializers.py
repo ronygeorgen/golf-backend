@@ -24,6 +24,7 @@ class UserSerializer(serializers.ModelSerializer):
             'ghl_location_id',
             'ghl_contact_id',
             'date_of_birth',
+            'calendar_color',
         )
         read_only_fields = (
             'id',
@@ -45,7 +46,7 @@ class StaffSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = User
-        fields = ('id', 'username', 'email', 'phone', 'role', 'first_name', 'last_name', 'email_verified', 'phone_verified', 'is_superuser', 'is_staff', 'date_of_birth', 'password', 'ghl_location_id')
+        fields = ('id', 'username', 'email', 'phone', 'role', 'first_name', 'last_name', 'email_verified', 'phone_verified', 'is_superuser', 'is_staff', 'date_of_birth', 'calendar_color', 'password', 'ghl_location_id')
         read_only_fields = ('id', 'email_verified', 'phone_verified', 'is_superuser', 'is_staff', 'username')
         extra_kwargs = {
             'email': {'required': True},

@@ -19,6 +19,8 @@ class User(AbstractUser):
     ghl_contact_id = models.CharField(max_length=100, blank=True, null=True)
     is_paused = models.BooleanField(default=False, help_text="If True, user cannot login or access the system")
     date_of_birth = models.DateField(null=True, blank=True, help_text="Date of birth (optional)")
+    calendar_color = models.CharField(max_length=20, null=True, blank=True, help_text="Hex color code for calendar display (e.g. #F97316)")
+
     
     def __str__(self):
         return f"{self.username} ({self.role})"
