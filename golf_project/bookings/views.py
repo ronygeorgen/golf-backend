@@ -1192,12 +1192,29 @@ class BookingViewSet(viewsets.ModelViewSet):
 
                     # Only apply the coach-capacity guard when we can determine how many coaches work
                     if not skip_coaching_availability_enforcement and _num_available_coaches > 0:
-                        concurrent_coaching_qs = Booking.objects.filter(
-                            booking_type='coaching',
-                            start_time__lt=end_time,
-                            end_time__gt=start_time,
-                            status__in=['confirmed', 'completed']
-                        )
+                        # IMPORTANT: restrict to bookings whose coach belongs to this package's coach pool.
+                        # Bookings by coaches from other packages must NOT count against this package's
+                        # capacity — otherwise a cross-package booking falsely fills the available slots.
+                        # If the selected coach is provided, only that coach matters (1 slot available, 
+                        # check only that coach to avoid cross-coach false blocks).
+                        if coach:
+                            # Specific coach requested: only block if THAT coach already has a booking
+                            concurrent_coaching_qs = Booking.objects.filter(
+                                booking_type='coaching',
+                                coach=coach,
+                                start_time__lt=end_time,
+                                end_time__gt=start_time,
+                                status__in=['confirmed', 'completed']
+                            )
+                        else:
+                            # No specific coach: count bookings held by any of this package's coaches
+                            concurrent_coaching_qs = Booking.objects.filter(
+                                booking_type='coaching',
+                                coach__in=_package_coaches_qs,
+                                start_time__lt=end_time,
+                                end_time__gt=start_time,
+                                status__in=['confirmed', 'completed']
+                            )
                         if location_id:
                             concurrent_coaching_qs = concurrent_coaching_qs.filter(location_id=location_id)
                         if concurrent_coaching_qs.count() >= _num_available_coaches:
