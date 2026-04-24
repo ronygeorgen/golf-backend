@@ -158,8 +158,12 @@ def compute_category_slots(
     blocked_by_staff = {}        # coach.id -> [(s_utc, e_utc), ...]
 
     for coach in coaches:
-        # Full-day block?
+        # ── Full-day block check ─────────────────────────────────────────── #
+        # A coach is fully blocked if there is a full-day block that applies
+        # to this category (service_category=category_id) OR to all categories
+        # (service_category=NULL).
         if StaffBlockedDate.objects.filter(
+            Q(service_category_id=category_id) | Q(service_category__isnull=True),
             staff=coach,
             date=booking_date,
             start_time__isnull=True,
@@ -167,9 +171,11 @@ def compute_category_slots(
         ).exists():
             continue  # skip this coach entirely
 
-        # Partial blocks
+        # ── Partial blocks ───────────────────────────────────────────────── #
+        # Collect partial blocks that match this category OR are general (NULL).
         partial = list(
             StaffBlockedDate.objects.filter(
+                Q(service_category_id=category_id) | Q(service_category__isnull=True),
                 staff=coach,
                 date=booking_date,
                 start_time__isnull=False,
@@ -189,18 +195,41 @@ def compute_category_slots(
                 ))
             blocked_by_staff[coach.id] = utc_blocks
 
-        # Availability windows: specific-date override first, then recurring
+        # ── Availability windows ─────────────────────────────────────────── #
+        # Resolution order (most-specific first):
+        #   1. Day-specific availability for this category
+        #   2. Day-specific general availability (NULL category)
+        #   3. Recurring availability for this category
+        #   4. Recurring general availability (NULL category)
         avails = list(
             StaffDayAvailability.objects.filter(
                 staff=coach,
                 date=booking_date,
+                service_category_id=category_id,
             ).values('start_time', 'end_time')
         )
+        if not avails:
+            avails = list(
+                StaffDayAvailability.objects.filter(
+                    staff=coach,
+                    date=booking_date,
+                    service_category__isnull=True,
+                ).values('start_time', 'end_time')
+            )
         if not avails:
             avails = list(
                 StaffAvailability.objects.filter(
                     staff=coach,
                     day_of_week=day_of_week,
+                    service_category_id=category_id,
+                ).values('start_time', 'end_time')
+            )
+        if not avails:
+            avails = list(
+                StaffAvailability.objects.filter(
+                    staff=coach,
+                    day_of_week=day_of_week,
+                    service_category__isnull=True,
                 ).values('start_time', 'end_time')
             )
         if avails:

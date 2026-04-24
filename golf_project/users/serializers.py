@@ -315,10 +315,16 @@ class StaffAvailabilitySerializer(serializers.ModelSerializer):
     start_time = serializers.TimeField()
     end_time = serializers.TimeField()
     day_of_week = serializers.IntegerField()
-    
+    service_category_name = serializers.SerializerMethodField(read_only=True)
+
     class Meta:
         model = StaffAvailability
         fields = '__all__'
+
+    def get_service_category_name(self, obj):
+        if obj.service_category_id:
+            return obj.service_category.name
+        return None
     
     def to_representation(self, instance):
         """Return UTC times as-is (no conversion)"""
@@ -363,10 +369,16 @@ class StaffDayAvailabilitySerializer(serializers.ModelSerializer):
     start_time = serializers.TimeField()
     end_time = serializers.TimeField()
     date = serializers.DateField()
-    
+    service_category_name = serializers.SerializerMethodField(read_only=True)
+
     class Meta:
         model = StaffDayAvailability
         fields = '__all__'
+
+    def get_service_category_name(self, obj):
+        if obj.service_category_id:
+            return obj.service_category.name
+        return None
     
     def validate(self, attrs):
         """Check if the date/time is on a closed day"""
@@ -439,15 +451,22 @@ class StaffBlockedDateSerializer(serializers.ModelSerializer):
     staff_name = serializers.SerializerMethodField(read_only=True)
     created_by_name = serializers.SerializerMethodField(read_only=True)
     is_full_day_block = serializers.SerializerMethodField(read_only=True)
-    
+    service_category_name = serializers.SerializerMethodField(read_only=True)
+
     class Meta:
         model = StaffBlockedDate
         fields = [
-            'id', 'staff', 'staff_name', 'date', 
+            'id', 'staff', 'staff_name', 'date',
             'start_time', 'end_time', 'is_full_day_block',
-            'reason', 'created_at', 'created_by', 'created_by_name'
+            'reason', 'created_at', 'created_by', 'created_by_name',
+            'service_category', 'service_category_name',
         ]
         read_only_fields = ['id', 'created_at', 'created_by']
+
+    def get_service_category_name(self, obj):
+        if obj.service_category_id:
+            return obj.service_category.name
+        return None
     
     def get_staff_name(self, obj):
         """Return staff member's full name"""
