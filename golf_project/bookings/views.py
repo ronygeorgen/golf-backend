@@ -1172,8 +1172,10 @@ class BookingViewSet(viewsets.ModelViewSet):
                     except Exception:
                         pass
 
+                    _package_coaches = list(_package_coaches_qs.distinct())
                     _num_available_coaches = 0
-                    for _c in _package_coaches_qs:
+                    _available_coach_ids = []
+                    for _c in _package_coaches:
                         # Check specific-date availability first, fall back to recurring
                         _avails = list(_StaffDayAvail.objects.filter(staff=_c, date=_slot_date_local).values('start_time', 'end_time'))
                         if not _avails:
@@ -1188,6 +1190,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                             # Coach must fully cover the slot
                             if _s_utc <= start_time and _e_utc >= end_time:
                                 _num_available_coaches += 1
+                                _available_coach_ids.append(_c.id)
                                 break
 
                     # Only apply the coach-capacity guard when we can determine how many coaches work
@@ -1200,6 +1203,12 @@ class BookingViewSet(viewsets.ModelViewSet):
                         )
                         if location_id:
                             concurrent_coaching_qs = concurrent_coaching_qs.filter(location_id=location_id)
+                        # Keep capacity checks aligned with availability endpoint: only count
+                        # bookings assigned to coaches relevant to this package and slot.
+                        if _available_coach_ids:
+                            concurrent_coaching_qs = concurrent_coaching_qs.filter(coach_id__in=_available_coach_ids)
+                        else:
+                            concurrent_coaching_qs = concurrent_coaching_qs.none()
                         if concurrent_coaching_qs.count() >= _num_available_coaches:
                             raise serializers.ValidationError(
                                 "No coaching session slot available: all coaches are already booked for this time slot."
