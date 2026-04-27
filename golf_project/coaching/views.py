@@ -1144,15 +1144,9 @@ class CreateTempPurchaseView(APIView):
                     status=status.HTTP_404_NOT_FOUND
                 )
         
-        # Get the appropriate package object for redirect_url check
+        # Get the appropriate package object for redirect_url - optional now as we transition to Square
         active_package = simulator_package if simulator_package else package
-        
-        # Validate package has redirect_url
-        if not active_package.redirect_url or not active_package.redirect_url.strip():
-            return Response(
-                {'error': 'Package does not have a redirect URL configured.'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        redirect_url = active_package.redirect_url or ''
         
         # Validate recipients based on purchase type
         if purchase_type == 'gift':

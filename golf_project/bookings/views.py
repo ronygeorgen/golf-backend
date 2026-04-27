@@ -3142,13 +3142,8 @@ class CreateTempBookingView(APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
         
-        # Get redirect URL - must be set
-        redirect_url = simulator.redirect_url
-        if not redirect_url:
-            return Response(
-                {'error': 'Simulator does not have a redirect URL configured.'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        # Get redirect URL - optional now as we transition to Square
+        redirect_url = simulator.redirect_url or ''
         
         # Parse datetime strings
         try:

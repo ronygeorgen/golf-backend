@@ -199,7 +199,7 @@ class InitiateSquarePaymentView(APIView):
         amount = request.data.get('amount')
         currency = request.data.get('currency', 'CAD')
         idempotency_key = request.data.get('idempotency_key') or str(uuid.uuid4())
-        coupon_code = request.data.get('coupon_code', '').strip().upper()
+        coupon_code = (request.data.get('coupon_code') or '').strip().upper()
 
         if not source_id:
             return Response({'error': 'source_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
