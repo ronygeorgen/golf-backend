@@ -201,11 +201,17 @@ STATIC_URL = 'static/'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # Square Payment Integration
-SQUARE_ACCESS_TOKEN = config('SANDBOX_ACCESS_TOKEN', default='')
-SQUARE_APPLICATION_ID = config('SANDBOX_APPLICATION_ID', default='')
-SQUARE_LOCATION_ID = config('SQUARE_LOCATION_ID', default='')
-SQUARE_ENVIRONMENT = config('SQUARE_ENVIRONMENT', default='sandbox')  # 'sandbox' or 'production'
-SQUARE_WEBHOOK_SIGNATURE_KEY = config('SQUARE_WEBHOOK_SIGNATURE_KEY', default='')
+SQUARE_ENVIRONMENT = config('SQUARE_ENVIRONMENT', default='sandbox').strip().lower()
+
+if SQUARE_ENVIRONMENT == 'production':
+    SQUARE_APPLICATION_ID = config('SQUARE_APPLICATION_ID', default=config('SANDBOX_APPLICATION_ID', default='')).strip()
+    SQUARE_ACCESS_TOKEN = config('SQUARE_ACCESS_TOKEN', default=config('SANDBOX_ACCESS_TOKEN', default='')).strip()
+else:
+    SQUARE_APPLICATION_ID = config('SANDBOX_APPLICATION_ID', default='').strip()
+    SQUARE_ACCESS_TOKEN = config('SANDBOX_ACCESS_TOKEN', default='').strip()
+
+SQUARE_LOCATION_ID = config('SQUARE_LOCATION_ID', default='').strip()
+SQUARE_WEBHOOK_SIGNATURE_KEY = config('SQUARE_WEBHOOK_SIGNATURE_KEY', default='').strip()
 # Full public URL of the webhook endpoint (e.g. your ngrok URL) — must match Square Dashboard exactly
 SQUARE_WEBHOOK_URL = config('SQUARE_WEBHOOK_URL', default='')
 

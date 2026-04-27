@@ -407,6 +407,7 @@ class SquareConfigView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request):
+        logger.info(f"Square config requested. Sending app_id={settings.SQUARE_APPLICATION_ID[:10]}..., env={settings.SQUARE_ENVIRONMENT}")
         return Response({
             'application_id': settings.SQUARE_APPLICATION_ID,
             'location_id': settings.SQUARE_LOCATION_ID,
