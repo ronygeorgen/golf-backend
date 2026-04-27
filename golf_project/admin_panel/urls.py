@@ -4,6 +4,7 @@ from . import views
 from simulators.views import SimulatorViewSet, DurationPriceViewSet
 from coaching.views import CoachingPackageViewSet
 from bookings.views import BookingViewSet
+from categories.views import ServiceCategoryViewSet
 
 router = DefaultRouter()
 router.register(r'dashboard', views.AdminDashboardViewSet, basename='admin-dashboard')
@@ -16,6 +17,7 @@ router.register(r'bookings', BookingViewSet, basename='admin-bookings')
 router.register(r'overrides', views.AdminOverrideViewSet, basename='admin-overrides')
 router.register(r'closed-days', views.ClosedDayViewSet, basename='admin-closed-days')
 router.register(r'liability-waiver', views.LiabilityWaiverViewSet, basename='admin-liability-waiver')
+router.register(r'categories', ServiceCategoryViewSet, basename='admin-categories')
 
 urlpatterns = [
     path('', include(router.urls)),

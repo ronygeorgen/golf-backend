@@ -22,11 +22,12 @@ class BookingCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Booking
         fields = [
-            'booking_type', 'simulator', 'duration_minutes', 
+            'booking_type', 'simulator', 'duration_minutes',
             'coaching_package', 'coach', 'start_time', 'end_time', 'total_price',
             'use_simulator_credit', 'use_organization_package', 'use_prepaid_hours', 'simulator_count',
             'admin_manual_booking',
-            'location_id'  # Include location_id so it can be saved during booking creation
+            'location_id',
+            'service_category',
         ]
     
     def __init__(self, *args, **kwargs):
@@ -159,13 +160,11 @@ class BookingCreateSerializer(serializers.ModelSerializer):
         return data
     
     def create(self, validated_data):
-        # Remove write-only fields that are not part of the Booking model
         validated_data.pop('use_simulator_credit', None)
         validated_data.pop('use_organization_package', None)
         validated_data.pop('use_prepaid_hours', None)
         validated_data.pop('simulator_count', None)
         validated_data.pop('admin_manual_booking', None)
-        # location_id should be in validated_data if provided, and will be saved by super().create()
         return super().create(validated_data)
 
 class BookingSerializer(serializers.ModelSerializer):
@@ -179,6 +178,7 @@ class BookingSerializer(serializers.ModelSerializer):
     uses_simulator_credit = serializers.SerializerMethodField()
     coaching_session_price = serializers.SerializerMethodField()
     purchase_type_label = serializers.SerializerMethodField()
+    service_category_name = serializers.SerializerMethodField()
     
     class Meta:
         model = Booking
@@ -226,3 +226,9 @@ class BookingSerializer(serializers.ModelSerializer):
             return 'Personal'
         
         return 'Personal'
+
+    def get_service_category_name(self, obj):
+        """Return the ServiceCategory name for this booking, or None for legacy bookings."""
+        if obj.service_category_id:
+            return obj.service_category.name
+        return None

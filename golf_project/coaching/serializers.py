@@ -2,21 +2,25 @@ from rest_framework import serializers
 from django.utils import timezone
 from datetime import timedelta
 from .models import (
-    CoachingPackage, CoachingPackagePurchase, SessionTransfer, OrganizationPackageMember, 
+    CoachingPackage, CoachingPackagePurchase, SessionTransfer, OrganizationPackageMember,
     TempPurchase, PendingRecipient, SimulatorPackage, SimulatorPackagePurchase, SimulatorHoursTransfer,
     SimulatorPackageTimeRestriction
 )
 from users.serializers import UserSerializer
 from users.models import User
 
+
 class CoachingPackageSerializer(serializers.ModelSerializer):
     staff_members_details = UserSerializer(source='staff_members', many=True, read_only=True)
+    # legacy computed field — kept for backward compatibility with existing frontend code
     category = serializers.SerializerMethodField()
-    
+    service_category_name = serializers.SerializerMethodField()
+    service_category_legacy_type = serializers.SerializerMethodField()
+
     class Meta:
         model = CoachingPackage
         fields = '__all__'
-    
+
     def get_category(self, obj):
         """
         Determine package category:
@@ -26,18 +30,37 @@ class CoachingPackageSerializer(serializers.ModelSerializer):
         if obj.simulator_hours and float(obj.simulator_hours) > 0:
             return 'combo'
         return 'coaching'
+
+    def get_service_category_name(self, obj):
+        if obj.service_category_id:
+            return obj.service_category.name
+        return None
+
+    def get_service_category_legacy_type(self, obj):
+        """Return the legacy_booking_type of the linked ServiceCategory, or None."""
+        if obj.service_category_id:
+            return obj.service_category.legacy_booking_type
+        return None
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Set staff_members field with queryset after initialization
+        # Lazy queryset for staff_members
         from users.models import User
         self.fields['staff_members'] = serializers.PrimaryKeyRelatedField(
             many=True,
             queryset=User.objects.filter(role__in=['staff', 'admin']),
             required=False,
-            allow_null=True
+            allow_null=True,
         )
-        
+        # Phase C: lazy queryset for service_category (writable, optional)
+        from categories.models import ServiceCategory
+        self.fields['service_category_id'] = serializers.PrimaryKeyRelatedField(
+            source='service_category',
+            queryset=ServiceCategory.objects.all(),
+            required=False,
+            allow_null=True,
+        )
+
         # For partial updates (PATCH), make required fields optional
         if self.partial:
             # Make title, description, and price optional for partial updates
@@ -508,29 +531,41 @@ class SimulatorPackageTimeRestrictionSerializer(serializers.ModelSerializer):
 
 
 class SimulatorPackageSerializer(serializers.ModelSerializer):
+    # legacy computed field — kept for backward compatibility
     category = serializers.SerializerMethodField()
     time_restrictions = SimulatorPackageTimeRestrictionSerializer(many=True, read_only=True)
-    
+    # Phase C: service category
+    service_category_name = serializers.SerializerMethodField()
+
     class Meta:
         model = SimulatorPackage
         fields = '__all__'
-    
+
     def get_category(self, obj):
-        """
-        Simulator packages are always 'simulator' type.
-        """
         return 'simulator'
-    
+
+    def get_service_category_name(self, obj):
+        if obj.service_category_id:
+            return obj.service_category.name
+        return None
+
     def validate_validity_days(self, value):
-        """Convert empty string to None for validity_days"""
         if value == '' or value is None:
             return None
         if value is not None and value < 1:
             raise serializers.ValidationError("Validity days must be at least 1.")
         return value
-    
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Phase C: lazy queryset for service_category (writable, optional)
+        from categories.models import ServiceCategory
+        self.fields['service_category_id'] = serializers.PrimaryKeyRelatedField(
+            source='service_category',
+            queryset=ServiceCategory.objects.all(),
+            required=False,
+            allow_null=True,
+        )
         # For partial updates (PATCH), make required fields optional
         if self.partial:
             if 'title' in self.fields:

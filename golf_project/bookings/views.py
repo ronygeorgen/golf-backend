@@ -1133,12 +1133,30 @@ class BookingViewSet(viewsets.ModelViewSet):
                 coach = booking_data.get('coach')
                 is_tpi_assessment = package.is_tpi_assessment if hasattr(package, 'is_tpi_assessment') else False
                 
-                # Validate coach-package assignment before entering the atomic block
+                # Validate coach-package assignment before entering the atomic block.
+                # For Phase-E category bookings the coach may be authorised via
+                # StaffCategory even when the package has no staff_members set.
                 if coach and package and not package.staff_members.filter(id=coach.id).exists():
-                    coach_name = f"{coach.first_name} {coach.last_name}".strip()
-                    raise serializers.ValidationError(
-                        f"Coach {coach_name} is not assigned to package '{package.title}'."
+                    service_cat_id = serializer.validated_data.get('service_category_id') or (
+                        serializer.validated_data.get('service_category').pk
+                        if serializer.validated_data.get('service_category')
+                        else None
                     )
+                    if service_cat_id:
+                        from users.models import StaffCategory as _StaffCat
+                        in_category = _StaffCat.objects.filter(
+                            staff=coach, category_id=service_cat_id
+                        ).exists()
+                        if not in_category:
+                            coach_name = f"{coach.first_name} {coach.last_name}".strip()
+                            raise serializers.ValidationError(
+                                f"Coach {coach_name} is not assigned to this service category."
+                            )
+                    else:
+                        coach_name = f"{coach.first_name} {coach.last_name}".strip()
+                        raise serializers.ValidationError(
+                            f"Coach {coach_name} is not assigned to package '{package.title}'."
+                        )
                 
                 # ONE atomic block: bay lock + coach checks + session consumption + booking creation.
                 # This closes the race-condition window from the previously separate transactions.
@@ -1163,13 +1181,27 @@ class BookingViewSet(viewsets.ModelViewSet):
                     _slot_date_local = start_time.astimezone(_center_tz).date()
                     _slot_dow = _slot_date_local.weekday()
 
-                    # Determine which coaches are linked to the chosen package
+                    # Determine which coaches are linked to the chosen package.
+                    # Phase-E: if the package has no staff_members but a service_category is
+                    # provided, fall back to StaffCategory assignments for the capacity guard.
                     _package_coaches_qs = User.objects.filter(role__in=['staff', 'admin'], is_active=True)
                     if location_id:
                         _package_coaches_qs = _package_coaches_qs.filter(ghl_location_id=location_id)
                     try:
                         _pkg_obj = _CoachPkg.objects.get(id=package.id)
-                        _package_coaches_qs = _pkg_obj.staff_members.filter(role__in=['staff', 'admin'], is_active=True)
+                        _pkg_staff = list(_pkg_obj.staff_members.filter(role__in=['staff', 'admin'], is_active=True))
+                        if _pkg_staff:
+                            _package_coaches_qs = _pkg_obj.staff_members.filter(role__in=['staff', 'admin'], is_active=True)
+                        else:
+                            # Phase-E: use StaffCategory as fallback
+                            _svc_cat = serializer.validated_data.get('service_category')
+                            if _svc_cat:
+                                from users.models import StaffCategory as _StaffCat2
+                                _cat_staff_ids = list(
+                                    _StaffCat2.objects.filter(category=_svc_cat)
+                                    .values_list('staff_id', flat=True)
+                                )
+                                _package_coaches_qs = _package_coaches_qs.filter(id__in=_cat_staff_ids)
                     except Exception:
                         pass
 

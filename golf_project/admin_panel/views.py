@@ -10,7 +10,7 @@ from django.db.models import Count, Sum, Q, F
 from django.utils import timezone as django_timezone
 from datetime import datetime, timedelta, timezone as dt_timezone
 from decimal import Decimal
-from users.models import User, StaffAvailability, StaffDayAvailability
+from users.models import User, StaffAvailability, StaffDayAvailability, StaffCategory
 
 logger = logging.getLogger(__name__)
 from users.utils import get_location_id_from_request, filter_by_location
@@ -21,7 +21,6 @@ from bookings.serializers import BookingSerializer
 from .serializers import CoachingSessionAdjustmentSerializer, SimulatorCreditGrantSerializer, ClosedDaySerializer, LiabilityWaiverSerializer
 from .models import ClosedDay, LiabilityWaiver
 from simulators.serializers import SimulatorCreditSerializer
-from .models import ClosedDay
 
 class AdminDashboardViewSet(viewsets.ViewSet):
     @action(detail=False, methods=['get'])
@@ -145,203 +144,247 @@ class StaffViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get', 'put'])
     def availability(self, request, pk=None):
         staff = self.get_object()
-        
-        # Verify staff belongs to admin's location
+
         location_id = get_location_id_from_request(request)
         if location_id and staff.ghl_location_id != location_id:
             raise PermissionDenied("You can only manage availability for staff in your location.")
-        
-        if request.method == 'GET':
-            # Get all recurring weekly availability
-            availability = StaffAvailability.objects.filter(staff=staff).order_by('day_of_week', 'start_time')
-            serializer = StaffAvailabilitySerializer(availability, many=True, context={'location_id': location_id})
-            return Response(serializer.data)
-        
-        elif request.method == 'PUT':
-            # Update availability data
-            availability_data = request.data
-            
-            # Ensure availability_data is a list
-            if not isinstance(availability_data, list):
-                return Response(
-                    {'error': 'Availability data must be a list'}, 
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            # Process each item in the payload - supports explicit delete or update/create
-            updated_availability = []
-            
-            for avail_data in availability_data:
-                # Check for explicit delete flag
-                if avail_data.get('deleted') is True:
-                    day_of_week = avail_data.get('day_of_week')
-                    start_time_str = avail_data.get('start_time')
-                    avail_id = avail_data.get('id')
-                    
-                    # Try to delete by ID if present
-                    if avail_id:
-                         StaffAvailability.objects.filter(id=avail_id, staff=staff).delete()
-                         print(f"Deleted availability {avail_id} for staff {staff.id}")
-                    # Fallback: Delete by matching day/time if ID not provided (for older clients?)
-                    elif day_of_week is not None and start_time_str:
-                        if len(start_time_str) > 5:
-                            start_time_str = start_time_str[:5]
-                            
-                        # Find matching entry
-                        # This is a bit unsafe without ID but provided for robustness
-                        # Filter by checking start_time string match
-                        candidates = StaffAvailability.objects.filter(staff=staff, day_of_week=day_of_week)
-                        for c in candidates:
-                            if str(c.start_time)[:5] == start_time_str:
-                                c.delete()
-                                print(f"Deleted availability (by match) for staff {staff.id}")
-                    
-                    continue # Skip update logic for this item
 
-                # Update or create logic for items NOT marked deleted
+        # Optional category scope: ?category_id=X  (omit or 0 = general / all)
+        raw_cat_id = request.query_params.get('category_id') or request.data.get('category_id')
+        category_id = int(raw_cat_id) if raw_cat_id and str(raw_cat_id).isdigit() else None
+
+        if request.method == 'GET':
+            qs = StaffAvailability.objects.filter(
+                staff=staff,
+                service_category_id=category_id,
+            ).order_by('day_of_week', 'start_time')
+            serializer = StaffAvailabilitySerializer(qs, many=True, context={'location_id': location_id})
+            return Response(serializer.data)
+
+        elif request.method == 'PUT':
+            availability_data = request.data
+            if not isinstance(availability_data, list):
+                return Response({'error': 'Availability data must be a list'}, status=status.HTTP_400_BAD_REQUEST)
+
+            updated_availability = []
+
+            for avail_data in availability_data:
+                if avail_data.get('deleted') is True:
+                    avail_id = avail_data.get('id')
+                    if avail_id:
+                        StaffAvailability.objects.filter(id=avail_id, staff=staff).delete()
+                    else:
+                        day_of_week = avail_data.get('day_of_week')
+                        start_time_str = (avail_data.get('start_time') or '')[:5]
+                        if day_of_week is not None and start_time_str:
+                            for c in StaffAvailability.objects.filter(
+                                staff=staff,
+                                day_of_week=day_of_week,
+                                service_category_id=category_id,
+                            ):
+                                if str(c.start_time)[:5] == start_time_str:
+                                    c.delete()
+                    continue
+
                 day_of_week = avail_data.get('day_of_week')
                 if day_of_week is not None:
                     try:
                         day_of_week = int(day_of_week)
-                        # Use serializer to handle timezone conversion
                         serializer_data = {**avail_data, 'staff': staff.id, 'day_of_week': day_of_week}
-                        serializer = StaffAvailabilitySerializer(data=serializer_data, context={'location_id': location_id})
+                        serializer = StaffAvailabilitySerializer(
+                            data=serializer_data, context={'location_id': location_id}
+                        )
                         if serializer.is_valid():
-                            availability, created = StaffAvailability.objects.update_or_create(
+                            avail, _ = StaffAvailability.objects.update_or_create(
                                 staff=staff,
                                 day_of_week=day_of_week,
                                 start_time=serializer.validated_data.get('start_time'),
-                                defaults={
-                                    'end_time': serializer.validated_data.get('end_time'),
-                                }
+                                service_category_id=category_id,
+                                defaults={'end_time': serializer.validated_data.get('end_time')},
                             )
-                            updated_availability.append(availability)
+                            updated_availability.append(avail)
                         else:
-                            # Fallback to direct assignment if serializer fails
-                            print(f"Serializer validation failed: {serializer.errors}")
                             try:
-                                start_time_obj = datetime.strptime(avail_data.get('start_time', '09:00'), '%H:%M').time()
-                                end_time_obj = datetime.strptime(avail_data.get('end_time', '17:00'), '%H:%M').time()
-                                availability, created = StaffAvailability.objects.update_or_create(
+                                s = datetime.strptime(avail_data.get('start_time', '09:00'), '%H:%M').time()
+                                e = datetime.strptime(avail_data.get('end_time', '17:00'), '%H:%M').time()
+                                avail, _ = StaffAvailability.objects.update_or_create(
                                     staff=staff,
                                     day_of_week=day_of_week,
-                                    start_time=start_time_obj,
-                                    defaults={
-                                        'end_time': end_time_obj,
-                                    }
+                                    start_time=s,
+                                    service_category_id=category_id,
+                                    defaults={'end_time': e},
                                 )
-                                updated_availability.append(availability)
+                                updated_availability.append(avail)
                             except ValueError:
                                 pass
                     except (ValueError, TypeError):
                         pass
-            
-            # Return updated availability list (fetch fresh from DB to include all current items)
-            all_avail = StaffAvailability.objects.filter(staff=staff).order_by('day_of_week', 'start_time')
+
+            all_avail = StaffAvailability.objects.filter(
+                staff=staff,
+                service_category_id=category_id,
+            ).order_by('day_of_week', 'start_time')
             serializer = StaffAvailabilitySerializer(all_avail, many=True, context={'location_id': location_id})
             return Response(serializer.data)
     
+    @action(detail=True, methods=['get', 'put'], url_path='categories')
+    def categories(self, request, pk=None):
+        """
+        Phase D: GET/PUT the service categories assigned to a staff member.
+
+        GET  → returns list of assigned categories (id, name, slug, is_primary).
+        PUT  → accepts {"category_ids": [1, 2, 3]} and replaces all assignments.
+               Optionally accepts {"category_ids": [...], "primary_id": <id>} to
+               mark one category as primary.
+        """
+        staff = self.get_object()
+        location_id = get_location_id_from_request(request)
+
+        if request.method == 'GET':
+            assignments = StaffCategory.objects.filter(staff=staff).select_related('category')
+            data = [
+                {
+                    'category_id': a.category_id,
+                    'name': a.category.name,
+                    'slug': a.category.slug,
+                    'customer_label': a.category.customer_label,
+                    'is_primary': a.is_primary,
+                }
+                for a in assignments
+            ]
+            return Response(data)
+
+        # PUT — replace assignments
+        category_ids = request.data.get('category_ids')
+        if not isinstance(category_ids, list):
+            return Response(
+                {'error': 'category_ids must be a list of integer IDs.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        primary_id = request.data.get('primary_id')
+
+        from categories.models import ServiceCategory
+        valid_cats = ServiceCategory.objects.filter(id__in=category_ids, is_active=True)
+        valid_ids = set(valid_cats.values_list('id', flat=True))
+
+        invalid = [cid for cid in category_ids if cid not in valid_ids]
+        if invalid:
+            return Response(
+                {'error': f'Invalid or inactive category IDs: {invalid}'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Replace all assignments atomically
+        from django.db import transaction
+        with transaction.atomic():
+            StaffCategory.objects.filter(staff=staff).delete()
+            for cid in valid_ids:
+                StaffCategory.objects.create(
+                    staff=staff,
+                    category_id=cid,
+                    is_primary=(cid == primary_id),
+                )
+
+        assignments = StaffCategory.objects.filter(staff=staff).select_related('category')
+        data = [
+            {
+                'category_id': a.category_id,
+                'name': a.category.name,
+                'slug': a.category.slug,
+                'customer_label': a.category.customer_label,
+                'is_primary': a.is_primary,
+            }
+            for a in assignments
+        ]
+        return Response(data)
+
     @action(detail=True, methods=['get', 'put'], url_path='day-availability')
     def day_availability(self, request, pk=None):
         """
-        Handle day-specific (non-recurring) availability for staff.
-        GET: Returns all day-specific availability entries
-        PUT: Updates day-specific availability (replaces all entries with provided list)
+        Day-specific (non-recurring) availability for staff.
+        Accepts optional ?category_id=X to scope to a single service category.
+        GET: Returns entries for that category (or general if omitted).
+        PUT: Replaces entries for that category.
         """
         staff = self.get_object()
-        
-        # Verify staff belongs to admin's location
+
         location_id = get_location_id_from_request(request)
         if location_id and staff.ghl_location_id != location_id:
             raise PermissionDenied("You can only manage availability for staff in your location.")
-        
+
+        raw_cat_id = request.query_params.get('category_id') or request.data.get('category_id')
+        category_id = int(raw_cat_id) if raw_cat_id and str(raw_cat_id).isdigit() else None
+
         if request.method == 'GET':
-            # Get all day-specific availability, ordered by date
-            day_availability = StaffDayAvailability.objects.filter(staff=staff).order_by('date', 'start_time')
-            serializer = StaffDayAvailabilitySerializer(day_availability, many=True, context={'location_id': location_id})
+            qs = StaffDayAvailability.objects.filter(
+                staff=staff,
+                service_category_id=category_id,
+            ).order_by('date', 'start_time')
+            serializer = StaffDayAvailabilitySerializer(qs, many=True, context={'location_id': location_id})
             return Response(serializer.data)
-        
+
         elif request.method == 'PUT':
-            # Update day-specific availability data
             availability_data = request.data
-            
-            # Ensure availability_data is a list
             if not isinstance(availability_data, list):
-                return Response(
-                    {'error': 'Availability data must be a list'}, 
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            
-            # Get all existing day-specific availability entries for this staff
-            existing_entries = StaffDayAvailability.objects.filter(staff=staff)
-            
-            # Get IDs of entries to keep (from the request)
+                return Response({'error': 'Availability data must be a list'}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Keys of entries to keep (date + start_time for this category scope)
             entries_to_keep = set()
             for avail_data in availability_data:
                 date = avail_data.get('date')
                 start_time_str = avail_data.get('start_time')
                 if date and start_time_str:
-                    # Normalize time format (remove seconds if present)
-                    if ':' in start_time_str and start_time_str.count(':') > 1:
-                        start_time_str = start_time_str[:5]
-                    entries_to_keep.add((str(date), start_time_str))
-            
-            # Delete entries not in the keep list
-            to_delete_ids = []
-            for entry in existing_entries:
-                entry_key = (str(entry.date), str(entry.start_time)[:5])
-                if entry_key not in entries_to_keep:
-                    to_delete_ids.append(entry.id)
-            
-            if to_delete_ids:
-                deleted_count = StaffDayAvailability.objects.filter(id__in=to_delete_ids).delete()
-                print(f"Deleted {deleted_count[0]} day-specific availability entries for staff {staff.id}")
-            
-            # Update or create each day-specific availability entry
-            updated_availability = []
+                    st = start_time_str[:5] if start_time_str.count(':') > 1 else start_time_str
+                    entries_to_keep.add((str(date), st))
+
+            # Delete entries for this category that are NOT in the keep set
+            to_delete = [
+                e.id
+                for e in StaffDayAvailability.objects.filter(
+                    staff=staff, service_category_id=category_id
+                )
+                if (str(e.date), str(e.start_time)[:5]) not in entries_to_keep
+            ]
+            if to_delete:
+                StaffDayAvailability.objects.filter(id__in=to_delete).delete()
+
+            updated = []
             for avail_data in availability_data:
                 date = avail_data.get('date')
-                if date:
-                    try:
-                        # Use serializer to handle timezone conversion
-                        serializer_data = {**avail_data, 'staff': staff.id, 'date': date}
-                        serializer = StaffDayAvailabilitySerializer(data=serializer_data, context={'location_id': location_id})
-                        if serializer.is_valid():
-                            availability, created = StaffDayAvailability.objects.update_or_create(
-                                staff=staff,
-                                date=date,
-                                start_time=serializer.validated_data.get('start_time'),
-                                defaults={
-                                    'end_time': serializer.validated_data.get('end_time'),
-                                }
-                            )
-                            updated_availability.append(availability)
-                        else:
-                            # Fallback to direct assignment if serializer fails
-                            print(f"Serializer validation failed: {serializer.errors}")
-                            try:
-                                from datetime import date as date_obj
-                                date_obj_parsed = date_obj.fromisoformat(date) if isinstance(date, str) else date
-                                start_time_obj = datetime.strptime(avail_data.get('start_time', '09:00'), '%H:%M').time()
-                                end_time_obj = datetime.strptime(avail_data.get('end_time', '17:00'), '%H:%M').time()
-                                availability, created = StaffDayAvailability.objects.update_or_create(
-                                    staff=staff,
-                                    date=date_obj_parsed,
-                                    start_time=start_time_obj,
-                                    defaults={
-                                        'end_time': end_time_obj,
-                                    }
-                                )
-                                updated_availability.append(availability)
-                            except (ValueError, TypeError) as e:
-                                print(f"Error creating day availability: {e}")
-                                pass
-                    except (ValueError, TypeError) as e:
-                        print(f"Error processing day availability: {e}")
-                        pass
-            
-            # Return updated availability list
-            serializer = StaffDayAvailabilitySerializer(updated_availability, many=True, context={'location_id': location_id})
+                if not date:
+                    continue
+                try:
+                    serializer_data = {**avail_data, 'staff': staff.id, 'date': date}
+                    ser = StaffDayAvailabilitySerializer(
+                        data=serializer_data, context={'location_id': location_id}
+                    )
+                    if ser.is_valid():
+                        avail, _ = StaffDayAvailability.objects.update_or_create(
+                            staff=staff,
+                            date=date,
+                            start_time=ser.validated_data.get('start_time'),
+                            service_category_id=category_id,
+                            defaults={'end_time': ser.validated_data.get('end_time')},
+                        )
+                        updated.append(avail)
+                    else:
+                        from datetime import date as date_type
+                        d = date_type.fromisoformat(date) if isinstance(date, str) else date
+                        s = datetime.strptime(avail_data.get('start_time', '09:00'), '%H:%M').time()
+                        e = datetime.strptime(avail_data.get('end_time', '17:00'), '%H:%M').time()
+                        avail, _ = StaffDayAvailability.objects.update_or_create(
+                            staff=staff,
+                            date=d,
+                            start_time=s,
+                            service_category_id=category_id,
+                            defaults={'end_time': e},
+                        )
+                        updated.append(avail)
+                except (ValueError, TypeError) as exc:
+                    print(f"Error processing day availability: {exc}")
+
+            serializer = StaffDayAvailabilitySerializer(updated, many=True, context={'location_id': location_id})
             return Response(serializer.data)
     
     @action(detail=True, methods=['get', 'post', 'delete'], url_path='blocked-dates')
@@ -364,10 +407,15 @@ class StaffViewSet(viewsets.ModelViewSet):
         from datetime import datetime as dt, time as dt_time
         import pytz
 
+        # Optional category scope: ?category_id=X (omit = general, i.e. NULL)
+        raw_cat_id = request.query_params.get('category_id') or request.data.get('category_id')
+        category_id = int(raw_cat_id) if raw_cat_id and str(raw_cat_id).isdigit() else None
+
         if request.method == 'GET':
-            # Get all blocked dates for this staff member
-            
-            blocked_dates = StaffBlockedDate.objects.filter(staff=staff).order_by('date')
+            blocked_dates = StaffBlockedDate.objects.filter(
+                staff=staff,
+                service_category_id=category_id,
+            ).order_by('date')
             serializer = StaffBlockedDateSerializer(blocked_dates, many=True)
             return Response(serializer.data)
         
@@ -449,14 +497,15 @@ class StaffViewSet(viewsets.ModelViewSet):
                         status=status.HTTP_400_BAD_REQUEST
                     )
             
-            # Create blocked date entry
+            # Create blocked date entry (scoped to category if provided)
             blocked_date = StaffBlockedDate.objects.create(
                 staff=staff,
                 date=block_date,
                 start_time=start_time,
                 end_time=end_time,
                 reason=reason,
-                created_by=request.user
+                created_by=request.user,
+                service_category_id=category_id,
             )
             
             # Find and cancel conflicting coaching bookings
@@ -566,16 +615,20 @@ class StaffViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
             
-            # Find and delete the blocked date
+            # Find and delete the blocked date (scoped to category if provided)
             try:
-                blocked_date = StaffBlockedDate.objects.get(staff=staff, date=unblock_date)
+                blocked_date = StaffBlockedDate.objects.get(
+                    staff=staff,
+                    date=unblock_date,
+                    service_category_id=category_id,
+                )
                 blocked_date.delete()
                 return Response({
                     'message': f'Successfully unblocked {date_str} for {staff.first_name} {staff.last_name}'
                 }, status=status.HTTP_200_OK)
             except StaffBlockedDate.DoesNotExist:
                 return Response(
-                    {'error': 'This date is not blocked for this staff member'}, 
+                    {'error': 'This date is not blocked for this staff member'},
                     status=status.HTTP_404_NOT_FOUND
                 )
 

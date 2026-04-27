@@ -56,6 +56,14 @@ class Booking(models.Model):
         related_name='redeemed_booking'
     )
     is_tpi_assessment = models.BooleanField(default=False, help_text="If True, this booking was made using a TPI Assessment package")
+    service_category = models.ForeignKey(
+        'categories.ServiceCategory',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='bookings',
+        help_text="Service category for non-legacy category bookings (Phase E).",
+    )
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

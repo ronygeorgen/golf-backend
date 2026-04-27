@@ -24,6 +24,7 @@ except ImportError:
     CELERY_AVAILABLE = False
     sync_purchase_with_ghl_task = None
 from users.models import User
+from users.utils import get_location_id_from_request
 from .models import (
     CoachingPackage, CoachingPackagePurchase, SessionTransfer, TempPurchase, PendingRecipient,
     SimulatorPackage, SimulatorPackagePurchase, SimulatorHoursTransfer
@@ -73,7 +74,6 @@ class CoachingPackageViewSet(viewsets.ModelViewSet):
         return [permission() for permission in permission_classes]
     
     def get_queryset(self):
-        from users.utils import get_location_id_from_request
         location_id = get_location_id_from_request(self.request)
         queryset = CoachingPackage.objects.all().order_by('-id')
         
@@ -93,11 +93,15 @@ class CoachingPackageViewSet(viewsets.ModelViewSet):
         staff_id = self.request.query_params.get('staff_id')
         if staff_id:
             queryset = queryset.filter(staff_members__id=staff_id)
-        
-        return queryset.select_related().prefetch_related('staff_members')
+
+        # Phase C: filter by service category
+        category_id = self.request.query_params.get('category_id')
+        if category_id:
+            queryset = queryset.filter(service_category_id=category_id)
+
+        return queryset.select_related('service_category').prefetch_related('staff_members')
     
     def perform_create(self, serializer):
-        from users.utils import get_location_id_from_request
         location_id = get_location_id_from_request(self.request)
         package = serializer.save(location_id=location_id)
         
@@ -154,13 +158,17 @@ class CoachingPackageViewSet(viewsets.ModelViewSet):
     def active_packages(self, request):
         # Get filtered queryset (includes location_id filtering from get_queryset)
         queryset = self.get_queryset()
-        
-        # Only return packages that have a redirect_url (for client-side) OR are TPI assessments
+
+        # Return packages that are purchasable by customers:
+        #   1. TPI Assessment packages (legacy)
+        #   2. Packages with a redirect_url (legacy pay-flow)
+        #   3. Packages linked to any ServiceCategory (Phase C+: all sport categories)
         active_packages = queryset.filter(is_active=True).filter(
             Q(is_tpi_assessment=True) |
-            (Q(redirect_url__isnull=False) & ~Q(redirect_url=''))
+            (Q(redirect_url__isnull=False) & ~Q(redirect_url='')) |
+            Q(service_category__isnull=False)
         )
-        
+
         serializer = self.get_serializer(active_packages, many=True)
         return Response(serializer.data)
 
@@ -170,7 +178,6 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
     
     def get_queryset(self):
-        from users.utils import get_location_id_from_request
         user = self.request.user
         location_id = get_location_id_from_request(self.request)
         base_qs = CoachingPackagePurchase.objects.select_related(
@@ -1933,7 +1940,6 @@ class SimulatorPackageViewSet(viewsets.ModelViewSet):
         return [permission() for permission in permission_classes]
     
     def get_queryset(self):
-        from users.utils import get_location_id_from_request
         location_id = get_location_id_from_request(self.request)
         queryset = SimulatorPackage.objects.all().order_by('-id')
         
@@ -1948,12 +1954,16 @@ class SimulatorPackageViewSet(viewsets.ModelViewSet):
         is_active = self.request.query_params.get('is_active')
         if is_active is not None:
             queryset = queryset.filter(is_active=is_active.lower() == 'true')
-        
-        return queryset
-    
+
+        # Phase C: filter by service category
+        category_id = self.request.query_params.get('category_id')
+        if category_id:
+            queryset = queryset.filter(service_category_id=category_id)
+
+        return queryset.select_related('service_category')
+
     def perform_create(self, serializer):
         """Set location_id when creating simulator package and handle time restrictions"""
-        from users.utils import get_location_id_from_request
         from coaching.models import SimulatorPackageTimeRestriction
         
         location_id = get_location_id_from_request(self.request)
@@ -1997,7 +2007,6 @@ class SimulatorPackageViewSet(viewsets.ModelViewSet):
     
     def perform_update(self, serializer):
         """Handle time restrictions when updating simulator package"""
-        from users.utils import get_location_id_from_request
         from coaching.models import SimulatorPackageTimeRestriction
         
         package = serializer.save()
@@ -2037,7 +2046,6 @@ class SimulatorPackageViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'], url_path='active')
     def active_packages(self, request):
         """Get all active simulator packages"""
-        from users.utils import get_location_id_from_request
         location_id = get_location_id_from_request(request)
         packages = SimulatorPackage.objects.filter(is_active=True)
         
