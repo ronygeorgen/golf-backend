@@ -50,6 +50,8 @@ INSTALLED_APPS = [
     'special_events',
     'banners',
     'dashboard',
+    'square_payments',
+    'coupons',
 ]
 
 MIDDLEWARE = [
@@ -196,6 +198,15 @@ STATIC_URL = 'static/'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# Square Payment Integration
+SQUARE_ACCESS_TOKEN = config('SANDBOX_ACCESS_TOKEN', default='')
+SQUARE_APPLICATION_ID = config('SANDBOX_APPLICATION_ID', default='')
+SQUARE_LOCATION_ID = config('SQUARE_LOCATION_ID', default='')
+SQUARE_ENVIRONMENT = config('SQUARE_ENVIRONMENT', default='sandbox')  # 'sandbox' or 'production'
+SQUARE_WEBHOOK_SIGNATURE_KEY = config('SQUARE_WEBHOOK_SIGNATURE_KEY', default='')
+# Full public URL of the webhook endpoint (e.g. your ngrok URL) — must match Square Dashboard exactly
+SQUARE_WEBHOOK_URL = config('SQUARE_WEBHOOK_URL', default='')
 
 # GHL Integration
 GHL_CLIENT_ID = config("GHL_CLIENT_ID")

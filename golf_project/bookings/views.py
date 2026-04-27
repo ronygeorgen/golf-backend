@@ -975,7 +975,8 @@ class BookingViewSet(viewsets.ModelViewSet):
                         self._temp_booking_response = {
                             'temp_id': temp_id_str,
                             'redirect_url': redirect_url,
-                            'simulator_count': simulator_count,  # Store count for webhook
+                            'simulator_count': simulator_count,
+                            'total_price': float(calculated_price),  # Needed by Square modal
                             'message': 'Temporary booking created successfully. Redirect to payment.'
                         }
                         
@@ -3190,6 +3191,7 @@ class CreateTempBookingView(APIView):
             return Response({
                 'temp_id': str(temp_booking.temp_id),
                 'redirect_url': redirect_url,
+                'total_price': float(total_price),  # Needed by Square modal
                 'message': 'Temporary booking created successfully.'
             }, status=status.HTTP_201_CREATED)
             
