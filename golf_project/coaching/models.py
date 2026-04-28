@@ -444,25 +444,28 @@ class SimulatorPackage(models.Model):
         """Check if this package has any time restrictions"""
         return self.time_restrictions.exists()
     
-    def get_matching_restrictions(self, booking_datetime):
+    def get_matching_restrictions(self, booking_datetime, location_id=None):
         """
         Get time restrictions that match the booking datetime.
         
         Args:
             booking_datetime: datetime object for the booking start time
+            location_id: Optional GHL location ID used to resolve center timezone
             
         Returns:
             QuerySet of matching SimulatorPackageTimeRestriction objects
         """
-        from django.utils import timezone
         from datetime import datetime
+        from golf_project.timezone_utils import utc_to_local
         
         if not isinstance(booking_datetime, datetime):
             return self.time_restrictions.none()
         
-        booking_date = booking_datetime.date()
-        booking_time = booking_datetime.time()
-        booking_day_of_week = booking_datetime.weekday()  # 0=Monday, 6=Sunday
+        # Restrictions are wall-clock local times, so convert booking time to center local time first.
+        local_booking_datetime = utc_to_local(booking_datetime, location_id=location_id)
+        booking_date = local_booking_datetime.date()
+        booking_time = local_booking_datetime.time()
+        booking_day_of_week = local_booking_datetime.weekday()  # 0=Monday, 6=Sunday
         
         matching_restrictions = []
         

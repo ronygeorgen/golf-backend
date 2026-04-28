@@ -606,7 +606,7 @@ class BookingViewSet(viewsets.ModelViewSet):
         
         return total
     
-    def _consume_package_simulator_hours(self, duration_minutes, use_organization=False, booking_start_time=None, user=None, location_id=None):
+    def _consume_package_simulator_hours(self, duration_minutes, use_organization=False, booking_start_time=None, user=None, location_id=None, admin_override=False):
         """
         Consume simulator hours from packages (combo or simulator-only).
         Priority: combo packages first, then non-restricted simulator packages, then restricted packages.
@@ -617,6 +617,7 @@ class BookingViewSet(viewsets.ModelViewSet):
             booking_start_time: datetime object for the booking start time (required for checking restrictions)
             user: The user to consume hours from (defaults to request.user)
             location_id: Location ID to filter by (defaults to request location_id)
+            admin_override: If True, bypass time-window and daily-limit restriction checks
             
         Returns:
             Purchase object (CoachingPackagePurchase or SimulatorPackagePurchase) if hours were consumed, None otherwise
@@ -627,6 +628,7 @@ class BookingViewSet(viewsets.ModelViewSet):
         from decimal import Decimal
         from coaching.models import SimulatorPackageUsage
         from django.utils import timezone
+        from golf_project.timezone_utils import utc_to_local
         
         user = user or self.request.user
         location_id = location_id or get_location_id_from_request(self.request)
@@ -699,15 +701,22 @@ class BookingViewSet(viewsets.ModelViewSet):
                 sim_purchase.consume_hours(hours_needed)
                 return sim_purchase
         
-        # If no unrestricted packages available, try restricted packages
-        # Only if booking_start_time is provided
-        if booking_start_time:
+        # If no unrestricted packages available, try restricted packages.
+        # booking_start_time is required unless admin override is explicitly enabled.
+        if booking_start_time or admin_override:
+            local_booking_start_time = utc_to_local(booking_start_time, location_id=location_id) if booking_start_time else None
             for sim_purchase in packages_with_restrictions:
                 if sim_purchase.hours_remaining < hours_needed:
                     continue
+                if admin_override:
+                    sim_purchase.consume_hours(hours_needed)
+                    return sim_purchase
                 
                 # Check if booking time matches any restrictions
-                matching_restrictions = sim_purchase.package.get_matching_restrictions(booking_start_time)
+                matching_restrictions = sim_purchase.package.get_matching_restrictions(
+                    booking_start_time,
+                    location_id=location_id
+                )
                 
                 if not matching_restrictions.exists():
                     # No matching restrictions, can't use this package
@@ -720,7 +729,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                 for restriction in matching_restrictions:
                     # Sum existing hours used for this restriction on this day
                     from decimal import Decimal
-                    usage_date = booking_start_time.date()
+                    usage_date = local_booking_start_time.date()
                     if restriction.is_recurring:
                         # For recurring, sum all hours used on this day of week
                         existing_usage_hours = SimulatorPackageUsage.objects.filter(
@@ -758,7 +767,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                     restriction_name = restriction_to_use.get_day_of_week_display() if restriction_to_use.is_recurring else str(restriction_to_use.date)
                     # Calculate how many hours are already used
                     from decimal import Decimal
-                    usage_date = booking_start_time.date()
+                    usage_date = local_booking_start_time.date()
                     if restriction_to_use.is_recurring:
                         existing_usage_hours = SimulatorPackageUsage.objects.filter(
                             package_purchase=sim_purchase,
@@ -799,6 +808,7 @@ class BookingViewSet(viewsets.ModelViewSet):
                 "Manual admin booking override is not permitted for this account."
             )
         skip_coaching_availability_enforcement = bool(admin_manual_booking)
+        simulator_admin_override = bool(admin_manual_booking)
         redeemed_credit = None
         
         # Determine target user
@@ -922,7 +932,14 @@ class BookingViewSet(viewsets.ModelViewSet):
                             # For multiple simulators, we need to consume hours for each simulator
                             # Calculate total duration in minutes for all simulators
                             total_duration_minutes = duration_minutes * simulator_count
-                            package_purchase = self._consume_package_simulator_hours(total_duration_minutes, use_organization=True, booking_start_time=start_time, user=target_user, location_id=location_id)
+                            package_purchase = self._consume_package_simulator_hours(
+                                total_duration_minutes,
+                                use_organization=True,
+                                booking_start_time=start_time,
+                                user=target_user,
+                                location_id=location_id,
+                                admin_override=simulator_admin_override
+                            )
                             if not package_purchase:
                                 raise serializers.ValidationError("Insufficient pre-paid hours available")
                     elif use_prepaid_hours is False:
@@ -992,7 +1009,14 @@ class BookingViewSet(viewsets.ModelViewSet):
                             # Calculate total duration in minutes for all simulators
                             total_duration_minutes = duration_minutes * simulator_count
                             try:
-                                package_purchase = self._consume_package_simulator_hours(total_duration_minutes, use_organization=True, booking_start_time=start_time, user=target_user, location_id=location_id)
+                                package_purchase = self._consume_package_simulator_hours(
+                                    total_duration_minutes,
+                                    use_organization=True,
+                                    booking_start_time=start_time,
+                                    user=target_user,
+                                    location_id=location_id,
+                                    admin_override=simulator_admin_override
+                                )
                             except serializers.ValidationError:
                                 # Fallback to payment if no package or credit available
                                 pass
@@ -1058,9 +1082,11 @@ class BookingViewSet(viewsets.ModelViewSet):
                         if simulator_package_purchase and hasattr(simulator_package_purchase, '_used_restriction'):
                             from coaching.models import SimulatorPackageUsage
                             from decimal import Decimal
+                            from golf_project.timezone_utils import utc_to_local
                             restriction = simulator_package_purchase._used_restriction
-                            usage_date = start_time.date()
-                            usage_time = start_time.time()
+                            local_start_time = utc_to_local(start_time, location_id=location_id)
+                            usage_date = local_start_time.date()
+                            usage_time = local_start_time.time()
                             
                             # Calculate hours used (for multiple simulators, this is total hours)
                             hours_used = Decimal(str(duration_minutes)) / Decimal('60') * simulator_count
