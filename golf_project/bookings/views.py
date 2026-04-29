@@ -1104,6 +1104,35 @@ class BookingViewSet(viewsets.ModelViewSet):
                     
                     return
             elif booking_type == 'coaching':
+                # ── Asset-only path (needs_staff=False CategoryAsset) ────────────
+                # These bookings don't require a coach, a package, or a simulator bay.
+                # Availability was already gated by _compute_asset_slots on the frontend.
+                # Conflict checking was done in BookingCreateSerializer.validate().
+                _asset_obj = booking_data.get('category_asset')
+                _is_asset_only = _asset_obj is not None and not getattr(_asset_obj, 'needs_staff', True)
+                if _is_asset_only:
+                    location_id = get_location_id_from_request(self.request)
+                    booking_instance = serializer.save(
+                        client=target_user,
+                        location_id=location_id,
+                        total_price=booking_data.get('total_price', 0),
+                    )
+                    if location_id and not booking_instance.location_id:
+                        booking_instance.location_id = location_id
+                        booking_instance.save(update_fields=['location_id'])
+                    logger.info(
+                        f"Asset-only booking created: id={booking_instance.id}, "
+                        f"asset={_asset_obj.id}, client={target_user.phone}"
+                    )
+                    try:
+                        from ghl.tasks import update_user_ghl_custom_fields_task
+                        ghl_loc_id = location_id or getattr(target_user, 'ghl_location_id', None)
+                        update_user_ghl_custom_fields_task.delay(target_user.id, location_id=ghl_loc_id)
+                    except Exception as exc:
+                        logger.warning("Failed to queue GHL update after asset-only booking: %s", exc)
+                    return
+                # ── Standard coaching path (requires package + bay + coach) ─────
+
                 package = booking_data.get('coaching_package')
                 if not package:
                     raise serializers.ValidationError("A coaching package is required for coaching bookings.")
