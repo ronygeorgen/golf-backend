@@ -64,6 +64,15 @@ class Booking(models.Model):
         related_name='bookings',
         help_text="Service category for non-legacy category bookings (Phase E).",
     )
+    category_asset = models.ForeignKey(
+        'categories.CategoryAsset',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='bookings',
+        help_text="The specific asset booked (e.g. Table Tennis Table 1). "
+                  "For needs_staff=False assets this is the availability gate.",
+    )
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

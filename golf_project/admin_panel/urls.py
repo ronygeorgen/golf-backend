@@ -4,7 +4,7 @@ from . import views
 from simulators.views import SimulatorViewSet, DurationPriceViewSet
 from coaching.views import CoachingPackageViewSet
 from bookings.views import BookingViewSet
-from categories.views import ServiceCategoryViewSet
+from categories.views import ServiceCategoryViewSet, CategoryAssetViewSet
 
 router = DefaultRouter()
 router.register(r'dashboard', views.AdminDashboardViewSet, basename='admin-dashboard')
@@ -18,6 +18,8 @@ router.register(r'overrides', views.AdminOverrideViewSet, basename='admin-overri
 router.register(r'closed-days', views.ClosedDayViewSet, basename='admin-closed-days')
 router.register(r'liability-waiver', views.LiabilityWaiverViewSet, basename='admin-liability-waiver')
 router.register(r'categories', ServiceCategoryViewSet, basename='admin-categories')
+# category-assets flat router: filter by ?category_id=X for listing
+router.register(r'category-assets', CategoryAssetViewSet, basename='admin-category-assets')
 
 urlpatterns = [
     path('', include(router.urls)),

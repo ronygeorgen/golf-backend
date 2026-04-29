@@ -1,7 +1,7 @@
 from django.utils.text import slugify
 from rest_framework import serializers
 
-from .models import ServiceCategory
+from .models import CategoryAsset, CategoryAssetAvailability, ServiceCategory
 
 
 class ServiceCategorySerializer(serializers.ModelSerializer):
@@ -74,3 +74,39 @@ class ServiceCategoryAdminSerializer(serializers.ModelSerializer):
                 {'slug': f'A category with slug "{slug}" already exists for this location.'}
             )
         return attrs
+
+
+# ---------------------------------------------------------------------------
+# Category Assets
+# ---------------------------------------------------------------------------
+
+class CategoryAssetAvailabilitySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CategoryAssetAvailability
+        fields = ('id', 'asset', 'day_of_week', 'start_time', 'end_time')
+
+    def to_representation(self, instance):
+        rep = super().to_representation(instance)
+        for f in ('start_time', 'end_time'):
+            val = rep.get(f)
+            if val and isinstance(val, str) and val.count(':') > 1:
+                rep[f] = val[:5]
+        return rep
+
+
+class CategoryAssetSerializer(serializers.ModelSerializer):
+    availabilities = CategoryAssetAvailabilitySerializer(many=True, read_only=True)
+    asset_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CategoryAsset
+        fields = (
+            'id', 'category', 'name', 'price_per_hour', 'needs_staff',
+            'is_active', 'sort_order', 'description', 'location_id',
+            'created_at', 'updated_at', 'availabilities', 'asset_count',
+        )
+        read_only_fields = ('id', 'created_at', 'updated_at', 'availabilities', 'asset_count')
+
+    def get_asset_count(self, obj):
+        """Returns how many active bookings exist for this asset (for display purposes)."""
+        return 0  # placeholder — bookings query added after Booking model is updated

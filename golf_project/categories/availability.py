@@ -33,6 +33,7 @@ def compute_category_slots(
     location_id,
     package=None,
     coach_id=None,
+    asset_id=None,
 ):
     """
     Return a list of available time slots for a service category on a given date.
@@ -41,13 +42,19 @@ def compute_category_slots(
         category_id  : int  – ServiceCategory PK
         booking_date : date – the local calendar date to query
         location_id  : str  – GHL location ID (may be empty/None)
-        package      : CoachingPackage instance or None – when provided, restricts
-                       staff to the intersection of StaffCategory and
-                       package.staff_members (if the package has any staff set).
-        coach_id     : int or None – when provided, restrict to one coach
+        package      : CoachingPackage instance or None – restricts staff to
+                       intersection of StaffCategory and package.staff_members.
+        coach_id     : int or None – restrict to one coach (staff-based assets)
+        asset_id     : int or None – specific CategoryAsset to check.
+                       If the asset has needs_staff=False, asset-schedule logic is used.
+                       If needs_staff=True (or no asset), staff-schedule logic is used.
+                       If None and the category has assets, staff-based logic applies
+                       (caller should always pass asset_id when assets are defined).
 
     Returns:
-        list[dict] sorted by start_time ISO string
+        list[dict] sorted by start_time ISO string.
+        Asset-based slots include an 'asset' key with {id, name, price_per_hour}.
+        Staff-based slots include 'available_coaches' as before.
     """
     from users.models import (
         StaffAvailability,
@@ -58,9 +65,31 @@ def compute_category_slots(
     )
     from bookings.models import Booking
     from golf_project.timezone_utils import get_center_timezone
+    from .models import CategoryAsset, CategoryAssetAvailability
 
     center_tz = get_center_timezone(location_id)
     day_of_week = booking_date.weekday()
+
+    # ------------------------------------------------------------------ #
+    # 0.  Asset-based slot logic (needs_staff=False)                      #
+    # ------------------------------------------------------------------ #
+    if asset_id:
+        try:
+            asset = CategoryAsset.objects.get(pk=asset_id, category_id=category_id, is_active=True)
+        except CategoryAsset.DoesNotExist:
+            return []
+
+        # If this asset requires staff, fall through to the normal staff logic below.
+        if not asset.needs_staff:
+            return _compute_asset_slots(
+                asset=asset,
+                booking_date=booking_date,
+                day_of_week=day_of_week,
+                center_tz=center_tz,
+                location_id=location_id,
+                package=package,
+            )
+        # needs_staff=True: continue into staff logic with this asset noted
 
     # ------------------------------------------------------------------ #
     # 1.  Resolve candidate coaches                                        #
@@ -346,3 +375,140 @@ def compute_category_slots(
         current_slot_start += timedelta(minutes=slot_interval)
 
     return sorted(available_slots_map.values(), key=lambda x: x['start_time'])
+
+
+# ---------------------------------------------------------------------------
+# Asset-based slot engine (needs_staff=False)
+# ---------------------------------------------------------------------------
+
+def _compute_asset_slots(asset, booking_date, day_of_week, center_tz, location_id, package=None):
+    """
+    Generate available slots for a single needs_staff=False CategoryAsset.
+
+    A slot is available when:
+      1. The asset's weekly schedule covers the full slot window.
+      2. No confirmed/completed Booking already occupies that asset on this slot.
+      3. The facility is open (ClosedDay + SpecialEvent checks).
+
+    Slot structure mirrors compute_category_slots so the frontend can share
+    rendering code; 'available_coaches' is an empty list, and an 'asset' key
+    is added with asset metadata.
+    """
+    import pytz
+    from datetime import datetime, timedelta
+    from django.db.models import Q
+    from django.utils import timezone as tz
+
+    from bookings.models import Booking
+    from admin_panel.models import ClosedDay
+    from special_events.models import SpecialEvent
+
+    duration_minutes = 60
+    if package is not None and hasattr(package, 'session_duration_minutes'):
+        duration_minutes = package.session_duration_minutes or 60
+
+    # Load the asset's weekly availability for this day
+    avail_windows = list(
+        asset.availabilities.filter(day_of_week=day_of_week).values('start_time', 'end_time')
+    )
+    if not avail_windows:
+        return []
+
+    # Convert availability windows to UTC
+    utc_windows = []
+    for w in avail_windows:
+        s_naive = datetime.combine(booking_date, w['start_time'])
+        e_naive = datetime.combine(booking_date, w['end_time'])
+        if w['end_time'] <= w['start_time']:
+            e_naive += timedelta(days=1)
+        utc_windows.append((
+            center_tz.localize(s_naive).astimezone(pytz.UTC),
+            center_tz.localize(e_naive).astimezone(pytz.UTC),
+        ))
+
+    if not utc_windows:
+        return []
+
+    min_start = min(s for s, _ in utc_windows)
+    max_end = max(e for _, e in utc_windows)
+
+    # Prefetch existing bookings for this asset on this day
+    existing_bookings = list(
+        Booking.objects.filter(
+            category_asset=asset,
+            start_time__lt=max_end,
+            end_time__gt=min_start,
+            status__in=['confirmed', 'completed'],
+        )
+    )
+
+    # Facility closure helpers
+    active_closures = list(
+        ClosedDay.objects.filter(is_active=True).filter(
+            Q(location_id=location_id) | Q(location_id__isnull=True) if location_id else Q()
+        )
+    )
+    next_day = booking_date + timedelta(days=1)
+    day_events_qs = SpecialEvent.objects.filter(is_active=True)
+    if location_id:
+        day_events_qs = day_events_qs.filter(location_id=location_id)
+    day_events = [e for e in day_events_qs if e.get_occurrences(start_date=booking_date, end_date=next_day)]
+
+    def is_facility_closed(check_time):
+        closed, _ = ClosedDay.check_if_closed(check_time, location_id=location_id)
+        return closed
+
+    def has_event_conflict(slot_start, slot_end):
+        return any(e.conflicts_with_range(slot_start, slot_end) for e in day_events)
+
+    def in_availability(slot_start, slot_end):
+        return any(s <= slot_start and e >= slot_end for s, e in utc_windows)
+
+    now = tz.now()
+    slot_interval = 30
+    current = min_start
+    slots = {}
+
+    while current < max_end:
+        slot_end = current + timedelta(minutes=duration_minutes)
+
+        if current <= now:
+            current += timedelta(minutes=slot_interval)
+            continue
+
+        if not in_availability(current, slot_end):
+            current += timedelta(minutes=slot_interval)
+            continue
+
+        if is_facility_closed(current):
+            current += timedelta(minutes=slot_interval)
+            continue
+
+        if has_event_conflict(current, slot_end):
+            current += timedelta(minutes=slot_interval)
+            continue
+
+        # Check no existing booking overlaps
+        is_booked = any(
+            b.start_time < slot_end and b.end_time > current
+            for b in existing_bookings
+        )
+        if not is_booked:
+            key = current.isoformat()
+            slots[key] = {
+                'start_time': key,
+                'end_time': slot_end.isoformat(),
+                'duration_minutes': duration_minutes,
+                'availability_end_time': max(e for s, e in utc_windows if s <= current).isoformat(),
+                'fits_duration': True,
+                'available_coaches': [],
+                'asset': {
+                    'id': asset.id,
+                    'name': asset.name,
+                    'price_per_hour': str(asset.price_per_hour) if asset.price_per_hour else None,
+                },
+            }
+
+        current += timedelta(minutes=slot_interval)
+
+    return sorted(slots.values(), key=lambda x: x['start_time'])

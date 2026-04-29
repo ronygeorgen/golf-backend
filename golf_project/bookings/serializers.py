@@ -28,6 +28,7 @@ class BookingCreateSerializer(serializers.ModelSerializer):
             'admin_manual_booking',
             'location_id',
             'service_category',
+            'category_asset',
         ]
     
     def __init__(self, *args, **kwargs):
@@ -133,23 +134,49 @@ class BookingCreateSerializer(serializers.ModelSerializer):
         if booking_type == 'coaching':
             if data.get('use_simulator_credit'):
                 raise serializers.ValidationError("Simulator credits cannot be applied to coaching bookings.")
-            if not coaching_package:
+
+            # For dynamic category bookings on a needs_staff=False asset, coach is optional
+            category_asset = data.get('category_asset')
+            is_asset_only = category_asset and not category_asset.needs_staff
+            if not is_asset_only and not coaching_package:
                 raise serializers.ValidationError("A coaching package is required for coaching bookings.")
-            
-            session_duration = coaching_package.session_duration_minutes
-            if data.get('duration_minutes') and data['duration_minutes'] != session_duration:
-                raise serializers.ValidationError(
-                    f"Coaching sessions must be {session_duration} minutes for the selected package."
+
+            # Asset-only bookings: check for asset conflicts
+            if is_asset_only and start_time and end_time:
+                asset_conflict = Booking.objects.filter(
+                    category_asset=category_asset,
+                    start_time__lt=end_time,
+                    end_time__gt=start_time,
+                    status__in=['confirmed', 'completed'],
                 )
-            data['duration_minutes'] = session_duration
-            if coaching_package.session_count:
-                per_session = (Decimal(coaching_package.price) / Decimal(coaching_package.session_count)).quantize(
-                    Decimal('0.01'),
-                    rounding=ROUND_HALF_UP
-                )
-            else:
-                per_session = Decimal(coaching_package.price).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
-            data['total_price'] = per_session
+                if exclude_id := self.context.get('exclude_booking_id'):
+                    asset_conflict = asset_conflict.exclude(id=exclude_id)
+                if asset_conflict.exists():
+                    raise serializers.ValidationError("This asset is already booked for the selected time slot.")
+
+            if coaching_package:
+                session_duration = coaching_package.session_duration_minutes
+                if data.get('duration_minutes') and data['duration_minutes'] != session_duration:
+                    raise serializers.ValidationError(
+                        f"Coaching sessions must be {session_duration} minutes for the selected package."
+                    )
+                data['duration_minutes'] = session_duration
+                if coaching_package.session_count:
+                    per_session = (Decimal(coaching_package.price) / Decimal(coaching_package.session_count)).quantize(
+                        Decimal('0.01'), rounding=ROUND_HALF_UP
+                    )
+                else:
+                    per_session = Decimal(coaching_package.price).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+                data['total_price'] = per_session
+            elif is_asset_only:
+                # Price based on asset hourly rate and duration
+                duration = data.get('duration_minutes') or 60
+                if category_asset.price_per_hour:
+                    data['total_price'] = (Decimal(category_asset.price_per_hour) * Decimal(duration) / 60).quantize(
+                        Decimal('0.01'), rounding=ROUND_HALF_UP
+                    )
+                else:
+                    data['total_price'] = Decimal('0.00')
         elif booking_type == 'simulator':
             data['use_simulator_credit'] = bool(data.get('use_simulator_credit'))
             if data.get('use_simulator_credit'):
@@ -179,6 +206,7 @@ class BookingSerializer(serializers.ModelSerializer):
     coaching_session_price = serializers.SerializerMethodField()
     purchase_type_label = serializers.SerializerMethodField()
     service_category_name = serializers.SerializerMethodField()
+    category_asset_name = serializers.SerializerMethodField()
     
     class Meta:
         model = Booking
@@ -231,4 +259,10 @@ class BookingSerializer(serializers.ModelSerializer):
         """Return the ServiceCategory name for this booking, or None for legacy bookings."""
         if obj.service_category_id:
             return obj.service_category.name
+        return None
+
+    def get_category_asset_name(self, obj):
+        if obj.category_asset_id:
+            return obj.category_asset.name
+        return None
         return None
