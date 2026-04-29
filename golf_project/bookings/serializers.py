@@ -265,4 +265,3 @@ class BookingSerializer(serializers.ModelSerializer):
         if obj.category_asset_id:
             return obj.category_asset.name
         return None
-        return None
