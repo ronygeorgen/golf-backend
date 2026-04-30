@@ -1184,11 +1184,20 @@ class BookingViewSet(viewsets.ModelViewSet):
                 if is_closed:
                     raise serializers.ValidationError(closed_message or "The facility is closed during this time.")
                 
+                # Dynamic category bookings (needs_staff=True asset) do NOT use simulator bays —
+                # the category asset IS the physical space.  Skip bay assignment entirely.
+                _category_asset_obj = booking_data.get('category_asset')
+                _is_dynamic_category_booking = bool(_category_asset_obj and getattr(_category_asset_obj, 'needs_staff', False))
+
                 # Find available bay (Coaching Bay first, then Simulator Bay) using locking
                 # Order by is_coaching_bay DESC so we try coaching bays first, then by bay_number
-                candidate_sims_qs = Simulator.objects.filter(is_active=True).order_by('-is_coaching_bay', 'bay_number')
-                if location_id:
-                    candidate_sims_qs = candidate_sims_qs.filter(location_id=location_id)
+                # Only for legacy coaching bookings — skip for dynamic category asset bookings.
+                if _is_dynamic_category_booking:
+                    candidate_sims_qs = Simulator.objects.none()
+                else:
+                    candidate_sims_qs = Simulator.objects.filter(is_active=True).order_by('-is_coaching_bay', 'bay_number')
+                    if location_id:
+                        candidate_sims_qs = candidate_sims_qs.filter(location_id=location_id)
                 
                 # Extract these before the atomic block so they are available throughout
                 coach = booking_data.get('coach')
@@ -1316,13 +1325,14 @@ class BookingViewSet(viewsets.ModelViewSet):
                                 "No coaching session slot available: all coaches are already booked for this time slot."
                             )
                     
-                    # --- Bay assignment ---
+                    # --- Bay assignment (legacy coaching only) ---
+                    # Dynamic category bookings skip this entirely — the asset is the venue.
                     for simulator in locked_sims:
                         if self._check_simulator_availability_atomic(simulator, start_time, end_time, use_locking=False):
                             assigned_simulator = simulator
                             break
-                    
-                    if not assigned_simulator:
+
+                    if not assigned_simulator and not _is_dynamic_category_booking:
                         raise serializers.ValidationError("No bay available for this coaching session (Coaching bays and Simulators are full for this time slot).")
 
                     # --- Coach-specific checks (within the same lock) ---
