@@ -34,6 +34,7 @@ def compute_category_slots(
     package=None,
     coach_id=None,
     asset_id=None,
+    duration_minutes=None,
 ):
     """
     Return a list of available time slots for a service category on a given date.
@@ -88,6 +89,7 @@ def compute_category_slots(
                 center_tz=center_tz,
                 location_id=location_id,
                 package=package,
+                duration_minutes=duration_minutes,
             )
         # needs_staff=True: continue into staff logic with this asset noted
 
@@ -382,7 +384,7 @@ def compute_category_slots(
 # Asset-based slot engine (needs_staff=False)
 # ---------------------------------------------------------------------------
 
-def _compute_asset_slots(asset, booking_date, day_of_week, center_tz, location_id, package=None):
+def _compute_asset_slots(asset, booking_date, day_of_week, center_tz, location_id, package=None, duration_minutes=None):
     """
     Generate available slots for a single needs_staff=False CategoryAsset.
 
@@ -404,9 +406,12 @@ def _compute_asset_slots(asset, booking_date, day_of_week, center_tz, location_i
     from admin_panel.models import ClosedDay
     from special_events.models import SpecialEvent
 
-    duration_minutes = 60
-    if package is not None and hasattr(package, 'session_duration_minutes'):
-        duration_minutes = package.session_duration_minutes or 60
+    # Resolution order: explicit caller override → package → default 60
+    if duration_minutes is None:
+        if package is not None and hasattr(package, 'session_duration_minutes'):
+            duration_minutes = package.session_duration_minutes or 60
+        else:
+            duration_minutes = 60
 
     # Load the asset's weekly availability for this day
     avail_windows = list(

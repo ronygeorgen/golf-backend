@@ -301,6 +301,10 @@ class CategorySlotsView(APIView):
         asset_id = request.query_params.get('asset_id')
         asset_id = int(asset_id) if asset_id and str(asset_id).isdigit() else None
 
+        # Optional duration override (used for asset-only bookings, mirrors simulator behaviour)
+        duration_raw = request.query_params.get('duration')
+        duration_minutes = int(duration_raw) if duration_raw and str(duration_raw).isdigit() else None
+
         from .availability import compute_category_slots
         slots = compute_category_slots(
             category_id=category.pk,
@@ -309,6 +313,7 @@ class CategorySlotsView(APIView):
             package=package,
             coach_id=int(coach_id) if coach_id else None,
             asset_id=asset_id,
+            duration_minutes=duration_minutes,
         )
 
         resp = {
