@@ -51,7 +51,7 @@ class CouponUsageSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'coupon', 'coupon_code', 'user', 'user_name',
             'customer_email', 'customer_phone',
-            'payment_id', 'payment_type',
+            'payment_id', 'payment_type', 'item_label',
             'discount_amount', 'original_amount', 'final_amount',
             'used_at',
         ]

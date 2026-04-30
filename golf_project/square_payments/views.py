@@ -118,6 +118,76 @@ def _finalize_simulator_booking(temp_id_str: str, payment_id: str):
     return {'booking_ids': [b.id for b in created_bookings], 'bookings': booking_serializer.data}
 
 
+def _finalize_asset_booking(temp_id_str: str, payment_id: str):
+    """Look up TempBooking by temp_id and convert it into a real Booking for generic asset."""
+    from bookings.models import TempBooking, Booking
+    from bookings.serializers import BookingSerializer
+    from users.models import User
+    from django.utils import timezone
+
+    temp_id = uuid.UUID(temp_id_str)
+    temp_booking = TempBooking.objects.select_for_update().get(temp_id=temp_id)
+
+    if temp_booking.status == 'completed':
+        existing = Booking.objects.filter(
+            client__phone=temp_booking.buyer_phone,
+            start_time=temp_booking.start_time,
+            end_time=temp_booking.end_time,
+            category_asset=temp_booking.category_asset
+        ).first()
+        return {'already_processed': True, 'booking_id': existing.id if existing else None}
+
+    if temp_booking.is_expired:
+        temp_booking.status = 'expired'
+        temp_booking.save(update_fields=['status'])
+        raise ValueError('Temporary booking has expired.')
+
+    buyer = User.objects.get(phone=temp_booking.buyer_phone)
+    location_id = temp_booking.location_id or getattr(buyer, 'ghl_location_id', None)
+
+    # Atomic conflict check
+    conflict = Booking.objects.filter(
+        category_asset=temp_booking.category_asset,
+        start_time__lt=temp_booking.end_time,
+        end_time__gt=temp_booking.start_time,
+        status__in=['confirmed', 'completed'],
+    ).exists()
+    
+    if conflict:
+        temp_booking.status = 'cancelled'
+        temp_booking.save(update_fields=['status'])
+        raise ValueError('This asset slot has already been taken by another booking.')
+
+    # Create the real Booking
+    booking = Booking.objects.create(
+        client=buyer,
+        location_id=location_id,
+        booking_type='coaching', 
+        service_category=temp_booking.service_category,
+        category_asset=temp_booking.category_asset,
+        start_time=temp_booking.start_time,
+        end_time=temp_booking.end_time,
+        duration_minutes=temp_booking.duration_minutes,
+        total_price=temp_booking.total_price,
+        status='confirmed'
+    )
+
+    temp_booking.payment_id = payment_id
+    temp_booking.status = 'completed'
+    temp_booking.processed_at = timezone.now()
+    temp_booking.save(update_fields=['payment_id', 'status', 'processed_at'])
+
+    try:
+        from ghl.tasks import update_user_ghl_custom_fields_task
+        update_user_ghl_custom_fields_task.delay(buyer.id, location_id=location_id)
+    except Exception as exc:
+        logger.warning("Failed to queue GHL update after Square asset booking: %s", exc)
+
+    booking_serializer = BookingSerializer(booking)
+    logger.info(f"Square: Asset booking created: {booking.id}")
+    return {'booking_id': booking.id, 'booking': booking_serializer.data}
+
+
 # ---------------------------------------------------------------------------
 # Helper: finalize a package purchase
 # ---------------------------------------------------------------------------
@@ -205,17 +275,40 @@ class InitiateSquarePaymentView(APIView):
             return Response({'error': 'source_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
         if not temp_id_str:
             return Response({'error': 'temp_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
-        if payment_type not in ('simulator', 'package', 'event'):
-            return Response({'error': 'payment_type must be simulator, package, or event.'}, status=status.HTTP_400_BAD_REQUEST)
+        if payment_type not in ('simulator', 'package', 'event', 'asset') and not (payment_type and payment_type.startswith('asset:')):
+            return Response({'error': 'payment_type must be simulator, package, event, asset, or asset:ID.'}, status=status.HTTP_400_BAD_REQUEST)
         if amount is None:
             return Response({'error': 'amount is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # ── Resolve Item Label for CouponUsage Tracking ───────────────────────
+        item_label = ""
+        try:
+            if payment_type == 'simulator':
+                item_label = "Simulator Booking"
+            elif payment_type == 'package':
+                from coaching.models import TempPurchase
+                tp = TempPurchase.objects.filter(temp_id=temp_id_str).first()
+                if tp:
+                    item_label = tp.package.title if tp.package else (tp.simulator_package.title if tp.simulator_package else "Package Purchase")
+            elif payment_type == 'event':
+                from special_events.models import TempEventRegistration
+                ter = TempEventRegistration.objects.filter(temp_id=temp_id_str).first()
+                if ter and ter.occurrence:
+                    item_label = f"Event: {ter.occurrence.event.title}"
+            elif payment_type == 'asset' or (payment_type and payment_type.startswith('asset:')):
+                from bookings.models import TempBooking
+                tb = TempBooking.objects.filter(temp_id=temp_id_str).first()
+                if tb and tb.category_asset:
+                    item_label = f"Asset: {tb.category_asset.name}"
+                else:
+                    item_label = "Generic Asset Booking"
+        except Exception as e:
+            logger.warning(f"Failed to resolve item_label for coupon usage: {e}")
 
         try:
             original_amount = float(amount)
         except (ValueError, TypeError):
             return Response({'error': 'Invalid amount.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        # ── Coupon validation ────────────────────────────────────────────────
         coupon_obj = None
         discount_amount = 0.0
         final_amount = original_amount
@@ -281,6 +374,7 @@ class InitiateSquarePaymentView(APIView):
                 discount_amount=discount_amount,
                 original_amount=original_amount,
                 final_amount=final_amount,
+                item_label=item_label,
             )
             # Increment usage counter atomically
             Coupon.objects.filter(pk=coupon_obj.pk).update(uses_count=models.F('uses_count') + 1)
@@ -292,6 +386,8 @@ class InitiateSquarePaymentView(APIView):
                 result = _finalize_simulator_booking(temp_id_str, payment_id)
             elif payment_type == 'package':
                 result = _finalize_package_purchase(temp_id_str, payment_id)
+            elif payment_type == 'asset' or (payment_type and payment_type.startswith('asset:')):
+                result = _finalize_asset_booking(temp_id_str, payment_id)
             else:
                 result = _finalize_event_registration(temp_id_str, payment_id)
         except Exception as exc:
@@ -385,6 +481,8 @@ class SquareWebhookView(APIView):
                     _finalize_simulator_booking(temp_id_str, payment_id)
                 elif payment_type == 'package':
                     _finalize_package_purchase(temp_id_str, payment_id)
+                elif payment_type == 'asset' or (payment_type and payment_type.startswith('asset:')):
+                    _finalize_asset_booking(temp_id_str, payment_id)
                 elif payment_type == 'event':
                     _finalize_event_registration(temp_id_str, payment_id)
                 else:

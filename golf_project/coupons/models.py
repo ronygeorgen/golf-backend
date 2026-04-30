@@ -10,10 +10,10 @@ class Coupon(models.Model):
     )
 
     APPLICABLE_CHOICES = (
-        ('all', 'All Services'),
         ('simulator', 'Simulator Bookings'),
         ('package', 'Package Purchases'),
         ('event', 'Special Event Registrations'),
+        ('asset', 'Generic Asset Bookings'),
     )
 
     code = models.CharField(max_length=50, unique=True, db_index=True)
@@ -21,7 +21,11 @@ class Coupon(models.Model):
     discount_type = models.CharField(max_length=20, choices=DISCOUNT_TYPES, default='percentage')
     discount_value = models.DecimalField(max_digits=10, decimal_places=2)
     
-    applicable_to = models.CharField(max_length=20, choices=APPLICABLE_CHOICES, default='all')
+    applicable_to = models.CharField(
+        max_length=255,
+        default='all',
+        help_text="Comma-separated list of applicable types (simulator, package, event, asset) or 'all'."
+    )
 
     max_uses = models.PositiveIntegerField(null=True, blank=True, help_text="Total times this coupon can be used.")
     uses_count = models.PositiveIntegerField(default=0)
@@ -54,9 +58,34 @@ class Coupon(models.Model):
             return False, "This coupon has reached its maximum usage limit."
 
         # Purpose check
-        if payment_type and self.applicable_to != 'all' and self.applicable_to != payment_type:
+        if payment_type and self.applicable_to != 'all':
+            allowed_types = [t.strip() for t in self.applicable_to.split(',') if t.strip()]
+            
+            # 1. Exact match (e.g. 'simulator' in ['simulator', 'package'])
+            if payment_type in allowed_types:
+                return True, ""
+            
+            # 2. General 'asset' match for specific asset requests (e.g. 'asset:5' matches 'asset')
+            if payment_type.startswith('asset:') and 'asset' in allowed_types:
+                return True, ""
+            
+            # 3. None match
             purpose_map = dict(self.APPLICABLE_CHOICES)
-            return False, f"This coupon is only valid for {purpose_map.get(self.applicable_to)}."
+            # If it's a specific asset, try to find a nice label if it's in the allowed list
+            allowed_labels = []
+            for t in allowed_types:
+                if t.startswith('asset:'):
+                    try:
+                        from categories.models import CategoryAsset
+                        asset_id = t.split(':')[1]
+                        asset_obj = CategoryAsset.objects.get(id=asset_id)
+                        allowed_labels.append(f"Asset: {asset_obj.name}")
+                    except Exception:
+                        allowed_labels.append(purpose_map.get(t, t))
+                else:
+                    allowed_labels.append(purpose_map.get(t, t))
+
+            return False, f"This coupon is only valid for: {', '.join(allowed_labels)}."
 
         # Per-user limit check (if info provided)
         if self.per_user_limit:
@@ -102,6 +131,7 @@ class CouponUsage(models.Model):
     discount_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     original_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
     final_amount = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    item_label = models.CharField(max_length=255, blank=True, help_text="Specific item name (e.g. Package Title)")
     used_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

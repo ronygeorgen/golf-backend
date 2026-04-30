@@ -76,7 +76,41 @@ class CouponUsageListView(APIView):
     permission_classes = [IsAuthenticated, IsAdminUser]
 
     def get(self, request):
-        usages = CouponUsage.objects.select_related('coupon', 'user').order_by('-used_at')
+        usages = CouponUsage.objects.select_related('coupon', 'user').all()
+        
+        # Apply filters from query params
+        user_query = request.query_params.get('user')
+        if user_query:
+            from django.db.models import Q
+            usages = usages.filter(
+                Q(user__first_name__icontains=user_query) |
+                Q(user__last_name__icontains=user_query) |
+                Q(customer_email__icontains=user_query) |
+                Q(customer_phone__icontains=user_query)
+            )
+
+        coupon_query = request.query_params.get('coupon')
+        if coupon_query:
+            usages = usages.filter(coupon__code__icontains=coupon_query)
+
+        purpose = request.query_params.get('purpose')
+        if purpose:
+            # Handles both exact matches and prefix matches (e.g. 'asset' matches 'asset:3')
+            usages = usages.filter(payment_type__icontains=purpose)
+
+        start_date = request.query_params.get('start_date')
+        if start_date:
+            usages = usages.filter(used_at__date__gte=start_date)
+
+        end_date = request.query_params.get('end_date')
+        if end_date:
+            usages = usages.filter(used_at__date__lte=end_date)
+
+        label = request.query_params.get('label')
+        if label:
+            usages = usages.filter(item_label__icontains=label)
+
+        usages = usages.order_by('-used_at')
         serializer = CouponUsageSerializer(usages, many=True)
         return Response(serializer.data)
 

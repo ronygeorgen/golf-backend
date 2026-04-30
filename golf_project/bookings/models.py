@@ -111,14 +111,30 @@ class TempBooking(models.Model):
     simulator = models.ForeignKey(
         'simulators.Simulator',
         on_delete=models.CASCADE,
+        related_name='temp_bookings',
+        null=True,
+        blank=True
+    )
+    service_category = models.ForeignKey(
+        'categories.ServiceCategory',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='temp_bookings'
+    )
+    category_asset = models.ForeignKey(
+        'categories.CategoryAsset',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
         related_name='temp_bookings'
     )
     location_id = models.CharField(max_length=100, blank=True, null=True, help_text="GHL location ID for this temp booking")
     buyer_phone = models.CharField(max_length=15)
     start_time = models.DateTimeField()
     end_time = models.DateTimeField()
-    duration_minutes = models.IntegerField(help_text="Duration per simulator in minutes")
-    simulator_count = models.IntegerField(default=1, help_text="Number of simulators to book")
+    duration_minutes = models.IntegerField(help_text="Duration per simulator/asset in minutes")
+    simulator_count = models.IntegerField(default=1, help_text="Number of simulators or assets to book")
     total_price = models.DecimalField(max_digits=8, decimal_places=2)
     status = models.CharField(
         max_length=20,
@@ -160,8 +176,8 @@ class TempBooking(models.Model):
                 condition=Q(payment_id__isnull=False)
             ),
             models.Index(
-                fields=['simulator', 'start_time', 'end_time', 'status'],
-                name='tempbook_avail_check_idx'
+                fields=['start_time', 'end_time', 'status'],
+                name='tempbook_gen_avail_idx'
             ),
         ]
     

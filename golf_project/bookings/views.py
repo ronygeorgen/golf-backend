@@ -1113,11 +1113,41 @@ class BookingViewSet(viewsets.ModelViewSet):
                 _asset_obj = booking_data.get('category_asset')
                 _is_asset_only = _asset_obj is not None and not getattr(_asset_obj, 'needs_staff', True)
                 if _is_asset_only:
-                    location_id = get_location_id_from_request(self.request)
+                    total_price = booking_data.get('total_price', 0)
+                    # Redirect to Square if there's a price and it's not a staff manual booking
+                    if total_price > 0 and not admin_manual_booking:
+                        start_time = booking_data.get('start_time')
+                        end_time = booking_data.get('end_time')
+                        duration_minutes = int((end_time - start_time).total_seconds() / 60)
+                        
+                        temp_booking = TempBooking(
+                            service_category=booking_data.get('service_category'),
+                            category_asset=_asset_obj,
+                            location_id=location_id,
+                            buyer_phone=target_user.phone,
+                            start_time=start_time,
+                            end_time=end_time,
+                            duration_minutes=duration_minutes,
+                            total_price=total_price
+                        )
+                        temp_booking.save()
+                        
+                        # Asset-only bookings might not have a redirect_url, use a default or category-based one if available
+                        redirect_url = getattr(_asset_obj, 'redirect_url', None) or '/bookings'
+                        
+                        self._temp_booking_response = {
+                            'temp_id': str(temp_booking.temp_id),
+                            'redirect_url': redirect_url,
+                            'total_price': float(total_price),
+                            'payment_type': 'asset', # Generic asset booking
+                            'message': 'Temporary booking created for asset. Redirect to payment.'
+                        }
+                        return
+
                     booking_instance = serializer.save(
                         client=target_user,
                         location_id=location_id,
-                        total_price=booking_data.get('total_price', 0),
+                        total_price=total_price,
                     )
                     if location_id and not booking_instance.location_id:
                         booking_instance.location_id = location_id
