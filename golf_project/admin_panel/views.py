@@ -100,46 +100,47 @@ class StaffViewSet(viewsets.ModelViewSet):
         if user.role == 'superadmin':
             location_id = self.request.data.get('ghl_location_id')
             role = serializer.validated_data.get('role', 'admin')
-            # Superadmin can only create admin, not staff or client
-            if role != 'admin':
-                raise PermissionDenied("Superadmin can only create admin users.")
+            # Superadmin can create admin or staff
+            if role not in ['admin', 'staff']:
+                raise PermissionDenied("Superadmin can only create admin or staff users.")
             if location_id:
                 # Validate location exists
                 from ghl.models import GHLLocation
                 try:
                     GHLLocation.objects.get(location_id=location_id)
-                    serializer.save(ghl_location_id=location_id, role='admin')
+                    serializer.save(ghl_location_id=location_id, role=role)
                 except GHLLocation.DoesNotExist:
                     raise PermissionDenied(f"Location {location_id} does not exist.")
             else:
                 raise PermissionDenied("Location ID is required when creating admin.")
         else:
-            # Regular admin can only create staff (not admin) for their location
+            # Regular admin can create staff or admins for their location
             role = serializer.validated_data.get('role', 'staff')
-            if role == 'admin':
-                raise PermissionDenied("Regular admins can only create staff members, not admin users.")
             location_id = get_location_id_from_request(self.request)
             if location_id:
-                serializer.save(ghl_location_id=location_id, role='staff')
+                serializer.save(ghl_location_id=location_id, role=role)
             else:
-                serializer.save(role='staff')
+                serializer.save(role=role)
     
+    def update(self, request, *args, **kwargs):
+        if request.user.role == 'staff':
+            if 'role' in request.data:
+                target_user = self.get_object()
+                if request.data['role'] != target_user.role:
+                    raise PermissionDenied("Staff members cannot change user roles.")
+        return super().update(request, *args, **kwargs)
+    
+    def partial_update(self, request, *args, **kwargs):
+        if request.user.role == 'staff':
+            if 'role' in request.data:
+                target_user = self.get_object()
+                if request.data['role'] != target_user.role:
+                    raise PermissionDenied("Staff members cannot change user roles.")
+        return super().partial_update(request, *args, **kwargs)
+
     def perform_update(self, serializer):
-        """Limit regular admins from elevating users to admin role"""
-        user = self.request.user
-        
-        # If regular admin (not superadmin), ensure role is not changed to admin from something else
-        if user.role != 'superadmin':
-            role = serializer.validated_data.get('role')
-            target_user = self.get_object()
-            
-            if role == 'admin' and target_user.role != 'admin':
-                raise PermissionDenied("Regular admins cannot change user role to admin.")
-            
-            serializer.save()
-        else:
-            # Superadmin can update freely
-            serializer.save()
+        """Allow admins and superadmins to update roles"""
+        serializer.save()
     
     @action(detail=True, methods=['get', 'put'])
     def availability(self, request, pk=None):
@@ -1266,13 +1267,32 @@ class UserViewSet(viewsets.ModelViewSet):
              serializer.save()
 
     def update(self, request, *args, **kwargs):
-        if not (request.user.role == 'admin' or request.user.is_superuser):
-            raise PermissionDenied("Administrator privileges are required.")
+        if not (request.user.role in ['admin', 'staff'] or request.user.is_superuser):
+            raise PermissionDenied("Administrator or Staff privileges are required.")
+        
+        # Prevent staff from changing roles
+        if request.user.role == 'staff':
+            data = request.data.copy()
+            if 'role' in data:
+                # If they try to change the role, force it back to the current role
+                # or just strip it from the data if it's a partial update
+                target_user = self.get_object()
+                if data['role'] != target_user.role:
+                     raise PermissionDenied("Staff members cannot change user roles.")
+        
         return super().update(request, *args, **kwargs)
     
     def partial_update(self, request, *args, **kwargs):
-        if not (request.user.role == 'admin' or request.user.is_superuser):
-            raise PermissionDenied("Administrator privileges are required.")
+        if not (request.user.role in ['admin', 'staff'] or request.user.is_superuser):
+            raise PermissionDenied("Administrator or Staff privileges are required.")
+            
+        # Prevent staff from changing roles
+        if request.user.role == 'staff':
+            if 'role' in request.data:
+                target_user = self.get_object()
+                if request.data['role'] != target_user.role:
+                    raise PermissionDenied("Staff members cannot change user roles.")
+                    
         return super().partial_update(request, *args, **kwargs)
 
     def destroy(self, request, *args, **kwargs):
