@@ -202,16 +202,18 @@ class BookingViewSet(viewsets.ModelViewSet):
     
     def _check_special_event_conflict(self, start_time, end_time=None):
         """
-        Check if a datetime or range conflicts with any active special event.
+        Check if a datetime or range conflicts with any active facility-wide special event.
+        Asset-linked group events (category_asset__isnull=False) are excluded — they only
+        block their own asset, not simulator bays or coaching slots.
         Returns (has_conflict, event_title) tuple.
         """
         from special_events.models import SpecialEvent
-        
+
         location_id = get_location_id_from_request(self.request)
-        active_events = SpecialEvent.objects.filter(is_active=True)
+        active_events = SpecialEvent.objects.filter(is_active=True, category_asset__isnull=True)
         if location_id:
             active_events = active_events.filter(location_id=location_id)
-        
+
         for event in active_events:
             if end_time:
                 if event.conflicts_with_range(start_time, end_time):
@@ -2353,7 +2355,8 @@ class BookingViewSet(viewsets.ModelViewSet):
                 from special_events.models import SpecialEvent
                 # Get location_id once at the start (already retrieved at line 1943, but ensure it's in scope)
                 location_id = get_location_id_from_request(request)
-                active_events = SpecialEvent.objects.filter(is_active=True)
+                # Exclude asset-linked group events — they only block their own asset, not simulator bays
+                active_events = SpecialEvent.objects.filter(is_active=True, category_asset__isnull=True)
                 if location_id:
                     active_events = active_events.filter(location_id=location_id)
                 
@@ -2786,9 +2789,9 @@ class BookingViewSet(viewsets.ModelViewSet):
         available_slots_map = {}
         now = timezone.now()
         
-        # Prefetch special events for this day
+        # Prefetch facility-wide special events for this day (exclude asset-linked group events)
         from special_events.models import SpecialEvent
-        day_events = SpecialEvent.objects.filter(is_active=True)
+        day_events = SpecialEvent.objects.filter(is_active=True, category_asset__isnull=True)
         if location_id:
             day_events = day_events.filter(location_id=location_id)
         # Filter events that could potentially occur on this day OR next day (for UTC crossover)
@@ -3219,12 +3222,12 @@ class CreateTempBookingView(APIView):
                         status=status.HTTP_409_CONFLICT
                     )
 
-                # Check for special event conflict
+                # Check for facility-wide special event conflict (exclude asset group events)
                 from special_events.models import SpecialEvent
-                active_events = SpecialEvent.objects.filter(is_active=True)
+                active_events = SpecialEvent.objects.filter(is_active=True, category_asset__isnull=True)
                 if location_id:
                     active_events = active_events.filter(location_id=location_id)
-                
+
                 for event in active_events:
                     if event.conflicts_with_range(start_time_dt, end_time_dt):
                         return Response(
@@ -3941,7 +3944,8 @@ class GuestBookingCreateView(APIView):
             if is_closed:
                 return Response({'error': closure_msg or "Facility is closed."}, status=status.HTTP_400_BAD_REQUEST)
             
-            active_events = SpecialEvent.objects.filter(is_active=True)
+            # Exclude asset-linked group events — they only block their own asset, not simulator bays
+            active_events = SpecialEvent.objects.filter(is_active=True, category_asset__isnull=True)
             if target_loc_id:
                 active_events = active_events.filter(location_id=target_loc_id)
             for event in active_events:

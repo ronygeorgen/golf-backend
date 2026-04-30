@@ -97,15 +97,19 @@ class CategoryAssetAvailabilitySerializer(serializers.ModelSerializer):
 class CategoryAssetSerializer(serializers.ModelSerializer):
     availabilities = CategoryAssetAvailabilitySerializer(many=True, read_only=True)
     asset_count = serializers.SerializerMethodField()
+    category_name = serializers.SerializerMethodField()
 
     class Meta:
         model = CategoryAsset
         fields = (
-            'id', 'category', 'name', 'price_per_hour', 'needs_staff',
+            'id', 'category', 'category_name', 'name', 'price_per_hour', 'needs_staff',
             'is_active', 'sort_order', 'description', 'location_id',
             'created_at', 'updated_at', 'availabilities', 'asset_count',
         )
-        read_only_fields = ('id', 'created_at', 'updated_at', 'availabilities', 'asset_count')
+        read_only_fields = ('id', 'created_at', 'updated_at', 'availabilities', 'asset_count', 'category_name')
+
+    def get_category_name(self, obj):
+        return obj.category.name if obj.category_id else None
 
     def get_asset_count(self, obj):
         """Returns how many active bookings exist for this asset (for display purposes)."""

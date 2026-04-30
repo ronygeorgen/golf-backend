@@ -162,7 +162,8 @@ def compute_category_slots(
     )
 
     next_day = booking_date + timedelta(days=1)
-    day_events_qs = SpecialEvent.objects.filter(is_active=True)
+    # For staff-based slots: only facility-wide events block (exclude asset group events)
+    day_events_qs = SpecialEvent.objects.filter(is_active=True, category_asset__isnull=True)
     if location_id:
         day_events_qs = day_events_qs.filter(location_id=location_id)
     day_events = [
@@ -449,7 +450,15 @@ def _compute_asset_slots(asset, booking_date, day_of_week, center_tz, location_i
         )
     )
     next_day = booking_date + timedelta(days=1)
-    day_events_qs = SpecialEvent.objects.filter(is_active=True)
+    # Block on: (a) facility-wide events (category_asset is null), OR
+    #           (b) group events for THIS specific asset.
+    # Do NOT block on group events linked to OTHER assets.
+    from django.db.models import Q as DQ
+    day_events_qs = SpecialEvent.objects.filter(
+        is_active=True
+    ).filter(
+        DQ(category_asset__isnull=True) | DQ(category_asset=asset)
+    )
     if location_id:
         day_events_qs = day_events_qs.filter(location_id=location_id)
     day_events = [e for e in day_events_qs if e.get_occurrences(start_date=booking_date, end_date=next_day)]

@@ -15,7 +15,8 @@ class SpecialEventSerializer(serializers.ModelSerializer):
     user_registered = serializers.SerializerMethodField()
     user_registration_status = serializers.SerializerMethodField()
     next_occurrence_date = serializers.SerializerMethodField()
-    
+    category_asset_name = serializers.SerializerMethodField()
+
     class Meta:
         model = SpecialEvent
         fields = [
@@ -23,11 +24,17 @@ class SpecialEventSerializer(serializers.ModelSerializer):
             'start_time', 'end_time', 'max_capacity', 'is_active',
             'price', 'show_price', 'is_private', 'is_auto_enroll', 'location_id',
             'upfront_payment', 'redirect_url',
+            'category_asset', 'category_asset_name',
             'registered_count', 'showed_up_count', 'available_spots',
             'is_full', 'user_registered', 'user_registration_status',
             'next_occurrence_date', 'created_at', 'updated_at'
         ]
         read_only_fields = ['created_at', 'updated_at']
+
+    def get_category_asset_name(self, obj):
+        if obj.category_asset_id:
+            return obj.category_asset.name
+        return None
     
     def get_registered_count(self, obj):
         # Get the occurrence date from context if available (for upcoming events)
