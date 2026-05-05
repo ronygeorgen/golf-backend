@@ -98,13 +98,103 @@ class GHLOAuthCallbackView(APIView):
         print(f"🔍 DEBUG: code = {code}")
         print(f"🔍 DEBUG: locationId from query = {location_id}")
         
+        from django.http import HttpResponse
+
+        # HTML Templates for Success and Failure
+        def get_html_response(is_success, title, message, details=None):
+            status_icon = "✓" if is_success else "✕"
+            status_color = "#10b981" if is_success else "#ef4444"
+            bg_color = "#f0fdf4" if is_success else "#fef2f2"
+            
+            return f"""
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>{title}</title>
+                <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+                <style>
+                    body {{
+                        font-family: 'Inter', -apple-system, sans-serif;
+                        background-color: #f8fafc;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        height: 100vh;
+                        margin: 0;
+                        color: #1e293b;
+                    }}
+                    .card {{
+                        background: white;
+                        padding: 3rem;
+                        border-radius: 1.5rem;
+                        box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1), 0 8px 10px -6px rgba(0, 0, 0, 0.1);
+                        text-align: center;
+                        max-width: 450px;
+                        width: 90%;
+                        border: 1px solid #e2e8f0;
+                    }}
+                    .icon-container {{
+                        width: 80px;
+                        height: 80px;
+                        background-color: {bg_color};
+                        color: {status_color};
+                        border-radius: 50%;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        font-size: 40px;
+                        font-weight: bold;
+                        margin: 0 auto 2rem;
+                    }}
+                    h1 {{ font-size: 1.875rem; font-weight: 700; margin-bottom: 1rem; color: #0f172a; }}
+                    p {{ color: #64748b; line-height: 1.625; margin-bottom: 2rem; font-size: 1.125rem; }}
+                    .details {{ 
+                        background: #f1f5f9; 
+                        padding: 1rem; 
+                        border-radius: 0.75rem; 
+                        font-family: monospace; 
+                        font-size: 0.875rem; 
+                        color: #475569; 
+                        word-break: break-all;
+                        margin-bottom: 2rem;
+                    }}
+                    .btn {{
+                        display: inline-block;
+                        background: #0f172a;
+                        color: white;
+                        padding: 0.875rem 2rem;
+                        border-radius: 0.75rem;
+                        text-decoration: none;
+                        font-weight: 600;
+                        transition: transform 0.2s, background 0.2s;
+                    }}
+                    .btn:hover {{ background: #1e293b; transform: translateY(-1px); }}
+                </style>
+            </head>
+            <body>
+                <div class="card">
+                    <div class="icon-container">{status_icon}</div>
+                    <h1>{title}</h1>
+                    <p>{message}</p>
+                    {f'<div class="details">{details}</div>' if details else ''}
+                    <a href="javascript:window.close()" class="btn">Close Window</a>
+                    <div style="margin-top: 1.5rem; font-size: 0.875rem; color: #94a3b8;">
+                        You can safely close this tab now.
+                    </div>
+                </div>
+            </body>
+            </html>
+            """
+        
         if not code:
-            return Response(
-                {"error": "Authorization code is required"},
-                status=status.HTTP_400_BAD_REQUEST
+            return HttpResponse(
+                get_html_response(False, "Authentication Failed", "Authorization code is required."),
+                status=200 # Return 200 so they see the styled error page
             )
         
-        # Exchange code for tokens first (locationId comes in the response)
+        # Exchange code for tokens first
         client_id = getattr(settings, 'GHL_CLIENT_ID', '')
         client_secret = getattr(settings, 'GHL_CLIENT_SECRET', '')
         redirect_uri = getattr(settings, 'GHL_REDIRECTED_URI', '')
@@ -112,9 +202,9 @@ class GHLOAuthCallbackView(APIView):
         token_url = f"{base_url}/oauth/token"
         
         if not all([client_id, client_secret, redirect_uri]):
-            return Response(
-                {"error": "GHL OAuth configuration incomplete"},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            return HttpResponse(
+                get_html_response(False, "Config Error", "GHL OAuth configuration is incomplete on the server."),
+                status=200
             )
         
         payload = {
@@ -131,56 +221,34 @@ class GHLOAuthCallbackView(APIView):
             response = requests.post(token_url, data=payload, timeout=30)
             response.raise_for_status()
             token_data = response.json()
-            print(f"🔍 Token data locationId: {token_data.get('locationId')}")
-            print(f"🔍 Full token data keys: {token_data.keys()}")
         except requests.exceptions.HTTPError as exc:
             error_text = response.text if hasattr(response, 'text') else str(exc)
             logger.error("Failed to exchange OAuth code for tokens: %s - %s", exc, error_text, exc_info=True)
-            return Response(
-                {"error": "Failed to complete OAuth flow", "details": error_text},
-                status=status.HTTP_400_BAD_REQUEST
+            return HttpResponse(
+                get_html_response(False, "Authorization Failed", "Failed to complete the OAuth flow.", error_text),
+                status=200
             )
         except Exception as exc:
             logger.error("Failed to exchange OAuth code for tokens: %s", exc, exc_info=True)
-            return Response(
-                {"error": "Failed to complete OAuth flow"},
-                status=status.HTTP_502_BAD_GATEWAY
+            return HttpResponse(
+                get_html_response(False, "System Error", "An unexpected error occurred during processing."),
+                status=200
             )
         
-        # Get locationId from token response if not in query params
         if not location_id:
             location_id = token_data.get('locationId')
         
         if not location_id:
-            return Response(
-                {"error": "locationId not found in token response"},
-                status=status.HTTP_400_BAD_REQUEST
+            return HttpResponse(
+                get_html_response(False, "Integration Error", "Location ID not found in the response from GHL."),
+                status=200
             )
         
-        # Decode the access token to see what location it's actually for
-        access_token = token_data.get('access_token')
-        if access_token:
-            try:
-                import base64
-                import json as json_lib
-                token_parts = access_token.split('.')
-                if len(token_parts) >= 2:
-                    payload = token_parts[1]
-                    payload += '=' * (4 - len(payload) % 4)
-                    decoded = base64.urlsafe_b64decode(payload)
-                    token_payload = json_lib.loads(decoded)
-                    actual_location = token_payload.get('authClassId') or token_payload.get('primaryAuthClassId')
-                    print(f"🔍 ACTUAL LOCATION IN TOKEN: {actual_location}")
-                    print(f"🔍 LOCATION WE'RE SAVING TO: {location_id}")
-            except Exception as e:
-                print(f"🔍 Error decoding token in callback: {e}")
-        
-        # Get location name from GHL API (optional)
+        # Get location name from GHL API
         location_name = None
         try:
             access_token = token_data.get('access_token')
             if access_token:
-                # Try to get location name
                 location_info_url = f"{base_url}/locations/{location_id}"
                 headers = {
                     'Authorization': f'Bearer {access_token}',
@@ -193,7 +261,7 @@ class GHLOAuthCallbackView(APIView):
         except Exception as exc:
             logger.warning("Failed to fetch location name for %s: %s", location_id, exc)
         
-        # Save tokens to location
+        # Save tokens
         location, created = GHLLocation.objects.update_or_create(
             location_id=location_id,
             defaults={
@@ -207,23 +275,13 @@ class GHLOAuthCallbackView(APIView):
                     **token_data,
                     'scope': token_data.get('scope'),
                     'user_type': token_data.get('userType'),
-                    'company_id': token_data.get('companyId'),
-                    'user_id': token_data.get('userId'),
                 },
             }
         )
         
-        logger.info("OAuth tokens saved for location %s (created: %s)", location_id, created)
-        
-        return Response(
-            {
-                "message": "Authentication successful",
-                "location_id": location_id,
-                "location_name": location_name or location.company_name,
-                "token_stored": True,
-                "note": f"Use this location_id ({location_id}) in your login URL: ?location={location_id}",
-            },
-            status=status.HTTP_200_OK
+        return HttpResponse(
+            get_html_response(True, "Authentication Successful", f"GHL for '{location_name or location_id}' has been successfully integrated."),
+            status=200
         )
 
 
