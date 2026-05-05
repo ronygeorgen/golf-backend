@@ -52,7 +52,7 @@ class MemberListPagination(PageNumberPagination):
 def list_ghl_locations(request):
     """
     List all active GHL locations for signup dropdown.
-    Returns location_id and display name (company_name or location_id).
+    Returns location_id, display name, and logo_url.
     GET /api/auth/ghl-locations/
     """
     try:
@@ -62,10 +62,18 @@ def list_ghl_locations(request):
         location_list = []
         for location in locations:
             display_name = location.company_name if location.company_name else location.location_id
+            # Build absolute logo URL if one is set
+            logo_url = None
+            if location.logo:
+                try:
+                    logo_url = request.build_absolute_uri(location.logo.url)
+                except Exception:
+                    pass
             location_list.append({
                 'location_id': location.location_id,
                 'display_name': display_name,
                 'company_name': location.company_name or '',
+                'logo_url': logo_url,
             })
         
         return Response({
@@ -288,6 +296,18 @@ def verify_otp(request):
                 from golf_project.timezone_utils import get_center_timezone_name
                 location_timezone = get_center_timezone_name(resolved_location)
                 response_data['location_timezone'] = location_timezone
+
+                # Include the location logo URL for dynamic branding
+                try:
+                    from ghl.models import GHLLocation
+                    loc = GHLLocation.objects.get(location_id=resolved_location)
+                    if loc.logo:
+                        base_url = request.build_absolute_uri('/').rstrip('/')
+                        response_data['location_logo_url'] = base_url + loc.logo.url
+                    else:
+                        response_data['location_logo_url'] = None
+                except Exception:
+                    response_data['location_logo_url'] = None
                 
                 return Response(response_data)
             else:
@@ -654,12 +674,24 @@ def login(request):
         # Include location timezone for DST-aware display on the frontend
         from golf_project.timezone_utils import get_center_timezone_name
         location_timezone = get_center_timezone_name(getattr(user, 'ghl_location_id', None))
+
+        # Include the location logo URL for dynamic branding
+        location_logo_url = None
+        try:
+            from ghl.models import GHLLocation
+            loc = GHLLocation.objects.get(location_id=user.ghl_location_id)
+            if loc.logo:
+                base_url = request.build_absolute_uri('/').rstrip('/')
+                location_logo_url = base_url + loc.logo.url
+        except Exception:
+            pass
         
         return Response({
             'message': 'Login successful',
             'token': token.key,
             'user': UserSerializer(user).data,
             'location_timezone': location_timezone,
+            'location_logo_url': location_logo_url,
         }, status=status.HTTP_200_OK)
     
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)

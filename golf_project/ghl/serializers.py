@@ -4,7 +4,8 @@ from .models import GHLLocation
 
 class GHLLocationSerializer(serializers.ModelSerializer):
     is_token_valid = serializers.SerializerMethodField()
-    
+    logo_url = serializers.SerializerMethodField()
+
     class Meta:
         model = GHLLocation
         fields = [
@@ -12,6 +13,8 @@ class GHLLocationSerializer(serializers.ModelSerializer):
             'location_id',
             'company_name',
             'timezone',
+            'logo',
+            'logo_url',
             'status',
             'webhook_url',
             'webhook_secret',
@@ -24,20 +27,30 @@ class GHLLocationSerializer(serializers.ModelSerializer):
             'created_at',
         ]
         read_only_fields = [
-            'id', 'status', 'webhook_secret', 'token_expires_at', 
-            'is_token_valid', 'metadata', 'onboarded_at', 'created_at'
+            'id', 'status', 'webhook_secret', 'token_expires_at',
+            'is_token_valid', 'metadata', 'onboarded_at', 'created_at',
+            'logo_url',
         ]
         extra_kwargs = {
             'access_token': {'write_only': True},
             'refresh_token': {'write_only': True},
+            'logo': {'required': False},
         }
-    
+
     def get_is_token_valid(self, obj):
         return obj.is_token_valid()
+
+    def get_logo_url(self, obj):
+        """Return the absolute URL for the logo if it exists."""
+        if not obj.logo:
+            return None
+        request = self.context.get('request')
+        if request:
+            return request.build_absolute_uri(obj.logo.url)
+        return obj.logo.url
 
 
 class GHLOnboardSerializer(serializers.Serializer):
     location_id = serializers.CharField(max_length=100)
     company_name = serializers.CharField(max_length=255, required=False, allow_blank=True)
     webhook_url = serializers.CharField(required=False, allow_blank=True)
-

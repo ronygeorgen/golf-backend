@@ -429,7 +429,7 @@ def list_all_ghl_locations(request):
         raise PermissionDenied("Only superadmin can access this endpoint.")
     
     locations = GHLLocation.objects.all().order_by('company_name', 'location_id')
-    serializer = GHLLocationSerializer(locations, many=True)
+    serializer = GHLLocationSerializer(locations, many=True, context={'request': request})
     return Response({
         'locations': serializer.data,
         'count': locations.count(),
@@ -480,7 +480,7 @@ def update_ghl_location_company_name(request, location_id):
     
     location.save(update_fields=update_fields)
     
-    serializer = GHLLocationSerializer(location)
+    serializer = GHLLocationSerializer(location, context={'request': request})
     return Response({
         'message': 'Location settings updated successfully.',
         'location': serializer.data
@@ -520,9 +520,109 @@ def set_ghl_location_company_name(request):
     location.company_name = company_name
     location.save(update_fields=['company_name', 'updated_at'])
     
-    serializer = GHLLocationSerializer(location)
+    serializer = GHLLocationSerializer(location, context={'request': request})
     return Response({
         'message': 'Company name set successfully.',
         'location': serializer.data
     }, status=status.HTTP_200_OK)
 
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def upload_ghl_location_logo(request, location_id):
+    """
+    Upload (or replace) the logo for a GHL location.
+    Only superadmin can upload logos.
+    POST /api/ghlpage/admin/locations/<location_id>/logo/
+    Content-Type: multipart/form-data
+    Body: logo=<file>
+    Constraints enforced on the *frontend* before upload:
+      - Resized to 912×273 px via canvas
+      - Max size 1 MB
+    The backend also enforces the 1 MB limit as a safety net.
+    """
+    if request.user.role != 'superadmin':
+        raise PermissionDenied("Only superadmin can upload logos.")
+    
+    try:
+        location = GHLLocation.objects.get(location_id=location_id)
+    except GHLLocation.DoesNotExist:
+        return Response(
+            {'error': f'Location {location_id} does not exist.'},
+            status=status.HTTP_404_NOT_FOUND
+        )
+    
+    logo_file = request.FILES.get('logo')
+    if not logo_file:
+        return Response(
+            {'error': 'No logo file provided.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    # Enforce 1 MB size limit
+    MAX_SIZE = 1 * 1024 * 1024  # 1 MB
+    if logo_file.size > MAX_SIZE:
+        return Response(
+            {'error': 'Logo file must be smaller than 1 MB.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    # Validate that it is an image
+    allowed_types = ['image/png', 'image/jpeg', 'image/jpg', 'image/gif', 'image/webp']
+    if logo_file.content_type not in allowed_types:
+        return Response(
+            {'error': 'Logo must be an image (PNG, JPG, GIF, or WebP).'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    # Remove the old logo file from disk before saving new one
+    if location.logo:
+        import os
+        old_path = location.logo.path
+        if os.path.exists(old_path):
+            os.remove(old_path)
+    
+    location.logo = logo_file
+    location.save(update_fields=['logo', 'updated_at'])
+    
+    serializer = GHLLocationSerializer(location, context={'request': request})
+    return Response({
+        'message': 'Logo uploaded successfully.',
+        'location': serializer.data
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['DELETE'])
+@permission_classes([IsAuthenticated])
+def delete_ghl_location_logo(request, location_id):
+    """
+    Delete the logo for a GHL location.
+    Only superadmin can delete logos.
+    DELETE /api/ghlpage/admin/locations/<location_id>/logo/
+    """
+    if request.user.role != 'superadmin':
+        raise PermissionDenied("Only superadmin can delete logos.")
+    
+    try:
+        location = GHLLocation.objects.get(location_id=location_id)
+    except GHLLocation.DoesNotExist:
+        return Response(
+            {'error': f'Location {location_id} does not exist.'},
+            status=status.HTTP_404_NOT_FOUND
+        )
+    
+    if not location.logo:
+        return Response(
+            {'error': 'This location has no logo to delete.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    
+    import os
+    old_path = location.logo.path
+    if os.path.exists(old_path):
+        os.remove(old_path)
+    
+    location.logo = None
+    location.save(update_fields=['logo', 'updated_at'])
+    
+    return Response({'message': 'Logo deleted successfully.'}, status=status.HTTP_200_OK)

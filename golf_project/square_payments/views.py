@@ -259,7 +259,7 @@ class InitiateSquarePaymentView(APIView):
         "idempotency_key": "<optional UUID>"
       }
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [AllowAny]
 
     @transaction.atomic
     def post(self, request):
@@ -280,35 +280,49 @@ class InitiateSquarePaymentView(APIView):
         if amount is None:
             return Response({'error': 'amount is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # ── Resolve Item Label for CouponUsage Tracking ───────────────────────
+        # ── Resolve Item Label and Guest Info ────────────────────────────────
         item_label = ""
+        guest_phone = ""
+        guest_email = ""
+        
         try:
             if payment_type == 'simulator':
                 item_label = "Simulator Booking"
+                from bookings.models import TempBooking
+                tb = TempBooking.objects.filter(temp_id=temp_id_str).first()
+                if tb:
+                    guest_phone = tb.buyer_phone
             elif payment_type == 'package':
                 from coaching.models import TempPurchase
                 tp = TempPurchase.objects.filter(temp_id=temp_id_str).first()
                 if tp:
+                    guest_phone = tp.buyer_phone
                     item_label = tp.package.title if tp.package else (tp.simulator_package.title if tp.simulator_package else "Package Purchase")
             elif payment_type == 'event':
                 from special_events.models import TempEventRegistration
                 ter = TempEventRegistration.objects.filter(temp_id=temp_id_str).first()
-                if ter and ter.occurrence:
-                    item_label = f"Event: {ter.occurrence.event.title}"
+                if ter:
+                    guest_phone = ter.phone
+                    guest_email = ter.email
+                    if ter.occurrence:
+                        item_label = f"Event: {ter.occurrence.event.title}"
             elif payment_type == 'asset' or (payment_type and payment_type.startswith('asset:')):
                 from bookings.models import TempBooking
                 tb = TempBooking.objects.filter(temp_id=temp_id_str).first()
-                if tb and tb.category_asset:
-                    item_label = f"Asset: {tb.category_asset.name}"
-                else:
-                    item_label = "Generic Asset Booking"
+                if tb:
+                    guest_phone = tb.buyer_phone
+                    if tb.category_asset:
+                        item_label = f"Asset: {tb.category_asset.name}"
+                    else:
+                        item_label = "Generic Asset Booking"
         except Exception as e:
-            logger.warning(f"Failed to resolve item_label for coupon usage: {e}")
+            logger.warning(f"Failed to resolve item_label or guest info: {e}")
 
         try:
             original_amount = float(amount)
         except (ValueError, TypeError):
             return Response({'error': 'Invalid amount.'}, status=status.HTTP_400_BAD_REQUEST)
+        
         coupon_obj = None
         discount_amount = 0.0
         final_amount = original_amount
@@ -320,9 +334,13 @@ class InitiateSquarePaymentView(APIView):
             except Coupon.DoesNotExist:
                 return Response({'error': f'Coupon "{coupon_code}" is invalid.'}, status=status.HTTP_400_BAD_REQUEST)
 
-            email = getattr(request.user, 'email', None)
-            phone = getattr(request.user, 'phone', None)
-            valid, err = coupon_obj.is_valid(payment_type=payment_type, user=request.user, email=email, phone=phone)
+            # Determine identification for coupon validation (prefer authenticated user)
+            is_auth = request.user.is_authenticated
+            user_obj = request.user if is_auth else None
+            email = getattr(request.user, 'email', None) or guest_email
+            phone = getattr(request.user, 'phone', None) or guest_phone
+            
+            valid, err = coupon_obj.is_valid(payment_type=payment_type, user=user_obj, email=email, phone=phone)
             if not valid:
                 return Response({'error': err}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -333,15 +351,14 @@ class InitiateSquarePaymentView(APIView):
         # ── Charge Square ────────────────────────────────────────────────────
         amount_cents = int(round(final_amount * 100))
         if amount_cents <= 0:
-            amount_cents = 0  # Fully covered by coupon — skip Square charge if needed
-            # For now, guard against $0 charge (Square requires > 0)
+            amount_cents = 0  # Fully covered by coupon
             if amount_cents == 0:
                 return Response({'error': 'Fully discounted payments are not yet supported.'}, status=status.HTTP_400_BAD_REQUEST)
 
         metadata = {
             'temp_id': temp_id_str,
             'payment_type': payment_type,
-            'customer_phone': getattr(request.user, 'phone', ''),
+            'customer_phone': getattr(request.user, 'phone', None) or guest_phone or "",
         }
 
         try:
@@ -366,9 +383,9 @@ class InitiateSquarePaymentView(APIView):
             from coupons.models import CouponUsage
             CouponUsage.objects.create(
                 coupon=coupon_obj,
-                user=request.user,
-                customer_email=getattr(request.user, 'email', None),
-                customer_phone=getattr(request.user, 'phone', None),
+                user=request.user if request.user.is_authenticated else None,
+                customer_email=getattr(request.user, 'email', None) or guest_email or None,
+                customer_phone=getattr(request.user, 'phone', None) or guest_phone or None,
                 payment_id=payment_id,
                 payment_type=payment_type,
                 discount_amount=discount_amount,

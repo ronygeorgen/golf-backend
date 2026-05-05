@@ -11,7 +11,9 @@ from .views import (
     test_purchase_custom_field,
     list_all_ghl_locations,
     update_ghl_location_company_name,
-    set_ghl_location_company_name
+    set_ghl_location_company_name,
+    upload_ghl_location_logo,
+    delete_ghl_location_logo,
 )
 
 urlpatterns = [
@@ -26,6 +28,7 @@ urlpatterns = [
     # Superadmin endpoints for managing locations
     path('admin/locations/', list_all_ghl_locations, name='ghl-admin-locations-list'),
     path('admin/locations/<str:location_id>/company-name/', update_ghl_location_company_name, name='ghl-update-company-name'),
+    path('admin/locations/<str:location_id>/logo/', upload_ghl_location_logo, name='ghl-upload-logo'),
+    path('admin/locations/<str:location_id>/logo/delete/', delete_ghl_location_logo, name='ghl-delete-logo'),
     path('admin/locations/set-company-name/', set_ghl_location_company_name, name='ghl-set-company-name'),
 ]
-
