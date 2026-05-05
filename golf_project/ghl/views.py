@@ -75,6 +75,7 @@ class GHLOAuthAuthorizeView(APIView):
             'redirect_uri': redirect_uri,
             'scope': scope,
             'response_type': 'code',
+            'version_id': getattr(settings, 'GHL_VERSION_ID', '69b46b052d4af946d411ad35'),
         }
         
         auth_redirect_url = f"{auth_url}?{urlencode(params)}"
@@ -247,13 +248,15 @@ class GHLOnboardView(APIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
         
-        # Build authorization URL (same format as your old code)
+        # Build authorization URL
+        version_id = getattr(settings, 'GHL_VERSION_ID', '69b46b052d4af946d411ad35')
         auth_redirect_url = (
             f"{auth_url}?"
             f"response_type=code&"
             f"redirect_uri={redirect_uri}&"
             f"client_id={client_id}&"
-            f"scope={scope}"
+            f"scope={scope}&"
+            f"version_id={version_id}"
         )
         
         return redirect(auth_redirect_url)

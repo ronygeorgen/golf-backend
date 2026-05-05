@@ -226,7 +226,8 @@ GHL_CLIENT_SECRET = config("GHL_CLIENT_SECRET")
 GHL_REDIRECTED_URI = config("GHL_REDIRECTED_URI")
 GHL_SCOPE = 'contacts.readonly contacts.write locations.readonly locations/tags.readonly locations/tags.write locations/customValues.readonly locations/customValues.write conversations.readonly conversations.write locations/customFields.write locations/customFields.readonly'
 GHL_BASE_URL = "https://services.leadconnectorhq.com"
-GHL_AUTH_URL = "https://marketplace.leadconnectorhq.com/oauth/chooselocation"
+GHL_AUTH_URL = "https://marketplace.gohighlevel.com/v2/oauth/chooselocation"
+GHL_VERSION_ID = "69b46b052d4af946d411ad35"
 GHL_API_VERSION = config('GHL_API_VERSION', default='2021-07-28')
 GHL_DEFAULT_LOCATION = config('GHL_DEFAULT_LOCATION', default='')
 
