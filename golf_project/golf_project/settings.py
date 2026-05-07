@@ -220,6 +220,13 @@ SQUARE_WEBHOOK_SIGNATURE_KEY = config('SQUARE_WEBHOOK_SIGNATURE_KEY', default=''
 # Full public URL of the webhook endpoint (e.g. your ngrok URL) — must match Square Dashboard exactly
 SQUARE_WEBHOOK_URL = config('SQUARE_WEBHOOK_URL', default='')
 
+# Square OAuth (multi-tenant, per-location)
+# SQUARE_OAUTH_SECRET: Application Secret from Square Developer Dashboard → OAuth tab
+SQUARE_OAUTH_SECRET = config('SQUARE_OAUTH_SECRET', default='').strip()
+# SQUARE_OAUTH_REDIRECT_URI: must be registered exactly in Square Dashboard
+# e.g. https://performgolf.net/api/square/oauth/callback/
+SQUARE_OAUTH_REDIRECT_URI = config('SQUARE_OAUTH_REDIRECT_URI', default='').strip()
+
 # GHL Integration
 GHL_CLIENT_ID = config("GHL_CLIENT_ID")
 GHL_CLIENT_SECRET = config("GHL_CLIENT_SECRET")
@@ -248,13 +255,16 @@ if crontab:
         'refresh-ghl-tokens': {
             'task': 'ghl.tasks.refresh_ghl_tokens_task',
             'schedule': crontab(minute=0),  # Run every hour at minute 0
-            # Alternative schedules:
-            # 'schedule': crontab(minute='*/30'),  # Every 30 minutes
-            # 'schedule': crontab(hour=0, minute=0),  # Daily at midnight
         },
         'update-upcoming-booking-dates': {
             'task': 'ghl.tasks.update_upcoming_booking_dates_task',
             'schedule': crontab(minute='0'),  # Run every hour at minute 0
+        },
+        # Square OAuth token refresh — runs every hour, refreshes tokens
+        # expiring within 30 minutes across all connected locations.
+        'refresh-square-tokens': {
+            'task': 'square_payments.tasks.refresh_square_tokens_task',
+            'schedule': crontab(minute=30),  # Run at the half-hour mark each hour
         },
     }
 else:

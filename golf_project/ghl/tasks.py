@@ -2,6 +2,7 @@
 Celery tasks for GHL integration.
 """
 import logging
+from django.conf import settings
 
 try:
     from celery import shared_task
@@ -133,23 +134,22 @@ def refresh_ghl_tokens_task():
         from .models import GHLLocation
         from .services import GHLClient
         from django.utils import timezone
-        
+
         # Get all active locations that need token refresh
         active_locations = GHLLocation.objects.filter(
             status='active',
             refresh_token__isnull=False
         ).exclude(refresh_token='')
-        
+
         refreshed_count = 0
         failed_count = 0
-        
+
         for location in active_locations:
             try:
                 # Check if token needs refresh (within 5 minutes of expiry)
                 if location.needs_token_refresh():
                     logger.info("Refreshing token for location %s", location.location_id)
                     client = GHLClient(location_id=location.location_id)
-                    # This will automatically refresh the token
                     client._get_location()
                     refreshed_count += 1
                     logger.info("Successfully refreshed token for location %s", location.location_id)
@@ -158,14 +158,15 @@ def refresh_ghl_tokens_task():
             except Exception as exc:
                 logger.error("Failed to refresh token for location %s: %s", location.location_id, exc, exc_info=True)
                 failed_count += 1
-        
-        logger.info("Token refresh completed: %d refreshed, %d failed, %d skipped", 
-                   refreshed_count, failed_count, active_locations.count() - refreshed_count - failed_count)
-        
+
+        logger.info(
+            "Token refresh completed: %d refreshed, %d failed, %d skipped",
+            refreshed_count, failed_count, active_locations.count() - refreshed_count - failed_count,
+        )
         return {
             'refreshed': refreshed_count,
             'failed': failed_count,
-            'total_checked': active_locations.count()
+            'total_checked': active_locations.count(),
         }
     except Exception as exc:
         logger.error("Failed to run token refresh task: %s", exc, exc_info=True)
