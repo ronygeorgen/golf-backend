@@ -840,7 +840,10 @@ class InitiateSquarePaymentView(APIView):
             logger.info("Coupon %s applied: -%s → final=%s", coupon_code, discount_amount, final_amount)
 
         # ── Resolve per-location Square credentials ──────────────────────────
-        sq_access_token, sq_location_id = _resolve_square_credentials(temp_id_str, payment_type)
+        try:
+            sq_access_token, sq_location_id = _resolve_square_credentials(temp_id_str, payment_type)
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_402_PAYMENT_REQUIRED)
 
         # ── Charge Square ────────────────────────────────────────────────────
         amount_cents = int(round(final_amount * 100))
