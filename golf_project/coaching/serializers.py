@@ -24,10 +24,11 @@ class CoachingPackageSerializer(serializers.ModelSerializer):
     def get_category(self, obj):
         """
         Determine package category:
-        - 'coaching': coaching-only package (no simulator hours)
-        - 'combo': combo package (has simulator hours)
+        - 'coaching': coaching-only package
+        - 'combo': includes simulator hours (legacy) or category asset hours (dynamic)
         """
-        if obj.simulator_hours and float(obj.simulator_hours) > 0:
+        if (obj.simulator_hours and float(obj.simulator_hours) > 0) or \
+           (obj.category_hours and float(obj.category_hours) > 0):
             return 'combo'
         return 'coaching'
 
@@ -257,12 +258,23 @@ class CoachingPackagePurchaseSerializer(serializers.ModelSerializer):
         if simulator_hours_total is None or (request and getattr(request.user, 'role', None) == 'client'):
             attrs['simulator_hours_total'] = package.simulator_hours or 0
             simulator_hours_total = attrs['simulator_hours_total']
-        
+
         if simulator_hours_total < 0:
             raise serializers.ValidationError("simulator_hours_total cannot be negative.")
-        
+
         attrs['simulator_hours_remaining'] = simulator_hours_total
-        
+
+        # Set category asset hours from package
+        category_hours_total = attrs.get('category_hours_total')
+        if category_hours_total is None or (request and getattr(request.user, 'role', None) == 'client'):
+            attrs['category_hours_total'] = package.category_hours or 0
+            category_hours_total = attrs['category_hours_total']
+
+        if category_hours_total < 0:
+            raise serializers.ValidationError("category_hours_total cannot be negative.")
+
+        attrs['category_hours_remaining'] = category_hours_total
+
         # Set gift-related fields
         if purchase_type == 'gift':
             attrs['gift_status'] = 'pending'

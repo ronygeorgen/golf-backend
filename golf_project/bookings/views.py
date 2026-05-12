@@ -1113,13 +1113,98 @@ class BookingViewSet(viewsets.ModelViewSet):
                 _asset_obj = booking_data.get('category_asset')
                 _is_asset_only = _asset_obj is not None and not getattr(_asset_obj, 'needs_staff', True)
                 if _is_asset_only:
+                    use_prepaid_hours = booking_data.get('use_prepaid_hours', None)
                     total_price = booking_data.get('total_price', 0)
-                    # Redirect to Square if there's a price and it's not a staff manual booking
+                    start_time = booking_data.get('start_time')
+                    end_time = booking_data.get('end_time')
+                    duration_minutes = int((end_time - start_time).total_seconds() / 60)
+
+                    # ── Prepaid hours path ─────────────────────────────────────────
+                    if use_prepaid_hours is True:
+                        from decimal import Decimal
+                        redeemed_credit = None
+                        package_purchase = None
+                        hours_needed = Decimal(str(duration_minutes)) / Decimal('60')
+
+                        # Priority 1: category-specific hours on a purchase for this category
+                        _service_category = booking_data.get('service_category')
+                        _cat_id = _service_category.id if _service_category else None
+                        if _cat_id:
+                            cat_purchase = (
+                                CoachingPackagePurchase.objects
+                                .select_for_update()
+                                .filter(
+                                    client=target_user,
+                                    package__service_category_id=_cat_id,
+                                    category_hours_remaining__gte=hours_needed,
+                                    package_status='active',
+                                )
+                                .exclude(gift_status='pending')
+                                .order_by('purchased_at')
+                                .first()
+                            )
+                            if cat_purchase:
+                                cat_purchase.consume_category_hours(hours_needed)
+                                package_purchase = cat_purchase
+
+                        # Priority 2: simulator credits
+                        if not package_purchase:
+                            try:
+                                redeemed_credit = self._reserve_simulator_credit(
+                                    hours_needed, user=target_user, location_id=location_id
+                                )
+                            except serializers.ValidationError:
+                                # Priority 3: simulator/combo package hours
+                                try:
+                                    package_purchase = self._consume_package_simulator_hours(
+                                        duration_minutes=duration_minutes,
+                                        use_organization=True,
+                                        booking_start_time=start_time,
+                                        user=target_user,
+                                        location_id=location_id,
+                                    )
+                                except serializers.ValidationError:
+                                    pass
+
+                        if not redeemed_credit and not package_purchase:
+                            raise serializers.ValidationError("Insufficient pre-paid hours available.")
+
+                        booking_instance = serializer.save(
+                            client=target_user,
+                            location_id=location_id,
+                            total_price=Decimal('0.00'),
+                        )
+                        if location_id and not booking_instance.location_id:
+                            booking_instance.location_id = location_id
+                            booking_instance.save(update_fields=['location_id'])
+
+                        update_fields = ['total_price', 'updated_at']
+                        if redeemed_credit:
+                            booking_instance.simulator_credit_redemption = redeemed_credit
+                            update_fields.append('simulator_credit_redemption')
+                        elif package_purchase:
+                            if isinstance(package_purchase, SimulatorPackagePurchase):
+                                booking_instance.simulator_package_purchase = package_purchase
+                                update_fields.append('simulator_package_purchase')
+                            else:
+                                booking_instance.package_purchase = package_purchase
+                                update_fields.append('package_purchase')
+                        booking_instance.save(update_fields=update_fields)
+
+                        logger.info(
+                            f"Asset-only booking (prepaid): id={booking_instance.id}, "
+                            f"asset={_asset_obj.id}, client={target_user.phone}"
+                        )
+                        try:
+                            from ghl.tasks import update_user_ghl_custom_fields_task
+                            ghl_loc_id = location_id or getattr(target_user, 'ghl_location_id', None)
+                            update_user_ghl_custom_fields_task.delay(target_user.id, location_id=ghl_loc_id)
+                        except Exception as exc:
+                            logger.warning("Failed to queue GHL update after asset-only prepaid booking: %s", exc)
+                        return
+
+                    # ── Pay up front (Square) ──────────────────────────────────────
                     if total_price > 0 and not admin_manual_booking:
-                        start_time = booking_data.get('start_time')
-                        end_time = booking_data.get('end_time')
-                        duration_minutes = int((end_time - start_time).total_seconds() / 60)
-                        
                         temp_booking = TempBooking(
                             service_category=booking_data.get('service_category'),
                             category_asset=_asset_obj,
@@ -1131,19 +1216,18 @@ class BookingViewSet(viewsets.ModelViewSet):
                             total_price=total_price
                         )
                         temp_booking.save()
-                        
-                        # Asset-only bookings might not have a redirect_url, use a default or category-based one if available
+
                         redirect_url = getattr(_asset_obj, 'redirect_url', None) or '/bookings'
-                        
                         self._temp_booking_response = {
                             'temp_id': str(temp_booking.temp_id),
                             'redirect_url': redirect_url,
                             'total_price': float(total_price),
-                            'payment_type': 'asset', # Generic asset booking
+                            'payment_type': 'asset',
                             'message': 'Temporary booking created for asset. Redirect to payment.'
                         }
                         return
 
+                    # ── Free or admin booking ──────────────────────────────────────
                     booking_instance = serializer.save(
                         client=target_user,
                         location_id=location_id,

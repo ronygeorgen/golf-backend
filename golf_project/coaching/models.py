@@ -19,6 +19,12 @@ class CoachingPackage(models.Model):
         default=0, 
         help_text="Number of simulator hours included in this package (for simulator bookings)."
     )
+    category_hours = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        default=0,
+        help_text="Number of asset hours included for the linked dynamic service category (e.g. table tennis table time). Set > 0 to make this a combo package."
+    )
     redirect_url = models.URLField(max_length=500, blank=True, null=True, help_text="URL to redirect to after package purchase")
     is_active = models.BooleanField(default=True)
     is_tpi_assessment = models.BooleanField(default=False, help_text="If True, this package is categorized as a TPI Assessment package (non-transferable, personal use only)")
@@ -85,6 +91,18 @@ class CoachingPackagePurchase(models.Model):
         default=0,
         help_text="Remaining simulator hours in this purchase"
     )
+    category_hours_total = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        default=0,
+        help_text="Total category asset hours included in this purchase"
+    )
+    category_hours_remaining = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        default=0,
+        help_text="Remaining category asset hours in this purchase"
+    )
     notes = models.CharField(max_length=255, blank=True)
     
     # Gifting fields
@@ -120,8 +138,9 @@ class CoachingPackagePurchase(models.Model):
         verbose_name_plural = 'Coaching Package Purchases'
     
     def __str__(self):
-        hours_str = f", {self.simulator_hours_remaining}/{self.simulator_hours_total} hrs" if self.simulator_hours_total > 0 else ""
-        return f"{self.purchase_name} - {self.package.title} ({self.sessions_remaining}/{self.sessions_total} sessions{hours_str})"
+        sim_str = f", {self.simulator_hours_remaining}/{self.simulator_hours_total} sim hrs" if self.simulator_hours_total > 0 else ""
+        cat_str = f", {self.category_hours_remaining}/{self.category_hours_total} cat hrs" if self.category_hours_total > 0 else ""
+        return f"{self.purchase_name} - {self.package.title} ({self.sessions_remaining}/{self.sessions_total} sessions{sim_str}{cat_str})"
     
     def generate_gift_token(self):
         """Generate a unique gift claim token"""
@@ -134,7 +153,11 @@ class CoachingPackagePurchase(models.Model):
     
     @property
     def is_depleted(self):
-        return self.sessions_remaining <= 0 and self.simulator_hours_remaining <= 0
+        return (
+            self.sessions_remaining <= 0
+            and self.simulator_hours_remaining <= 0
+            and self.category_hours_remaining <= 0
+        )
     
     @property
     def is_gift_pending(self):
@@ -149,23 +172,26 @@ class CoachingPackagePurchase(models.Model):
             not self.is_gift_pending
         )
     
+    def _check_depleted(self):
+        """Mark package as completed when all resources are exhausted."""
+        if (
+            self.sessions_remaining == 0
+            and self.simulator_hours_remaining <= 0
+            and self.category_hours_remaining <= 0
+        ):
+            self.package_status = 'completed'
+
     def consume_session(self, count=1):
         if count < 1:
             raise ValueError("count must be at least 1")
         if self.sessions_remaining < count:
             raise ValueError("Not enough sessions remaining")
         self.sessions_remaining -= count
-        if self.sessions_remaining == 0 and self.simulator_hours_remaining <= 0:
-            self.package_status = 'completed'
+        self._check_depleted()
         self.save(update_fields=['sessions_remaining', 'package_status', 'updated_at'])
-    
+
     def consume_simulator_hours(self, hours):
-        """
-        Consume simulator hours from this purchase.
-        
-        Args:
-            hours: Decimal or float representing hours to consume
-        """
+        """Consume simulator hours from this purchase."""
         from decimal import Decimal
         hours = Decimal(str(hours))
         if hours <= 0:
@@ -173,9 +199,20 @@ class CoachingPackagePurchase(models.Model):
         if self.simulator_hours_remaining < hours:
             raise ValueError("Not enough simulator hours remaining")
         self.simulator_hours_remaining -= hours
-        if self.sessions_remaining == 0 and self.simulator_hours_remaining <= 0:
-            self.package_status = 'completed'
+        self._check_depleted()
         self.save(update_fields=['simulator_hours_remaining', 'package_status', 'updated_at'])
+
+    def consume_category_hours(self, hours):
+        """Consume category asset hours from this purchase."""
+        from decimal import Decimal
+        hours = Decimal(str(hours))
+        if hours <= 0:
+            raise ValueError("hours must be greater than 0")
+        if self.category_hours_remaining < hours:
+            raise ValueError("Not enough category hours remaining")
+        self.category_hours_remaining -= hours
+        self._check_depleted()
+        self.save(update_fields=['category_hours_remaining', 'package_status', 'updated_at'])
 
 
 class SessionTransfer(models.Model):
