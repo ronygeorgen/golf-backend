@@ -516,17 +516,20 @@ class BookingViewSet(viewsets.ModelViewSet):
         purchase.consume_session(1)
         return purchase
     
-    def _get_total_available_simulator_hours(self, use_organization=False, user=None, location_id=None):
+    def _get_total_available_simulator_hours(self, use_organization=False, user=None, location_id=None, category_id=None):
         """
         Get total available simulator hours from all sources:
         - Simulator credits
         - Combo packages (coaching packages with simulator hours)
         - Simulator-only packages
+        - Dynamic-category combo packages (coaching packages with category_hours, filtered by category_id)
         
         Args:
             use_organization: If True, also include organization packages where user is a member
             user: The user to check hours for (defaults to request.user)
             location_id: Location ID to filter by (defaults to request location_id)
+            category_id: If provided, also sum category_hours_remaining for purchases of packages
+                         belonging to this service category.
             
         Returns:
             Decimal: Total available hours
@@ -605,7 +608,37 @@ class BookingViewSet(viewsets.ModelViewSet):
             total=Sum('hours_remaining')
         )['total'] or Decimal('0')
         total += sim_hours
-        
+
+        # 4. Dynamic-category combo hours (category_hours_remaining) for the given category
+        if category_id:
+            cat_base_qs = CoachingPackagePurchase.objects.filter(
+                package__service_category_id=category_id,
+                category_hours_remaining__gt=0,
+                package_status='active',
+            ).exclude(gift_status='pending')
+
+            if location_id:
+                cat_base_qs = cat_base_qs.filter(
+                    Q(package__location_id=location_id) |
+                    Q(package__location_id__isnull=True)
+                )
+
+            if use_organization:
+                org_purchase_ids = OrganizationPackageMember.objects.filter(
+                    Q(phone=user.phone) | Q(user=user)
+                ).values_list('package_purchase_id', flat=True)
+                cat_purchases = cat_base_qs.filter(
+                    Q(client=user) |
+                    Q(id__in=org_purchase_ids, purchase_type='organization')
+                )
+            else:
+                cat_purchases = cat_base_qs.filter(client=user).exclude(purchase_type='organization')
+
+            cat_hours = cat_purchases.aggregate(
+                total=Sum('category_hours_remaining')
+            )['total'] or Decimal('0')
+            total += cat_hours
+
         return total
     
     def _consume_package_simulator_hours(self, duration_minutes, use_organization=False, booking_start_time=None, user=None, location_id=None):
@@ -1526,7 +1559,13 @@ class BookingViewSet(viewsets.ModelViewSet):
         use_organization = request.query_params.get('use_organization', 'false').lower() == 'true'
         target_user = request.user
         location_id = get_location_id_from_request(request)
-        
+        category_id = request.query_params.get('category_id')
+        if category_id:
+            try:
+                category_id = int(category_id)
+            except (ValueError, TypeError):
+                category_id = None
+
         # Admin/Staff/Superadmin can query for other users
         if request.user.role in ['admin', 'staff', 'superadmin']:
             user_id = request.query_params.get('user_id')
@@ -1535,11 +1574,12 @@ class BookingViewSet(viewsets.ModelViewSet):
                     target_user = User.objects.get(id=user_id)
                 except User.DoesNotExist:
                     return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
-        
+
         total_hours = self._get_total_available_simulator_hours(
-            use_organization=use_organization, 
+            use_organization=use_organization,
             user=target_user,
-            location_id=location_id
+            location_id=location_id,
+            category_id=category_id,
         )
         
         return Response({
