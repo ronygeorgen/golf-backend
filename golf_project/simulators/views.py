@@ -277,17 +277,37 @@ class SimulatorViewSet(viewsets.ModelViewSet):
                             except ValueError:
                                 end_time_obj = datetime.strptime('17:00', '%H:%M').time()
                         
-                        # Use update_or_create directly to handle uniqueness constraint properly
-                        # This avoids serializer validation issues with unique constraints
-                        availability, created = SimulatorAvailability.objects.update_or_create(
-                            simulator=simulator,
-                            day_of_week=day_of_week,
-                            start_time=start_time_obj,
-                            defaults={
-                                'end_time': end_time_obj,
-                            }
-                        )
-                        updated_availability.append(availability)
+                        entry_id = avail_data.get('id')
+                        if entry_id:
+                            # Update existing entry by ID — handles start_time/day_of_week
+                            # changes correctly without creating duplicate entries
+                            try:
+                                availability = SimulatorAvailability.objects.get(
+                                    id=int(entry_id), simulator=simulator
+                                )
+                                availability.day_of_week = day_of_week
+                                availability.start_time = start_time_obj
+                                availability.end_time = end_time_obj
+                                availability.save()
+                                updated_availability.append(availability)
+                            except SimulatorAvailability.DoesNotExist:
+                                # Entry doesn't exist with that ID — fall back to create
+                                availability, created = SimulatorAvailability.objects.update_or_create(
+                                    simulator=simulator,
+                                    day_of_week=day_of_week,
+                                    start_time=start_time_obj,
+                                    defaults={'end_time': end_time_obj}
+                                )
+                                updated_availability.append(availability)
+                        else:
+                            # New entry (no ID yet) — use update_or_create by day+time key
+                            availability, created = SimulatorAvailability.objects.update_or_create(
+                                simulator=simulator,
+                                day_of_week=day_of_week,
+                                start_time=start_time_obj,
+                                defaults={'end_time': end_time_obj}
+                            )
+                            updated_availability.append(availability)
                     except (ValueError, TypeError) as e:
                         print(f"Error processing availability data: {e}")
                         pass
