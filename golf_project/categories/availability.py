@@ -230,9 +230,9 @@ def compute_category_slots(
         # ── Availability windows ─────────────────────────────────────────── #
         # Resolution order (most-specific first):
         #   1. Day-specific availability for this category
-        #   2. Day-specific general availability (NULL category)
-        #   3. Recurring availability for this category
-        #   4. Recurring general availability (NULL category)
+        #   2. Recurring availability for this category
+        # No fallback to Coaching (NULL category) — each dynamic category
+        # must have its own availability configured.
         avails = list(
             StaffDayAvailability.objects.filter(
                 staff=coach,
@@ -242,26 +242,10 @@ def compute_category_slots(
         )
         if not avails:
             avails = list(
-                StaffDayAvailability.objects.filter(
-                    staff=coach,
-                    date=booking_date,
-                    service_category__isnull=True,
-                ).values('start_time', 'end_time')
-            )
-        if not avails:
-            avails = list(
                 StaffAvailability.objects.filter(
                     staff=coach,
                     day_of_week=day_of_week,
                     service_category_id=category_id,
-                ).values('start_time', 'end_time')
-            )
-        if not avails:
-            avails = list(
-                StaffAvailability.objects.filter(
-                    staff=coach,
-                    day_of_week=day_of_week,
-                    service_category__isnull=True,
                 ).values('start_time', 'end_time')
             )
         if avails:

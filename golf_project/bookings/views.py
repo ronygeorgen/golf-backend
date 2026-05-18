@@ -516,96 +516,114 @@ class BookingViewSet(viewsets.ModelViewSet):
         purchase.consume_session(1)
         return purchase
     
-    def _get_total_available_simulator_hours(self, use_organization=False, user=None, location_id=None):
+    def _get_total_available_simulator_hours(self, use_organization=False, user=None, location_id=None, category_id=None):
         """
-        Get total available simulator hours from all sources:
-        - Simulator credits
-        - Combo packages (coaching packages with simulator hours)
-        - Simulator-only packages
-        
+        Get total available pre-paid hours.
+
+        When category_id is provided (dynamic-category asset-only booking):
+            Returns only category_hours_remaining for purchases whose package
+            belongs to that service category.  Simulator credits/packages are
+            intentionally excluded — they are for golf-simulator bays only.
+
+        When category_id is None (simulator booking):
+            Returns the sum of simulator credits + combo-package simulator hours
+            + simulator-only package hours.
+
         Args:
             use_organization: If True, also include organization packages where user is a member
             user: The user to check hours for (defaults to request.user)
             location_id: Location ID to filter by (defaults to request location_id)
-            
+            category_id: Service-category ID for a dynamic-category asset booking.
+
         Returns:
             Decimal: Total available hours
         """
         from decimal import Decimal
         from users.utils import get_location_id_from_request
-        
+
         user = user or self.request.user
         location_id = location_id or get_location_id_from_request(self.request)
         total = Decimal('0')
-        
-        # 1. Simulator credits - filter by user's location_id
+
+        # ── Dynamic-category path: only category-specific hours ──────────────
+        if category_id:
+            cat_base_qs = CoachingPackagePurchase.objects.filter(
+                package__service_category_id=category_id,
+                category_hours_remaining__gt=0,
+                package_status='active',
+            ).exclude(gift_status='pending')
+
+            if location_id:
+                cat_base_qs = cat_base_qs.filter(
+                    Q(package__location_id=location_id) |
+                    Q(package__location_id__isnull=True)
+                )
+
+            if use_organization:
+                org_purchase_ids = OrganizationPackageMember.objects.filter(
+                    Q(phone=user.phone) | Q(user=user)
+                ).values_list('package_purchase_id', flat=True)
+                cat_purchases = cat_base_qs.filter(
+                    Q(client=user) |
+                    Q(id__in=org_purchase_ids, purchase_type='organization')
+                )
+            else:
+                cat_purchases = cat_base_qs.filter(client=user).exclude(purchase_type='organization')
+
+            total += cat_purchases.aggregate(
+                total=Sum('category_hours_remaining')
+            )['total'] or Decimal('0')
+            return total
+
+        # ── Simulator path: credits + combo simulator hours + simulator packages ──
+        # 1. Simulator credits
         credits_qs = SimulatorCredit.objects.filter(
             client=user,
             status=SimulatorCredit.Status.AVAILABLE
         )
-        # Filter credits by user's ghl_location_id matching the location_id
         if location_id:
             credits_qs = credits_qs.filter(client__ghl_location_id=location_id)
-        
-        credits = credits_qs.aggregate(total=Sum('hours_remaining'))['total'] or Decimal('0')
-        total += credits
-        
+        total += credits_qs.aggregate(total=Sum('hours_remaining'))['total'] or Decimal('0')
+
         # 2. Combo packages (coaching packages with simulator hours)
         base_qs = CoachingPackagePurchase.objects.filter(
             simulator_hours_remaining__gt=0,
             package_status='active'
         ).exclude(gift_status='pending')
-        
-        # Filter by package location_id
         if location_id:
             base_qs = base_qs.filter(
-                Q(package__location_id=location_id) | 
+                Q(package__location_id=location_id) |
                 Q(package__location_id__isnull=True)
             )
-        
         if use_organization:
             org_purchase_ids = OrganizationPackageMember.objects.filter(
                 Q(phone=user.phone) | Q(user=user)
             ).values_list('package_purchase_id', flat=True)
-            
             combo_purchases = base_qs.filter(
-                Q(client=user) | 
+                Q(client=user) |
                 Q(id__in=org_purchase_ids, purchase_type='organization')
             )
         else:
-            combo_purchases = base_qs.filter(
-                client=user
-            ).exclude(purchase_type='organization')
-        
-        combo_hours = combo_purchases.aggregate(
+            combo_purchases = base_qs.filter(client=user).exclude(purchase_type='organization')
+        total += combo_purchases.aggregate(
             total=Sum('simulator_hours_remaining')
         )['total'] or Decimal('0')
-        total += combo_hours
-        
+
         # 3. Simulator-only packages
         sim_base_qs = SimulatorPackagePurchase.objects.filter(
             hours_remaining__gt=0,
             package_status='active'
         ).exclude(gift_status='pending')
-        
-        # Filter by package location_id
         if location_id:
             sim_base_qs = sim_base_qs.filter(
-                Q(package__location_id=location_id) | 
+                Q(package__location_id=location_id) |
                 Q(package__location_id__isnull=True)
             )
-        
-        if use_organization:
-            # For simulator-only packages, check if user is the client
-            sim_purchases = sim_base_qs.filter(client=user)
-        else:
-            sim_purchases = sim_base_qs.filter(client=user)
-        
-        sim_hours = sim_purchases.aggregate(
+        sim_purchases = sim_base_qs.filter(client=user)
+        total += sim_purchases.aggregate(
             total=Sum('hours_remaining')
         )['total'] or Decimal('0')
-        total += sim_hours
-        
+
         return total
     
     def _consume_package_simulator_hours(self, duration_minutes, use_organization=False, booking_start_time=None, user=None, location_id=None):
@@ -1113,13 +1131,72 @@ class BookingViewSet(viewsets.ModelViewSet):
                 _asset_obj = booking_data.get('category_asset')
                 _is_asset_only = _asset_obj is not None and not getattr(_asset_obj, 'needs_staff', True)
                 if _is_asset_only:
+                    use_prepaid_hours = booking_data.get('use_prepaid_hours', None)
                     total_price = booking_data.get('total_price', 0)
-                    # Redirect to Square if there's a price and it's not a staff manual booking
+                    start_time = booking_data.get('start_time')
+                    end_time = booking_data.get('end_time')
+                    duration_minutes = int((end_time - start_time).total_seconds() / 60)
+
+                    # ── Prepaid hours path ─────────────────────────────────────────
+                    if use_prepaid_hours is True:
+                        from decimal import Decimal
+                        package_purchase = None
+                        hours_needed = Decimal(str(duration_minutes)) / Decimal('60')
+
+                        # Consume category-specific hours for this dynamic category.
+                        # Simulator credits/packages are intentionally NOT used here —
+                        # they are reserved for golf-simulator bay bookings only.
+                        _service_category = booking_data.get('service_category')
+                        _cat_id = _service_category.id if _service_category else None
+                        if _cat_id:
+                            cat_purchase = (
+                                CoachingPackagePurchase.objects
+                                .select_for_update()
+                                .filter(
+                                    client=target_user,
+                                    package__service_category_id=_cat_id,
+                                    category_hours_remaining__gte=hours_needed,
+                                    package_status='active',
+                                )
+                                .exclude(gift_status='pending')
+                                .order_by('purchased_at')
+                                .first()
+                            )
+                            if cat_purchase:
+                                cat_purchase.consume_category_hours(hours_needed)
+                                package_purchase = cat_purchase
+
+                        if not package_purchase:
+                            raise serializers.ValidationError("Insufficient pre-paid hours available.")
+
+                        booking_instance = serializer.save(
+                            client=target_user,
+                            location_id=location_id,
+                            total_price=Decimal('0.00'),
+                        )
+                        if location_id and not booking_instance.location_id:
+                            booking_instance.location_id = location_id
+                            booking_instance.save(update_fields=['location_id'])
+
+                        update_fields = ['total_price', 'updated_at']
+                        booking_instance.package_purchase = package_purchase
+                        update_fields.append('package_purchase')
+                        booking_instance.save(update_fields=update_fields)
+
+                        logger.info(
+                            f"Asset-only booking (prepaid): id={booking_instance.id}, "
+                            f"asset={_asset_obj.id}, client={target_user.phone}"
+                        )
+                        try:
+                            from ghl.tasks import update_user_ghl_custom_fields_task
+                            ghl_loc_id = location_id or getattr(target_user, 'ghl_location_id', None)
+                            update_user_ghl_custom_fields_task.delay(target_user.id, location_id=ghl_loc_id)
+                        except Exception as exc:
+                            logger.warning("Failed to queue GHL update after asset-only prepaid booking: %s", exc)
+                        return
+
+                    # ── Pay up front (Square) ──────────────────────────────────────
                     if total_price > 0 and not admin_manual_booking:
-                        start_time = booking_data.get('start_time')
-                        end_time = booking_data.get('end_time')
-                        duration_minutes = int((end_time - start_time).total_seconds() / 60)
-                        
                         temp_booking = TempBooking(
                             service_category=booking_data.get('service_category'),
                             category_asset=_asset_obj,
@@ -1131,19 +1208,18 @@ class BookingViewSet(viewsets.ModelViewSet):
                             total_price=total_price
                         )
                         temp_booking.save()
-                        
-                        # Asset-only bookings might not have a redirect_url, use a default or category-based one if available
+
                         redirect_url = getattr(_asset_obj, 'redirect_url', None) or '/bookings'
-                        
                         self._temp_booking_response = {
                             'temp_id': str(temp_booking.temp_id),
                             'redirect_url': redirect_url,
                             'total_price': float(total_price),
-                            'payment_type': 'asset', # Generic asset booking
+                            'payment_type': 'asset',
                             'message': 'Temporary booking created for asset. Redirect to payment.'
                         }
                         return
 
+                    # ── Free or admin booking ──────────────────────────────────────
                     booking_instance = serializer.save(
                         client=target_user,
                         location_id=location_id,
@@ -1442,7 +1518,13 @@ class BookingViewSet(viewsets.ModelViewSet):
         use_organization = request.query_params.get('use_organization', 'false').lower() == 'true'
         target_user = request.user
         location_id = get_location_id_from_request(request)
-        
+        category_id = request.query_params.get('category_id')
+        if category_id:
+            try:
+                category_id = int(category_id)
+            except (ValueError, TypeError):
+                category_id = None
+
         # Admin/Staff/Superadmin can query for other users
         if request.user.role in ['admin', 'staff', 'superadmin']:
             user_id = request.query_params.get('user_id')
@@ -1451,11 +1533,12 @@ class BookingViewSet(viewsets.ModelViewSet):
                     target_user = User.objects.get(id=user_id)
                 except User.DoesNotExist:
                     return Response({'error': 'User not found'}, status=status.HTTP_404_NOT_FOUND)
-        
+
         total_hours = self._get_total_available_simulator_hours(
-            use_organization=use_organization, 
+            use_organization=use_organization,
             user=target_user,
-            location_id=location_id
+            location_id=location_id,
+            category_id=category_id,
         )
         
         return Response({
