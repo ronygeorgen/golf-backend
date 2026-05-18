@@ -371,12 +371,7 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
                     status='reserved'
                 )
                 
-                redirect_url = event.redirect_url
-                if not redirect_url:
-                    return Response(
-                        {'error': 'This event requires upfront payment but no redirect URL is configured. Please contact support.'},
-                        status=status.HTTP_500_INTERNAL_SERVER_ERROR
-                    )
+                redirect_url = event.redirect_url or ''
                 
                 # Format redirect URL with params similar to simulator booking
                 # Note: simulator booking passes details as query params along with the url

@@ -62,9 +62,20 @@ class SpecialEvent(models.Model):
         help_text="URL to redirect to after event registration payment (if upfront_payment is True)"
     )
     
+    # When set, this is a group session for a specific asset (e.g. "Fitness Room A group class").
+    # It does NOT block simulator bays — only the linked asset is considered occupied.
+    category_asset = models.ForeignKey(
+        'categories.CategoryAsset',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='group_events',
+        help_text="Link to a category asset for asset-specific group sessions. Leave blank for facility-wide events."
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-    
+
     class Meta:
         ordering = ['date', 'start_time']
         verbose_name = 'Special Event'

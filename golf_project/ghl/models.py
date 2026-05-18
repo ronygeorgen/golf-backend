@@ -10,6 +10,12 @@ class GHLLocation(models.Model):
         default='America/Halifax',
         help_text="IANA timezone for this golf center (e.g. America/Halifax, America/Toronto, Asia/Dubai)"
     )
+    logo = models.ImageField(
+        upload_to='location_logos/',
+        null=True,
+        blank=True,
+        help_text="Company logo (912×273 recommended, max 1 MB)"
+    )
     status = models.CharField(max_length=50, blank=True)
     webhook_url = models.URLField(blank=True)
     webhook_secret = models.CharField(max_length=255, blank=True)

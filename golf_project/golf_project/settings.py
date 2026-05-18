@@ -42,6 +42,7 @@ INSTALLED_APPS = [
     'rest_framework.authtoken',
     'corsheaders',
     'bookings',
+    'categories',
     'users',
     'coaching',
     'simulators',
@@ -50,6 +51,8 @@ INSTALLED_APPS = [
     'special_events',
     'banners',
     'dashboard',
+    'square_payments',
+    'coupons',
 ]
 
 MIDDLEWARE = [
@@ -191,11 +194,38 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
 
 STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+
+# Media files (user-uploaded content, e.g. location logos)
+MEDIA_URL = '/media/'
+MEDIA_ROOT = BASE_DIR / 'media'
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# Square Payment Integration
+SQUARE_ENVIRONMENT = config('SQUARE_ENVIRONMENT', default='sandbox').strip().lower()
+
+if SQUARE_ENVIRONMENT == 'production':
+    SQUARE_APPLICATION_ID = config('SQUARE_APPLICATION_ID', default=config('SANDBOX_APPLICATION_ID', default='')).strip()
+    SQUARE_ACCESS_TOKEN = config('SQUARE_ACCESS_TOKEN', default=config('SANDBOX_ACCESS_TOKEN', default='')).strip()
+else:
+    SQUARE_APPLICATION_ID = config('SANDBOX_APPLICATION_ID', default='').strip()
+    SQUARE_ACCESS_TOKEN = config('SANDBOX_ACCESS_TOKEN', default='').strip()
+
+SQUARE_LOCATION_ID = config('SQUARE_LOCATION_ID', default='').strip()
+SQUARE_WEBHOOK_SIGNATURE_KEY = config('SQUARE_WEBHOOK_SIGNATURE_KEY', default='').strip()
+# Full public URL of the webhook endpoint (e.g. your ngrok URL) — must match Square Dashboard exactly
+SQUARE_WEBHOOK_URL = config('SQUARE_WEBHOOK_URL', default='')
+
+# Square OAuth (multi-tenant, per-location)
+# SQUARE_OAUTH_SECRET: Application Secret from Square Developer Dashboard → OAuth tab
+SQUARE_OAUTH_SECRET = config('SQUARE_OAUTH_SECRET', default='').strip()
+# SQUARE_OAUTH_REDIRECT_URI: must be registered exactly in Square Dashboard
+# e.g. https://performgolf.net/api/square/oauth/callback/
+SQUARE_OAUTH_REDIRECT_URI = config('SQUARE_OAUTH_REDIRECT_URI', default='').strip()
 
 # GHL Integration
 GHL_CLIENT_ID = config("GHL_CLIENT_ID")
@@ -204,6 +234,7 @@ GHL_REDIRECTED_URI = config("GHL_REDIRECTED_URI")
 GHL_SCOPE = 'contacts.readonly contacts.write locations.readonly locations/tags.readonly locations/tags.write locations/customValues.readonly locations/customValues.write conversations.readonly conversations.write locations/customFields.write locations/customFields.readonly'
 GHL_BASE_URL = "https://services.leadconnectorhq.com"
 GHL_AUTH_URL = "https://marketplace.leadconnectorhq.com/oauth/chooselocation"
+GHL_VERSION_ID = "69b46b052d4af946d411ad35"
 GHL_API_VERSION = config('GHL_API_VERSION', default='2021-07-28')
 GHL_DEFAULT_LOCATION = config('GHL_DEFAULT_LOCATION', default='')
 
@@ -224,13 +255,16 @@ if crontab:
         'refresh-ghl-tokens': {
             'task': 'ghl.tasks.refresh_ghl_tokens_task',
             'schedule': crontab(minute=0),  # Run every hour at minute 0
-            # Alternative schedules:
-            # 'schedule': crontab(minute='*/30'),  # Every 30 minutes
-            # 'schedule': crontab(hour=0, minute=0),  # Daily at midnight
         },
         'update-upcoming-booking-dates': {
             'task': 'ghl.tasks.update_upcoming_booking_dates_task',
             'schedule': crontab(minute='0'),  # Run every hour at minute 0
+        },
+        # Square OAuth token refresh — runs every hour, refreshes tokens
+        # expiring within 30 minutes across all connected locations.
+        'refresh-square-tokens': {
+            'task': 'square_payments.tasks.refresh_square_tokens_task',
+            'schedule': crontab(minute=30),  # Run at the half-hour mark each hour
         },
     }
 else:

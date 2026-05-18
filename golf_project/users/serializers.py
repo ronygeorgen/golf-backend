@@ -6,6 +6,9 @@ from datetime import datetime, time as dt_time
 from .models import User, StaffAvailability, StaffDayAvailability, StaffBlockedDate
 
 class UserSerializer(serializers.ModelSerializer):
+    # Phase D: category IDs this staff member is assigned to (empty list for non-staff)
+    assigned_category_ids = serializers.SerializerMethodField()
+
     class Meta:
         model = User
         fields = (
@@ -25,6 +28,7 @@ class UserSerializer(serializers.ModelSerializer):
             'ghl_contact_id',
             'date_of_birth',
             'calendar_color',
+            'assigned_category_ids',
         )
         read_only_fields = (
             'id',
@@ -35,10 +39,18 @@ class UserSerializer(serializers.ModelSerializer):
             'username',
             'ghl_location_id',
             'ghl_contact_id',
+            'assigned_category_ids',
         )
         extra_kwargs = {
             'date_of_birth': {'required': False, 'allow_null': True},
         }
+
+    def get_assigned_category_ids(self, obj):
+        if obj.role not in ('staff', 'admin'):
+            return []
+        return list(
+            obj.staff_categories.values_list('category_id', flat=True)
+        )
 
 class StaffSerializer(serializers.ModelSerializer):
     """Serializer for creating/updating staff members by admin - auto-generates username"""
@@ -304,10 +316,16 @@ class StaffAvailabilitySerializer(serializers.ModelSerializer):
     start_time = serializers.TimeField()
     end_time = serializers.TimeField()
     day_of_week = serializers.IntegerField()
-    
+    service_category_name = serializers.SerializerMethodField(read_only=True)
+
     class Meta:
         model = StaffAvailability
         fields = '__all__'
+
+    def get_service_category_name(self, obj):
+        if obj.service_category_id:
+            return obj.service_category.name
+        return None
     
     def to_representation(self, instance):
         """Return UTC times as-is (no conversion)"""
@@ -352,10 +370,16 @@ class StaffDayAvailabilitySerializer(serializers.ModelSerializer):
     start_time = serializers.TimeField()
     end_time = serializers.TimeField()
     date = serializers.DateField()
-    
+    service_category_name = serializers.SerializerMethodField(read_only=True)
+
     class Meta:
         model = StaffDayAvailability
         fields = '__all__'
+
+    def get_service_category_name(self, obj):
+        if obj.service_category_id:
+            return obj.service_category.name
+        return None
     
     def validate(self, attrs):
         """Check if the date/time is on a closed day"""
@@ -428,15 +452,22 @@ class StaffBlockedDateSerializer(serializers.ModelSerializer):
     staff_name = serializers.SerializerMethodField(read_only=True)
     created_by_name = serializers.SerializerMethodField(read_only=True)
     is_full_day_block = serializers.SerializerMethodField(read_only=True)
-    
+    service_category_name = serializers.SerializerMethodField(read_only=True)
+
     class Meta:
         model = StaffBlockedDate
         fields = [
-            'id', 'staff', 'staff_name', 'date', 
+            'id', 'staff', 'staff_name', 'date',
             'start_time', 'end_time', 'is_full_day_block',
-            'reason', 'created_at', 'created_by', 'created_by_name'
+            'reason', 'created_at', 'created_by', 'created_by_name',
+            'service_category', 'service_category_name',
         ]
         read_only_fields = ['id', 'created_at', 'created_by']
+
+    def get_service_category_name(self, obj):
+        if obj.service_category_id:
+            return obj.service_category.name
+        return None
     
     def get_staff_name(self, obj):
         """Return staff member's full name"""
