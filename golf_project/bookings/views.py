@@ -2672,6 +2672,161 @@ class BookingViewSet(viewsets.ModelViewSet):
         return Response(response_data)
     
     @action(detail=False, methods=['get'])
+    def find_next_available_slot(self, request):
+        """
+        Scan forward from *date* (exclusive) up to 30 days looking for the first
+        date that has a slot at preferred_time available for simulator booking.
+
+        Query params:
+            date            YYYY-MM-DD  start date (search begins on date+1)
+            duration        int         session length in minutes (default 60)
+            simulator_count int         bays needed (default 1)
+            preferred_time  HH:MM       desired start time in center's local timezone
+
+        Returns:
+            { found: true,  date, formatted_date, slot: {start_time, end_time, duration_minutes} }
+            { found: false }
+        """
+        from simulators.models import SimulatorAvailability
+        import pytz
+        from golf_project.timezone_utils import get_center_timezone
+
+        date_str        = request.query_params.get('date')
+        preferred_time  = request.query_params.get('preferred_time')
+
+        if not date_str or not preferred_time:
+            return Response(
+                {'error': 'date and preferred_time are required'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        try:
+            duration_minutes = int(request.query_params.get('duration', 60))
+            simulator_count  = int(request.query_params.get('simulator_count', 1))
+            pref_h, pref_m   = [int(x) for x in preferred_time.split(':')]
+            start_date       = datetime.strptime(date_str, '%Y-%m-%d').date()
+        except (ValueError, TypeError, AttributeError):
+            return Response({'error': 'Invalid parameters'}, status=status.HTTP_400_BAD_REQUEST)
+
+        location_id = get_location_id_from_request(request)
+        center_tz   = get_center_timezone(location_id)
+
+        # Active non-coaching simulators for this location
+        active_sims = Simulator.objects.filter(is_active=True, is_coaching_bay=False)
+        if location_id:
+            active_sims = active_sims.filter(location_id=location_id)
+        active_sims = list(active_sims.order_by('bay_number'))
+
+        if len(active_sims) < simulator_count:
+            return Response({'found': False})
+
+        from special_events.models import SpecialEvent
+        from admin_panel.models import ClosedDay
+
+        # Scan up to 30 days forward (start_date itself is excluded — user already checked it)
+        for day_offset in range(1, 31):
+            check_date  = start_date + timedelta(days=day_offset)
+            day_of_week = check_date.weekday()
+
+            # Does any active simulator have an availability window for this weekday?
+            sim_avails = SimulatorAvailability.objects.filter(
+                simulator__in=active_sims,
+                day_of_week=day_of_week
+            ).select_related('simulator')
+
+            if not sim_avails.exists():
+                continue
+
+            # Convert preferred_time to UTC for this specific date
+            try:
+                target_local = center_tz.localize(
+                    datetime(check_date.year, check_date.month, check_date.day, pref_h, pref_m)
+                )
+            except Exception:
+                continue
+
+            target_utc   = target_local.astimezone(pytz.UTC)
+            slot_end_utc = target_utc + timedelta(minutes=duration_minutes)
+
+            # Which simulators have an availability window that fully covers this slot?
+            valid_sims = []
+            for avail in sim_avails:
+                avail_start = center_tz.localize(datetime.combine(check_date, avail.start_time))
+                avail_end   = center_tz.localize(datetime.combine(check_date, avail.end_time))
+                if avail_end <= avail_start:          # crosses midnight
+                    avail_end += timedelta(days=1)
+                avail_end_utc = avail_end.astimezone(pytz.UTC)
+
+                if target_local >= avail_start and slot_end_utc <= avail_end_utc:
+                    valid_sims.append(avail.simulator)
+
+            if len(valid_sims) < simulator_count:
+                continue
+
+            # Facility closed?
+            is_closed, _ = ClosedDay.check_if_closed(target_utc, location_id=location_id)
+            if is_closed:
+                continue
+
+            # Special event conflict?
+            blocking_events = SpecialEvent.objects.filter(is_active=True, category_asset__isnull=True)
+            if location_id:
+                blocking_events = blocking_events.filter(location_id=location_id)
+            has_event = any(
+                event.get_occurrences(start_date=check_date, end_date=check_date) and
+                event.conflicts_with_range(target_utc, slot_end_utc)
+                for event in blocking_events
+            )
+            if has_event:
+                continue
+
+            # Booking / temp-booking conflicts per simulator
+            now_utc = timezone.now()
+            free_sims = []
+            for simulator in valid_sims:
+                booking_clash = Booking.objects.filter(
+                    simulator=simulator,
+                    start_time__lt=slot_end_utc,
+                    end_time__gt=target_utc,
+                    status__in=['confirmed', 'completed']
+                )
+                if location_id:
+                    booking_clash = booking_clash.filter(location_id=location_id)
+
+                temp_clash = TempBooking.objects.filter(
+                    simulator=simulator,
+                    start_time__lt=slot_end_utc,
+                    end_time__gt=target_utc,
+                    status='reserved',
+                    expires_at__gt=now_utc
+                )
+                if location_id:
+                    temp_clash = temp_clash.filter(location_id=location_id)
+
+                if not booking_clash.exists() and not temp_clash.exists():
+                    free_sims.append(simulator)
+
+            if len(free_sims) >= simulator_count:
+                # ✅ Found a valid date + slot
+                formatted = '{}, {} {}'.format(
+                    check_date.strftime('%A'),
+                    check_date.strftime('%B'),
+                    check_date.day  # plain int — no leading zero, cross-platform
+                )
+                return Response({
+                    'found': True,
+                    'date': check_date.strftime('%Y-%m-%d'),
+                    'formatted_date': formatted,
+                    'slot': {
+                        'start_time': target_utc.isoformat(),
+                        'end_time':   slot_end_utc.isoformat(),
+                        'duration_minutes': duration_minutes,
+                    },
+                })
+
+        return Response({'found': False})
+
+    @action(detail=False, methods=['get'])
     def check_coaching_availability(self, request):
         from users.models import User
         """Check available time slots for coaching booking"""
