@@ -1216,10 +1216,12 @@ class CreateTempPurchaseView(APIView):
             verify_purchase = TempPurchase.objects.get(temp_id=temp_purchase.temp_id)
             logger.info(f"Verified temp purchase exists in DB: temp_id={verify_purchase.temp_id}")
             
-            redirect_url = simulator_package.redirect_url if simulator_package else package.redirect_url
+            redirect_url = (simulator_package.redirect_url if simulator_package else package.redirect_url) or ''
             
-            # Add referral_id to redirect URL if provided
-            if referral_id:
+            # Add referral_id to redirect URL only if there is an actual URL to append to.
+            # Coaching packages migrated to Square have no redirect_url, so skip this block
+            # to avoid producing a malformed "?referral_id=3" string.
+            if referral_id and redirect_url:
                 from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
                 parsed = urlparse(redirect_url)
                 query_params = parse_qs(parsed.query)
