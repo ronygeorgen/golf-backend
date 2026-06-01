@@ -811,13 +811,16 @@ class InitiateSquarePaymentView(APIView):
             logger.warning("Failed to resolve item_label or guest info: %s", exc)
 
         try:
-            original_amount = float(amount)
+            original_amount = float(amount)  # Pre-tax base price sent by frontend
         except (ValueError, TypeError):
             return Response({'error': 'Invalid amount.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Nova Scotia HST rate (14%, effective April 1 2025: 5% federal GST + 9% provincial)
+        HST_RATE = 0.14
+
         coupon_obj = None
         discount_amount = 0.0
-        final_amount = original_amount
+        final_amount = original_amount  # post-coupon base (still pre-tax)
 
         if coupon_code:
             from coupons.models import Coupon, CouponUsage
@@ -836,8 +839,16 @@ class InitiateSquarePaymentView(APIView):
                 return Response({'error': err}, status=status.HTTP_400_BAD_REQUEST)
 
             discount_amount = coupon_obj.calculate_discount(original_amount)
-            final_amount = round(original_amount - discount_amount, 2)
-            logger.info("Coupon %s applied: -%s → final=%s", coupon_code, discount_amount, final_amount)
+            final_amount = round(original_amount - discount_amount, 2)  # post-coupon base, still pre-tax
+            logger.info("Coupon %s applied: -%s → discounted_base=%s", coupon_code, discount_amount, final_amount)
+
+        # ── Apply Nova Scotia HST (14%) on top of post-coupon base ───────────
+        tax_amount = round(final_amount * HST_RATE, 2)
+        final_amount_with_tax = round(final_amount + tax_amount, 2)
+        logger.info(
+            "HST 14%% applied: base=%s, tax=%s, total_with_tax=%s",
+            final_amount, tax_amount, final_amount_with_tax,
+        )
 
         # ── Resolve per-location Square credentials ──────────────────────────
         try:
@@ -845,8 +856,8 @@ class InitiateSquarePaymentView(APIView):
         except ValueError as exc:
             return Response({'error': str(exc)}, status=status.HTTP_402_PAYMENT_REQUIRED)
 
-        # ── Charge Square ────────────────────────────────────────────────────
-        amount_cents = int(round(final_amount * 100))
+        # ── Charge Square (tax-inclusive total) ───────────────────────────────
+        amount_cents = int(round(final_amount_with_tax * 100))
         if amount_cents <= 0:
             return Response({'error': 'Fully discounted payments are not yet supported.'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -862,7 +873,11 @@ class InitiateSquarePaymentView(APIView):
                 amount_cents=amount_cents,
                 currency=currency,
                 idempotency_key=idempotency_key,
-                note=f"Golf booking ({payment_type}){' | coupon:' + coupon_code if coupon_code else ''}",
+                note=(
+                    f"Golf booking ({payment_type})"
+                    f"{' | coupon:' + coupon_code if coupon_code else ''}"
+                    f" | HST 14%: ${tax_amount:.2f}"
+                ),
                 metadata=metadata,
                 access_token=sq_access_token,
                 location_id=sq_location_id,
@@ -887,7 +902,7 @@ class InitiateSquarePaymentView(APIView):
                 payment_type=payment_type,
                 discount_amount=discount_amount,
                 original_amount=original_amount,
-                final_amount=final_amount,
+                final_amount=final_amount_with_tax,  # tax-inclusive total actually charged
                 item_label=item_label,
             )
             from coupons.models import Coupon
@@ -931,6 +946,10 @@ class InitiateSquarePaymentView(APIView):
             'booking_status': 'confirmed',
             'coupon_applied': coupon_code or None,
             'discount_amount': discount_amount,
+            'base_amount': original_amount,
+            'tax_rate': 0.14,
+            'tax_amount': tax_amount,
+            'total_charged': final_amount_with_tax,
             'result': result,
         }, status=status.HTTP_201_CREATED)
 
