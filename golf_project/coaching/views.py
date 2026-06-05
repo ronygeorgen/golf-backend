@@ -9,7 +9,8 @@ from django.utils import timezone
 from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.pagination import PageNumberPagination
-from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
+from rest_framework import permissions
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -43,6 +44,18 @@ from django.db import transaction
 
 logger = logging.getLogger(__name__)
 
+
+class IsAdminOrSuperadminRole(permissions.BasePermission):
+    """JWT admin users may have role='admin' without Django is_staff."""
+
+    def has_permission(self, request, view):
+        user = request.user
+        if not user or not user.is_authenticated:
+            return False
+        role = getattr(user, 'role', '') or ''
+        return role in ('admin', 'superadmin') or getattr(user, 'is_superuser', False)
+
+
 class TenPerPagePagination(PageNumberPagination):
     page_size = 10
     page_size_query_param = 'page_size'
@@ -70,7 +83,7 @@ class CoachingPackageViewSet(viewsets.ModelViewSet):
         if self.action in ['list', 'retrieve', 'active_packages']:
             permission_classes = [AllowAny]  # Public access for viewing packages
         else:
-            permission_classes = [IsAuthenticated, IsAdminUser]  # Admin only for create/update/delete
+            permission_classes = [IsAuthenticated, IsAdminOrSuperadminRole]
         return [permission() for permission in permission_classes]
     
     def get_queryset(self):
@@ -1932,7 +1945,7 @@ class SimulatorPackageViewSet(viewsets.ModelViewSet):
         if self.action in ['list', 'retrieve', 'active_packages']:
             permission_classes = [AllowAny]  # Public access for viewing packages
         else:
-            permission_classes = [IsAuthenticated, IsAdminUser]  # Admin only for create/update/delete
+            permission_classes = [IsAuthenticated, IsAdminOrSuperadminRole]
         return [permission() for permission in permission_classes]
     
     def get_queryset(self):
