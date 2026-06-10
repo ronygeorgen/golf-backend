@@ -151,7 +151,9 @@ class StaffViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("You can only manage availability for staff in your location.")
 
         # Optional category scope: ?category_id=X  (omit or 0 = general / all)
-        raw_cat_id = request.query_params.get('category_id') or request.data.get('category_id')
+        raw_cat_id = request.query_params.get('category_id')
+        if not raw_cat_id and isinstance(request.data, dict):
+            raw_cat_id = request.data.get('category_id')
         category_id = int(raw_cat_id) if raw_cat_id and str(raw_cat_id).isdigit() else None
 
         if request.method == 'GET':
@@ -314,7 +316,9 @@ class StaffViewSet(viewsets.ModelViewSet):
         if location_id and staff.ghl_location_id != location_id:
             raise PermissionDenied("You can only manage availability for staff in your location.")
 
-        raw_cat_id = request.query_params.get('category_id') or request.data.get('category_id')
+        raw_cat_id = request.query_params.get('category_id')
+        if not raw_cat_id and isinstance(request.data, dict):
+            raw_cat_id = request.data.get('category_id')
         category_id = int(raw_cat_id) if raw_cat_id and str(raw_cat_id).isdigit() else None
 
         if request.method == 'GET':
@@ -409,7 +413,9 @@ class StaffViewSet(viewsets.ModelViewSet):
         import pytz
 
         # Optional category scope: ?category_id=X (omit = general, i.e. NULL)
-        raw_cat_id = request.query_params.get('category_id') or request.data.get('category_id')
+        raw_cat_id = request.query_params.get('category_id')
+        if not raw_cat_id and isinstance(request.data, dict):
+            raw_cat_id = request.data.get('category_id')
         category_id = int(raw_cat_id) if raw_cat_id and str(raw_cat_id).isdigit() else None
 
         if request.method == 'GET':
