@@ -595,6 +595,8 @@ class SimulatorPackagePurchaseSerializer(serializers.ModelSerializer):
     client_details = UserSerializer(source='client', read_only=True)
     original_owner_details = UserSerializer(source='original_owner', read_only=True)
     recipient_name = serializers.SerializerMethodField()
+    is_membership = serializers.SerializerMethodField()
+    subscription_info = serializers.SerializerMethodField()
     
     class Meta:
         model = SimulatorPackagePurchase
@@ -621,6 +623,8 @@ class SimulatorPackagePurchaseSerializer(serializers.ModelSerializer):
             'gift_expires_at',
             'expiry_date',
             'referral_id',
+            'is_membership',
+            'subscription_info',
         ]
         read_only_fields = [
             'client', 'hours_remaining', 'purchased_at', 'updated_at',
@@ -636,6 +640,22 @@ class SimulatorPackagePurchaseSerializer(serializers.ModelSerializer):
             except User.DoesNotExist:
                 return None
         return None
+
+    def get_is_membership(self, obj):
+        return bool(getattr(obj.package, 'is_membership', False))
+
+    def get_subscription_info(self, obj):
+        """Return subscription details if this purchase is linked to a membership."""
+        try:
+            sub = obj.member_subscription
+            return {
+                'subscription_id': sub.square_subscription_id,
+                'status': sub.status,
+                'current_period_end': sub.current_period_end.isoformat() if sub.current_period_end else None,
+                'canceled_at': sub.canceled_at.isoformat() if sub.canceled_at else None,
+            }
+        except Exception:
+            return None
     
     def validate(self, attrs):
         package = attrs.get('package')

@@ -261,7 +261,7 @@ def build_oauth_url(state: str = '') -> str:
 
     params = {
         'client_id': settings.SQUARE_APPLICATION_ID,
-        'scope': 'PAYMENTS_WRITE PAYMENTS_READ MERCHANT_PROFILE_READ',
+        'scope': 'PAYMENTS_WRITE PAYMENTS_READ MERCHANT_PROFILE_READ ITEMS_WRITE ITEMS_READ SUBSCRIPTIONS_WRITE SUBSCRIPTIONS_READ CUSTOMERS_WRITE CUSTOMERS_READ',
         'session': 'false',
     }
     if state:
@@ -410,3 +410,199 @@ def get_location_square_account(ghl_location_id: str):
             "Please complete Square OAuth first."
         )
     return account
+
+
+# ---------------------------------------------------------------------------
+# Subscription helpers (Membership feature)
+# ---------------------------------------------------------------------------
+
+def get_or_create_square_customer(access_token: str, user) -> str:
+    """
+    Upsert a Square Customer for the given platform user.
+    Searches by phone first; creates a new customer if not found.
+    Returns the Square customer_id string.
+    """
+    import uuid as _uuid
+    client = get_square_client(access_token)
+
+    # Search by phone number first
+    if user.phone:
+        try:
+            result = client.customers.search(
+                query={
+                    'filter': {
+                        'phone_filter': {'phone': user.phone}
+                    }
+                }
+            )
+            customers = getattr(result, 'customers', None) or []
+            if customers:
+                return customers[0].id
+        except Exception:
+            pass  # Fall through to create
+
+    # Create a new customer
+    body = {
+        'idempotency_key': str(_uuid.uuid4()),
+        'given_name': getattr(user, 'first_name', '') or '',
+        'family_name': getattr(user, 'last_name', '') or '',
+        'email_address': getattr(user, 'email', '') or '',
+        'phone_number': getattr(user, 'phone', '') or '',
+    }
+    try:
+        result = client.customers.create(**body)
+        return result.customer.id
+    except Exception as exc:
+        human_msg = _extract_square_error_message(exc)
+        logger.error('get_or_create_square_customer error: %s', human_msg)
+        raise ValueError(human_msg)
+
+
+def save_card_on_file(access_token: str, customer_id: str, source_id: str, idempotency_key: str = None) -> str:
+    """
+    Save a card nonce to a Square customer as a Card on File.
+    Returns the Square card_id string.
+    """
+    import uuid as _uuid
+    client = get_square_client(access_token)
+    body = {
+        'idempotency_key': idempotency_key or str(_uuid.uuid4()),
+        'source_id': source_id,
+        'card': {'customer_id': customer_id},
+    }
+    try:
+        result = client.cards.create_card(**body)
+        return result.card.id
+    except Exception as exc:
+        human_msg = _extract_square_error_message(exc)
+        logger.error('save_card_on_file error: %s', human_msg)
+        raise ValueError(human_msg)
+
+
+def upsert_subscription_plan(access_token: str, location_id: str, package) -> tuple:
+    """
+    Upsert a Square Catalog subscription plan for the given SimulatorPackage.
+    Uses the package ID as an idempotency key — safe to call repeatedly.
+    Returns (catalog_item_id, plan_variation_id).
+    """
+    client = get_square_client(access_token)
+
+    plan_name = f'{package.title} — Monthly Membership'
+    # Calculate tax-inclusive price (HST 14%)
+    HST_RATE = 0.14
+    base_price = float(package.price)
+    tax_amount = round(base_price * HST_RATE, 2)
+    tax_inclusive_price = round(base_price + tax_amount, 2)
+    price_cents = int(round(tax_inclusive_price * 100))
+    item_id = f'#plan-pkg-{package.id}'
+    variation_id = f'#variation-pkg-{package.id}'
+    idem_key = f'sub-plan-pkg-{package.id}'
+
+    body = {
+        'idempotency_key': idem_key,
+        'object': {
+            'type': 'SUBSCRIPTION_PLAN',
+            'id': item_id,
+            'subscription_plan_data': {
+                'name': plan_name,
+                'subscription_plan_variations': [
+                    {
+                        'type': 'SUBSCRIPTION_PLAN_VARIATION',
+                        'id': variation_id,
+                        'subscription_plan_variation_data': {
+                            'name': 'Monthly',
+                            'phases': [
+                                {
+                                    'cadence': 'MONTHLY',
+                                    'recurring': True,
+                                    'pricing': {
+                                        'type': 'STATIC',
+                                        'price_money': {
+                                            'amount': price_cents,
+                                            'currency': 'CAD',
+                                        },
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ],
+            },
+        },
+    }
+
+    try:
+        result = client.catalog.upsert_catalog_object(**body)
+        obj = result.catalog_object
+        catalog_item_id = obj.id
+        variations = obj.subscription_plan_data.subscription_plan_variations
+        plan_variation_id = variations[0].id
+        logger.info(
+            'Upserted subscription plan for package %s: catalog=%s variation=%s',
+            package.id, catalog_item_id, plan_variation_id,
+        )
+        return catalog_item_id, plan_variation_id
+    except Exception as exc:
+        human_msg = _extract_square_error_message(exc)
+        logger.error('upsert_subscription_plan error for package %s: %s', package.id, human_msg)
+        raise ValueError(human_msg)
+
+
+def create_square_subscription(
+    access_token: str,
+    location_id: str,
+    plan_variation_id: str,
+    customer_id: str,
+    card_id: str = None,
+    idempotency_key: str = None,
+) -> dict:
+    """
+    Create a Square recurring subscription.
+    Returns a dict with subscription details.
+    """
+    import uuid as _uuid
+    client = get_square_client(access_token)
+
+    body = {
+        'idempotency_key': idempotency_key or str(_uuid.uuid4()),
+        'location_id': location_id,
+        'plan_variation_id': plan_variation_id,
+        'customer_id': customer_id,
+    }
+    if card_id:
+        body['card_id'] = card_id
+
+    try:
+        result = client.subscriptions.create_subscription(**body)
+        sub = result.subscription
+        return {
+            'id': sub.id,
+            'status': getattr(sub, 'status', 'ACTIVE').lower(),
+            'start_date': getattr(sub, 'start_date', None),
+            'charged_through_date': getattr(sub, 'charged_through_date', None),
+            'customer_id': getattr(sub, 'customer_id', customer_id),
+            'plan_variation_id': getattr(sub, 'plan_variation_id', plan_variation_id),
+        }
+    except Exception as exc:
+        human_msg = _extract_square_error_message(exc)
+        logger.error('create_square_subscription error: %s', human_msg)
+        raise ValueError(human_msg)
+
+
+def cancel_square_subscription(access_token: str, subscription_id: str) -> dict:
+    """
+    Cancel a Square subscription.
+    Returns a dict with updated subscription status.
+    """
+    client = get_square_client(access_token)
+    try:
+        result = client.subscriptions.cancel_subscription(subscription_id=subscription_id)
+        sub = result.subscription
+        return {
+            'id': sub.id,
+            'status': getattr(sub, 'status', 'CANCELED').lower(),
+        }
+    except Exception as exc:
+        human_msg = _extract_square_error_message(exc)
+        logger.error('cancel_square_subscription error: %s', human_msg)
+        raise ValueError(human_msg)

@@ -266,6 +266,11 @@ if crontab:
             'task': 'square_payments.tasks.refresh_square_tokens_task',
             'schedule': crontab(minute=30),  # Run at the half-hour mark each hour
         },
+        # Membership hours safety-net — resets any overdue member hours daily
+        'sync-membership-hours': {
+            'task': 'square_payments.tasks.sync_membership_hours_task',
+            'schedule': crontab(hour=2, minute=0),  # Run daily at 2 AM UTC
+        },
     }
 else:
     CELERY_BEAT_SCHEDULE = {}

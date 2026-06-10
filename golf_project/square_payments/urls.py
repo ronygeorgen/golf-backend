@@ -8,6 +8,9 @@ from .views import (
     SquareOAuthStatusView,
     SquareOAuthDisconnectView,
     SquareOAuthListView,
+    MembershipSubscribeView,
+    MembershipCancelView,
+    MembershipStatusView,
 )
 
 urlpatterns = [
@@ -27,4 +30,9 @@ urlpatterns = [
     path('oauth/disconnect/<str:ghl_location_id>/', SquareOAuthDisconnectView.as_view(), name='square-oauth-disconnect'),
     # List all connected locations (superadmin only)
     path('oauth/list/', SquareOAuthListView.as_view(), name='square-oauth-list'),
+
+    # ── Membership Subscriptions ────────────────────────────────────────────────────
+    path('memberships/subscribe/', MembershipSubscribeView.as_view(), name='square-membership-subscribe'),
+    path('memberships/my/', MembershipStatusView.as_view(), name='square-membership-my'),
+    path('memberships/<str:subscription_id>/cancel/', MembershipCancelView.as_view(), name='square-membership-cancel'),
 ]

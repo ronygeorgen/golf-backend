@@ -153,3 +153,73 @@ def refresh_single_square_token_task(self, ghl_location_id: str):
     except Exception as exc:
         logger.error("Failed to refresh Square token for location %s: %s", ghl_location_id, exc, exc_info=True)
         raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=120)
+def sync_membership_hours_task(self):
+    """
+    Daily safety-net: reset hours for any MemberSubscription whose
+    current_period_end has passed but whose hours weren't reset by webhook.
+    """
+    try:
+        from .models import MemberSubscription
+        from django.utils import timezone
+        try:
+            from dateutil.relativedelta import relativedelta
+            HAS_DATEUTIL = True
+        except ImportError:
+            HAS_DATEUTIL = False
+
+        now = timezone.now()
+        overdue = MemberSubscription.objects.filter(
+            status='active',
+            current_period_end__lt=now,
+        ).select_related('purchase', 'package', 'coaching_purchase', 'coaching_package')
+
+        fixed = 0
+        for sub in overdue:
+            purchase = sub.purchase
+            coaching_purchase = sub.coaching_purchase
+
+            if purchase:
+                monthly_hours = sub.package.monthly_hours
+                # Only reset if hours haven't already been topped up this cycle
+                if purchase.hours_remaining < monthly_hours:
+                    purchase.hours_remaining = monthly_hours
+                    purchase.hours_total = monthly_hours
+                    purchase.package_status = 'active'
+                    purchase.save(update_fields=['hours_remaining', 'hours_total', 'package_status', 'updated_at'])
+            elif coaching_purchase:
+                pkg = sub.coaching_package
+                if coaching_purchase.sessions_remaining < pkg.monthly_sessions or coaching_purchase.simulator_hours_remaining < pkg.monthly_simulator_hours:
+                    coaching_purchase.sessions_remaining = pkg.monthly_sessions
+                    coaching_purchase.sessions_total = pkg.monthly_sessions
+                    coaching_purchase.simulator_hours_remaining = pkg.monthly_simulator_hours
+                    coaching_purchase.simulator_hours_total = pkg.monthly_simulator_hours
+                    coaching_purchase.category_hours_remaining = pkg.monthly_category_hours
+                    coaching_purchase.category_hours_total = pkg.monthly_category_hours
+                    coaching_purchase.package_status = 'active'
+                    coaching_purchase.save(update_fields=[
+                        'sessions_remaining', 'sessions_total',
+                        'simulator_hours_remaining', 'simulator_hours_total',
+                        'category_hours_remaining', 'category_hours_total',
+                        'package_status', 'updated_at'
+                    ])
+            else:
+                continue
+
+            # Advance the period
+            if HAS_DATEUTIL:
+                sub.current_period_start = sub.current_period_end
+                sub.current_period_end = sub.current_period_end + relativedelta(months=1)
+            else:
+                sub.current_period_start = sub.current_period_end
+                sub.current_period_end = sub.current_period_end + timezone.timedelta(days=30)
+            sub.save(update_fields=['current_period_start', 'current_period_end', 'updated_at'])
+            fixed += 1
+
+        logger.info('sync_membership_hours_task: fixed %d overdue memberships.', fixed)
+        return {'fixed': fixed}
+    except Exception as exc:
+        logger.error('sync_membership_hours_task failed: %s', exc, exc_info=True)
+        raise self.retry(exc=exc)
