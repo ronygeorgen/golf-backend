@@ -261,7 +261,7 @@ def build_oauth_url(state: str = '') -> str:
 
     params = {
         'client_id': settings.SQUARE_APPLICATION_ID,
-        'scope': 'PAYMENTS_WRITE PAYMENTS_READ MERCHANT_PROFILE_READ ITEMS_WRITE ITEMS_READ SUBSCRIPTIONS_WRITE SUBSCRIPTIONS_READ CUSTOMERS_WRITE CUSTOMERS_READ',
+        'scope': 'PAYMENTS_WRITE PAYMENTS_READ MERCHANT_PROFILE_READ ITEMS_WRITE ITEMS_READ SUBSCRIPTIONS_WRITE SUBSCRIPTIONS_READ CUSTOMERS_WRITE CUSTOMERS_READ ORDERS_WRITE INVOICES_WRITE',
         'session': 'false',
     }
     if state:
@@ -412,49 +412,137 @@ def get_location_square_account(ghl_location_id: str):
     return account
 
 
-# ---------------------------------------------------------------------------
-# Subscription helpers (Membership feature)
-# ---------------------------------------------------------------------------
+def _format_phone_number_e164(phone: str) -> str | None:
+    """
+    Cleans and formats a phone number string to E.164 format (+1XXXXXXXXXX).
+    Returns None if the phone number cannot be formatted to a valid E.164 structure.
+    """
+    if not phone:
+        return None
+
+    # Strip whitespace
+    cleaned = phone.strip()
+
+    # If it already starts with '+', keep the '+' and strip any non-digit characters
+    if cleaned.startswith('+'):
+        digits_only = ''.join(c for c in cleaned[1:] if c.isdigit())
+        if 7 <= len(digits_only) <= 15:
+            return f"+{digits_only}"
+        return None
+
+    # Otherwise, strip all non-digit characters
+    digits_only = ''.join(c for c in cleaned if c.isdigit())
+
+    # For US/Canada (assume 10 digits or 11 digits starting with 1)
+    if len(digits_only) == 10:
+        return f"+1{digits_only}"
+    if len(digits_only) == 11 and digits_only.startswith('1'):
+        return f"+{digits_only}"
+
+    # Generic fallback: if it has 7 to 15 digits, try prepending '+'
+    if 7 <= len(digits_only) <= 15:
+        return f"+{digits_only}"
+
+    return None
+
 
 def get_or_create_square_customer(access_token: str, user) -> str:
     """
     Upsert a Square Customer for the given platform user.
-    Searches by phone first; creates a new customer if not found.
+    Searches by phone first (exact E.164 match); creates a new customer if not found.
     Returns the Square customer_id string.
+
+    SDK v44 uses TypedDict-style params for customers.search():
+        query = {"filter": {"phone_number": {"exact": "+1XXXXXXXXXX"}}}
+    NOT the old REST dict structure phone_filter: {phone: ...}.
     """
     import uuid as _uuid
     client = get_square_client(access_token)
+    formatted_phone = _format_phone_number_e164(getattr(user, 'phone', None))
 
-    # Search by phone number first
-    if user.phone:
+    logger.info(
+        'get_or_create_square_customer: user=%s, raw_phone=%r, formatted_phone=%r',
+        getattr(user, 'id', '?'), getattr(user, 'phone', None), formatted_phone,
+    )
+
+    # Search by formatted E.164 phone number (exact match)
+    if formatted_phone:
         try:
             result = client.customers.search(
                 query={
                     'filter': {
-                        'phone_filter': {'phone': user.phone}
+                        'phone_number': {'exact': formatted_phone}
                     }
                 }
             )
             customers = getattr(result, 'customers', None) or []
             if customers:
+                logger.info('Square customer found by phone search: %s', customers[0].id)
                 return customers[0].id
-        except Exception:
-            pass  # Fall through to create
+        except Exception as exc:
+            logger.warning(
+                'get_or_create_square_customer: search by phone failed (will create new): %s', exc
+            )
 
-    # Create a new customer
-    body = {
+    # Also try email search as fallback
+    user_email = getattr(user, 'email', '') or ''
+    if user_email:
+        try:
+            result = client.customers.search(
+                query={
+                    'filter': {
+                        'email_address': {'exact': user_email}
+                    }
+                }
+            )
+            customers = getattr(result, 'customers', None) or []
+            if customers:
+                logger.info('Square customer found by email search: %s', customers[0].id)
+                return customers[0].id
+        except Exception as exc:
+            logger.warning(
+                'get_or_create_square_customer: search by email failed (will create new): %s', exc
+            )
+
+    # Create a new customer — only include phone_number if we have a valid E.164 value
+    create_kwargs = {
         'idempotency_key': str(_uuid.uuid4()),
         'given_name': getattr(user, 'first_name', '') or '',
         'family_name': getattr(user, 'last_name', '') or '',
-        'email_address': getattr(user, 'email', '') or '',
-        'phone_number': getattr(user, 'phone', '') or '',
+        'email_address': user_email,
     }
+    if formatted_phone:
+        create_kwargs['phone_number'] = formatted_phone
+
+    logger.info(
+        'Creating new Square customer with kwargs (phone included: %s)',
+        'yes' if formatted_phone else 'no (omitted — invalid/missing)',
+    )
+
     try:
-        result = client.customers.create(**body)
-        return result.customer.id
+        result = client.customers.create(**create_kwargs)
+        new_id = result.customer.id
+        logger.info('Square customer created: %s', new_id)
+        return new_id
     except Exception as exc:
         human_msg = _extract_square_error_message(exc)
-        logger.error('get_or_create_square_customer error: %s', human_msg)
+        
+        # If Square rejected the phone number specifically, retry without it
+        if 'phone' in human_msg.lower() and 'phone_number' in create_kwargs:
+            logger.warning('Square rejected the phone number "%s". Retrying without phone number.', create_kwargs['phone_number'])
+            del create_kwargs['phone_number']
+            create_kwargs['idempotency_key'] = str(_uuid.uuid4())
+            try:
+                result = client.customers.create(**create_kwargs)
+                new_id = result.customer.id
+                logger.info('Square customer created (without phone): %s', new_id)
+                return new_id
+            except Exception as retry_exc:
+                human_msg = _extract_square_error_message(retry_exc)
+                logger.error('get_or_create_square_customer retry create error: %s | raw: %s', human_msg, retry_exc)
+                raise ValueError(human_msg)
+                
+        logger.error('get_or_create_square_customer create error: %s | raw: %s', human_msg, exc)
         raise ValueError(human_msg)
 
 
@@ -471,7 +559,7 @@ def save_card_on_file(access_token: str, customer_id: str, source_id: str, idemp
         'card': {'customer_id': customer_id},
     }
     try:
-        result = client.cards.create_card(**body)
+        result = client.cards.create(**body)
         return result.card.id
     except Exception as exc:
         human_msg = _extract_square_error_message(exc)
@@ -494,9 +582,25 @@ def upsert_subscription_plan(access_token: str, location_id: str, package) -> tu
     tax_amount = round(base_price * HST_RATE, 2)
     tax_inclusive_price = round(base_price + tax_amount, 2)
     price_cents = int(round(tax_inclusive_price * 100))
-    item_id = f'#plan-pkg-{package.id}'
-    variation_id = f'#variation-pkg-{package.id}'
-    idem_key = f'sub-plan-pkg-{package.id}'
+    import hashlib
+    currency = settings.SQUARE_CURRENCY
+    
+    # Create a unique hash based on package ID, currency, price, and name.
+    # If the admin changes the price or name, this generates a NEW hash.
+    # This prevents Square's "idempotency key can only be retried with same data" error,
+    # and safely creates a new Square Catalog plan for the new price without breaking old ones.
+    hash_str = f"{package.id}-{currency}-{price_cents}-{plan_name}"
+    plan_hash = hashlib.md5(hash_str.encode()).hexdigest()[:12]
+    
+    idem_key = f'sub-plan-{plan_hash}'
+    item_id = f'#plan-{plan_hash}'
+    variation_id = f'#var-{plan_hash}'
+
+    logger.info(
+        'upsert_subscription_plan: package=%s price_cents=%d currency=%s idem_key=%s',
+        package.id, price_cents, currency, idem_key,
+    )
+
 
     body = {
         'idempotency_key': idem_key,
@@ -519,8 +623,9 @@ def upsert_subscription_plan(access_token: str, location_id: str, package) -> tu
                                         'type': 'STATIC',
                                         'price_money': {
                                             'amount': price_cents,
-                                            'currency': 'CAD',
+                                            'currency': currency,
                                         },
+
                                     },
                                 }
                             ],
@@ -532,7 +637,34 @@ def upsert_subscription_plan(access_token: str, location_id: str, package) -> tu
     }
 
     try:
-        result = client.catalog.upsert_catalog_object(**body)
+        # 1. First, list catalog items to see if this exact plan already exists.
+        # This avoids the "idempotency key can only be retried with same data" bug 
+        # in Square's Catalog Upsert endpoint.
+        try:
+            res = client.catalog.list(types='SUBSCRIPTION_PLAN')
+            for obj in res:
+                plan_data = getattr(obj, 'subscription_plan_data', None)
+                if plan_data and getattr(plan_data, 'name', '') == plan_name:
+                    variations = getattr(plan_data, 'subscription_plan_variations', [])
+                    if variations:
+                        var_data = getattr(variations[0], 'subscription_plan_variation_data', None)
+                        if var_data:
+                            phases = getattr(var_data, 'phases', [])
+                            if phases:
+                                pricing = getattr(phases[0], 'pricing', None)
+                                if pricing:
+                                    money = getattr(pricing, 'price_money', None)
+                                    if money and getattr(money, 'amount', None) == price_cents and getattr(money, 'currency', None) == currency:
+                                        logger.info('upsert_subscription_plan: Found existing plan %s', obj.id)
+                                        return obj.id, variations[0].id
+        except Exception as e:
+            logger.warning('upsert_subscription_plan: Failed to list/parse catalog items: %s', e)
+
+        # 2. If it doesn't exist, create it with a FRESH idempotency key
+        import uuid as _uuid
+        body['idempotency_key'] = str(_uuid.uuid4())
+        
+        result = client.catalog.object.upsert(**body)
         obj = result.catalog_object
         catalog_item_id = obj.id
         variations = obj.subscription_plan_data.subscription_plan_variations
@@ -573,7 +705,7 @@ def create_square_subscription(
         body['card_id'] = card_id
 
     try:
-        result = client.subscriptions.create_subscription(**body)
+        result = client.subscriptions.create(**body)
         sub = result.subscription
         return {
             'id': sub.id,
@@ -596,7 +728,7 @@ def cancel_square_subscription(access_token: str, subscription_id: str) -> dict:
     """
     client = get_square_client(access_token)
     try:
-        result = client.subscriptions.cancel_subscription(subscription_id=subscription_id)
+        result = client.subscriptions.cancel(subscription_id=subscription_id)
         sub = result.subscription
         return {
             'id': sub.id,

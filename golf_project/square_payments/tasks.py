@@ -219,7 +219,36 @@ def sync_membership_hours_task(self):
             fixed += 1
 
         logger.info('sync_membership_hours_task: fixed %d overdue memberships.', fixed)
-        return {'fixed': fixed}
+
+        # 2. Sweep canceled memberships whose current_period_end has passed
+        expired = MemberSubscription.objects.filter(
+            status='canceled',
+            current_period_end__lt=now,
+        ).select_related('purchase', 'coaching_purchase')
+
+        expired_count = 0
+        for sub in expired:
+            updated = False
+            if sub.purchase and sub.purchase.package_status != 'completed':
+                sub.purchase.package_status = 'completed'
+                sub.purchase.hours_remaining = 0
+                sub.purchase.save(update_fields=['package_status', 'hours_remaining', 'updated_at'])
+                updated = True
+            if sub.coaching_purchase and sub.coaching_purchase.package_status != 'completed':
+                sub.coaching_purchase.package_status = 'completed'
+                sub.coaching_purchase.sessions_remaining = 0
+                sub.coaching_purchase.simulator_hours_remaining = 0
+                sub.coaching_purchase.category_hours_remaining = 0
+                sub.coaching_purchase.save(update_fields=[
+                    'package_status', 'sessions_remaining', 
+                    'simulator_hours_remaining', 'category_hours_remaining', 'updated_at'
+                ])
+                updated = True
+            if updated:
+                expired_count += 1
+
+        logger.info('sync_membership_hours_task: expired %d canceled memberships.', expired_count)
+        return {'fixed': fixed, 'expired': expired_count}
     except Exception as exc:
         logger.error('sync_membership_hours_task failed: %s', exc, exc_info=True)
         raise self.retry(exc=exc)

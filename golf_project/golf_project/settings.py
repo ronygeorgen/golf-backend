@@ -216,6 +216,7 @@ else:
     SQUARE_ACCESS_TOKEN = config('SANDBOX_ACCESS_TOKEN', default='').strip()
 
 SQUARE_LOCATION_ID = config('SQUARE_LOCATION_ID', default='').strip()
+SQUARE_CURRENCY = config('SQUARE_CURRENCY', default='CAD').strip().upper()
 SQUARE_WEBHOOK_SIGNATURE_KEY = config('SQUARE_WEBHOOK_SIGNATURE_KEY', default='').strip()
 # Full public URL of the webhook endpoint (e.g. your ngrok URL) — must match Square Dashboard exactly
 SQUARE_WEBHOOK_URL = config('SQUARE_WEBHOOK_URL', default='')

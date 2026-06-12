@@ -762,10 +762,22 @@ class InitiateSquarePaymentView(APIView):
         temp_id_str = request.data.get('temp_id')
         payment_type = request.data.get('payment_type')
         amount = request.data.get('amount')
-        currency = request.data.get('currency', 'CAD')
-        idempotency_key = request.data.get('idempotency_key') or str(uuid.uuid4())
+        # Always use the server-side setting — never trust the frontend currency.
+        # This prevents "merchant can only process payments in USD but amount was provided in CAD".
+        currency = settings.SQUARE_CURRENCY
+        
+        import hashlib
+        
+        # Append part of the source_id to the idempotency key so that frontend retries
+        # don't trigger Square's "idempotency key can only be retried with same data" error.
+        # Square restricts idempotency keys to 45 chars max. 
+        # We hash the base key to 15 chars to leave plenty of room for suffixes.
+        raw_idem_key = request.data.get('idempotency_key') or str(uuid.uuid4())
+        short_base = hashlib.md5(raw_idem_key.encode()).hexdigest()[:15]
+        source_id_suffix = source_id[-8:] if source_id else ''
+        idempotency_key = f"{short_base}-{source_id_suffix}"
+        
         coupon_code = (request.data.get('coupon_code') or '').strip().upper()
-
         if not source_id:
             return Response({'error': 'source_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
         if not temp_id_str:
@@ -995,11 +1007,18 @@ class SquareWebhookView(APIView):
         # Square V2 uses payment.created and payment.updated.
         # payment.created  → status APPROVED  (skip, money not captured yet)
         # payment.updated  → status COMPLETED (finalize booking)
-        if event_type in ('invoice.payment_made',):
+        if event_type == 'invoice.payment_made':
             try:
                 self._handle_membership_invoice_paid(payload.get('data', {}))
             except Exception as exc:
                 logger.error('Square webhook: membership invoice handler error: %s', exc, exc_info=True)
+            return Response({'message': 'Webhook received.'}, status=status.HTTP_200_OK)
+
+        if event_type == 'invoice.scheduled_charge_failed':
+            try:
+                self._handle_invoice_charge_failed(payload.get('data', {}))
+            except Exception as exc:
+                logger.error('Square webhook: invoice charge failed handler error: %s', exc, exc_info=True)
             return Response({'message': 'Webhook received.'}, status=status.HTTP_200_OK)
 
         if event_type in ('subscription.updated', 'subscription.created'):
@@ -1174,6 +1193,47 @@ class SquareWebhookView(APIView):
         except MemberSubscription.DoesNotExist:
             pass
 
+    def _handle_invoice_charge_failed(self, data):
+        """
+        invoice.scheduled_charge_failed — Square tried to auto-charge the member
+        for a subscription renewal but the payment failed (expired card, NSF, etc.).
+
+        Square will automatically retry the charge. If all retries fail, Square
+        cancels the subscription and fires subscription.updated with status=CANCELED.
+
+        We log the failure here so admins can see it in the server logs.
+        The member retains access until Square actually cancels the subscription.
+        """
+        from .models import MemberSubscription
+
+        invoice = data.get('object', {}).get('invoice', {})
+        subscription_id = invoice.get('subscription_id', '')
+        invoice_id = invoice.get('id', '')
+
+        if not subscription_id:
+            logger.warning('invoice.scheduled_charge_failed: no subscription_id in payload')
+            return
+
+        try:
+            member_sub = MemberSubscription.objects.select_related('client', 'package').get(
+                square_subscription_id=subscription_id
+            )
+            logger.warning(
+                'PAYMENT FAILED: Membership renewal charge failed for user=%s (id=%s), '
+                'package=%s, sub_id=%s, invoice_id=%s. '
+                'Square will retry automatically. Member retains access until Square cancels.',
+                member_sub.client.phone,
+                member_sub.client_id,
+                member_sub.package.title if member_sub.package else 'N/A',
+                subscription_id,
+                invoice_id,
+            )
+        except MemberSubscription.DoesNotExist:
+            logger.warning(
+                'invoice.scheduled_charge_failed: no MemberSubscription found for sub_id=%s invoice_id=%s',
+                subscription_id, invoice_id
+            )
+
 
 # ===========================================================================
 # CONFIG VIEW
@@ -1217,6 +1277,7 @@ class SquareConfigView(APIView):
             'application_id': app_id,
             'location_id': resolved_location_id,
             'environment': env,
+            'currency': getattr(settings, 'SQUARE_CURRENCY', 'CAD'),
         })
 
 
@@ -1267,7 +1328,17 @@ class MembershipSubscribeView(APIView):
         package_id = request.data.get('package_id')
         package_type = request.data.get('package_type', 'simulator') # Default to simulator for backward compatibility
         ghl_location_id = request.data.get('location_id', '').strip()
-        idempotency_key = request.data.get('idempotency_key') or str(uuid.uuid4())
+        
+        import hashlib
+        
+        # Append part of the source_id to the idempotency key so that frontend retries
+        # don't trigger Square's "idempotency key can only be retried with same data" error.
+        # Square restricts idempotency keys to 45 chars max.
+        # We hash the base key to 15 chars to leave plenty of room for -card and -sub suffixes.
+        raw_idem_key = request.data.get('idempotency_key') or str(uuid.uuid4())
+        short_base = hashlib.md5(raw_idem_key.encode()).hexdigest()[:15]
+        source_id_suffix = source_id[-8:] if source_id else ''
+        idempotency_key = f"{short_base}-{source_id_suffix}"
 
         if not source_id:
             return Response({'error': 'source_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -1457,7 +1528,11 @@ class MembershipCancelView(APIView):
         try:
             cancel_square_subscription(account.access_token, subscription_id)
         except ValueError as exc:
-            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+            exc_str = str(exc).lower()
+            if "already has a pending cancel date" in exc_str or "already canceled" in exc_str or "already cancelled" in exc_str:
+                logger.info('Subscription %s already canceled in Square. Syncing local state.', subscription_id)
+            else:
+                return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
         member_sub.status = 'canceled'
         member_sub.canceled_at = timezone.now()
