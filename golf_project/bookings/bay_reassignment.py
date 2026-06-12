@@ -72,17 +72,36 @@ def _serialize_failed(booking, reason):
     }
 
 
-def _affected_bookings_queryset(source_simulator):
+def _affected_bookings_queryset(source_simulator, specific_date=None):
     now = timezone.now()
-    return (
-        Booking.objects.filter(
-            simulator=source_simulator,
-            status='confirmed',
-            start_time__gte=now,
-        )
-        .select_related('client', 'simulator')
-        .order_by('start_time')
-    )
+    qs = Booking.objects.filter(
+        simulator=source_simulator,
+        status='confirmed',
+        start_time__gte=now,
+    ).select_related('client', 'simulator').order_by('start_time')
+
+    if specific_date:
+        from datetime import datetime
+        import pytz
+        from golf_project.timezone_utils import get_center_timezone
+        
+        try:
+            query_date = datetime.strptime(specific_date, '%Y-%m-%d').date()
+            center_tz = get_center_timezone(source_simulator.location_id)
+            
+            start_of_day_local = center_tz.localize(datetime.combine(query_date, datetime.min.time()))
+            end_of_day_local = center_tz.localize(datetime.combine(query_date, datetime.max.time()))
+            
+            start_utc = start_of_day_local.astimezone(pytz.UTC)
+            end_utc = end_of_day_local.astimezone(pytz.UTC)
+            
+            # Use max(now, start_utc) to not pull past bookings if date is today
+            actual_start = max(now, start_utc)
+            qs = qs.filter(start_time__gte=actual_start, start_time__lte=end_utc)
+        except (ValueError, TypeError):
+            pass
+
+    return qs
 
 
 def run_deactivate_simulator_reassign(
@@ -91,12 +110,13 @@ def run_deactivate_simulator_reassign(
     dry_run,
     allow_coaching_bay,
     deactivate,
+    specific_date=None,
 ):
     """
     dry_run: if True, only compute moved/failed; no DB writes.
     deactivate: if True, set source_simulator.is_active False after processing bookings (execute only).
     """
-    bookings = list(_affected_bookings_queryset(source_simulator))
+    bookings = list(_affected_bookings_queryset(source_simulator, specific_date=specific_date))
     moved = []
     failed = []
 

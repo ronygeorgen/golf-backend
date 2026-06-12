@@ -146,6 +146,7 @@ class SimulatorViewSet(viewsets.ModelViewSet):
         dry_run = _as_bool(request.data.get('dry_run'), default=False)
         allow_coaching_bay = _as_bool(request.data.get('allow_coaching_bay'), default=False)
         deactivate = _as_bool(request.data.get('deactivate'), default=True)
+        specific_date = request.data.get('specific_date')
         if not simulator.is_active:
             deactivate = False
 
@@ -156,6 +157,7 @@ class SimulatorViewSet(viewsets.ModelViewSet):
             dry_run=dry_run,
             allow_coaching_bay=allow_coaching_bay,
             deactivate=deactivate,
+            specific_date=specific_date,
         )
         return Response(payload, status=status.HTTP_200_OK)
     
