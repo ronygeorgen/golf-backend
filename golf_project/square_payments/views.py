@@ -762,10 +762,22 @@ class InitiateSquarePaymentView(APIView):
         temp_id_str = request.data.get('temp_id')
         payment_type = request.data.get('payment_type')
         amount = request.data.get('amount')
-        currency = request.data.get('currency', 'CAD')
-        idempotency_key = request.data.get('idempotency_key') or str(uuid.uuid4())
+        # Always use the server-side setting — never trust the frontend currency.
+        # This prevents "merchant can only process payments in USD but amount was provided in CAD".
+        currency = settings.SQUARE_CURRENCY
+        
+        import hashlib
+        
+        # Append part of the source_id to the idempotency key so that frontend retries
+        # don't trigger Square's "idempotency key can only be retried with same data" error.
+        # Square restricts idempotency keys to 45 chars max. 
+        # We hash the base key to 15 chars to leave plenty of room for suffixes.
+        raw_idem_key = request.data.get('idempotency_key') or str(uuid.uuid4())
+        short_base = hashlib.md5(raw_idem_key.encode()).hexdigest()[:15]
+        source_id_suffix = source_id[-8:] if source_id else ''
+        idempotency_key = f"{short_base}-{source_id_suffix}"
+        
         coupon_code = (request.data.get('coupon_code') or '').strip().upper()
-
         if not source_id:
             return Response({'error': 'source_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
         if not temp_id_str:
@@ -995,6 +1007,34 @@ class SquareWebhookView(APIView):
         # Square V2 uses payment.created and payment.updated.
         # payment.created  → status APPROVED  (skip, money not captured yet)
         # payment.updated  → status COMPLETED (finalize booking)
+        if event_type == 'invoice.payment_made':
+            try:
+                self._handle_membership_invoice_paid(payload.get('data', {}))
+            except Exception as exc:
+                logger.error('Square webhook: membership invoice handler error: %s', exc, exc_info=True)
+            return Response({'message': 'Webhook received.'}, status=status.HTTP_200_OK)
+
+        if event_type == 'invoice.scheduled_charge_failed':
+            try:
+                self._handle_invoice_charge_failed(payload.get('data', {}))
+            except Exception as exc:
+                logger.error('Square webhook: invoice charge failed handler error: %s', exc, exc_info=True)
+            return Response({'message': 'Webhook received.'}, status=status.HTTP_200_OK)
+
+        if event_type in ('subscription.updated', 'subscription.created'):
+            try:
+                self._handle_subscription_updated(payload.get('data', {}))
+            except Exception as exc:
+                logger.error('Square webhook: subscription updated handler error: %s', exc, exc_info=True)
+            return Response({'message': 'Webhook received.'}, status=status.HTTP_200_OK)
+
+        if event_type == 'subscription.canceled':
+            try:
+                self._handle_subscription_canceled(payload.get('data', {}))
+            except Exception as exc:
+                logger.error('Square webhook: subscription canceled handler error: %s', exc, exc_info=True)
+            return Response({'message': 'Webhook received.'}, status=status.HTTP_200_OK)
+
         if event_type not in ['payment.created', 'payment.updated']:
             return Response({'message': f'Event type {event_type} not handled.'}, status=status.HTTP_200_OK)
 
@@ -1035,6 +1075,164 @@ class SquareWebhookView(APIView):
             logger.error("Square webhook finalization error: %s", exc, exc_info=True)
 
         return Response({'message': 'Webhook received.'}, status=status.HTTP_200_OK)
+
+    # ------------------------------------------------------------------
+    # Membership / Subscription webhook handlers
+    # ------------------------------------------------------------------
+
+    def _handle_membership_invoice_paid(self, data):
+        """
+        invoice.payment_made — Square fires this each month for subscription invoices.
+        Resets the member's SimulatorPackagePurchase hours to monthly_hours.
+        """
+        from .models import MemberSubscription
+        from django.utils import timezone
+
+        invoice = data.get('object', {}).get('invoice', {})
+        subscription_id = invoice.get('subscription_id', '')
+        if not subscription_id:
+            logger.warning('invoice.payment_made: no subscription_id in payload')
+            return
+
+        try:
+            member_sub = MemberSubscription.objects.select_related(
+                'purchase', 'package', 'coaching_purchase', 'coaching_package'
+            ).get(square_subscription_id=subscription_id)
+        except MemberSubscription.DoesNotExist:
+            logger.warning('invoice.payment_made: no MemberSubscription for sub_id=%s', subscription_id)
+            return
+
+        if member_sub.status == 'canceled':
+            logger.info('invoice.payment_made: sub %s is canceled, skipping reset.', subscription_id)
+            return
+
+        purchase = member_sub.purchase
+        coaching_purchase = member_sub.coaching_purchase
+
+        if purchase:
+            monthly_hours = member_sub.package.monthly_hours
+            purchase.hours_remaining = monthly_hours
+            purchase.hours_total = monthly_hours
+            purchase.package_status = 'active'
+            purchase.save(update_fields=['hours_remaining', 'hours_total', 'package_status', 'updated_at'])
+            reset_msg = f"simulator_hours={monthly_hours}"
+        elif coaching_purchase:
+            pkg = member_sub.coaching_package
+            coaching_purchase.sessions_remaining = pkg.monthly_sessions
+            coaching_purchase.sessions_total = pkg.monthly_sessions
+            coaching_purchase.simulator_hours_remaining = pkg.monthly_simulator_hours
+            coaching_purchase.simulator_hours_total = pkg.monthly_simulator_hours
+            coaching_purchase.category_hours_remaining = pkg.monthly_category_hours
+            coaching_purchase.category_hours_total = pkg.monthly_category_hours
+            coaching_purchase.package_status = 'active'
+            coaching_purchase.save(update_fields=[
+                'sessions_remaining', 'sessions_total',
+                'simulator_hours_remaining', 'simulator_hours_total',
+                'category_hours_remaining', 'category_hours_total',
+                'package_status', 'updated_at'
+            ])
+            reset_msg = f"sessions={pkg.monthly_sessions} sim_hrs={pkg.monthly_simulator_hours} cat_hrs={pkg.monthly_category_hours}"
+        else:
+            logger.warning('invoice.payment_made: no purchase linked to sub %s', subscription_id)
+            return
+
+        # Advance billing period by 1 month
+        now = timezone.now()
+        try:
+            from dateutil.relativedelta import relativedelta
+            period_end = now + relativedelta(months=1)
+        except ImportError:
+            period_end = now + timezone.timedelta(days=30)
+
+        member_sub.status = 'active'
+        member_sub.current_period_start = now
+        member_sub.current_period_end = period_end
+        member_sub.save(update_fields=['status', 'current_period_start', 'current_period_end', 'updated_at'])
+
+        logger.info(
+            'Membership reset: user=%s sub=%s reset=[%s] next_end=%s',
+            member_sub.client_id, subscription_id, reset_msg, period_end,
+        )
+
+    def _handle_subscription_updated(self, data):
+        """subscription.updated / subscription.created — sync status."""
+        from .models import MemberSubscription
+        sub_obj = data.get('object', {}).get('subscription', {})
+        subscription_id = sub_obj.get('id', '')
+        sq_status = sub_obj.get('status', '').lower()
+        if not subscription_id:
+            return
+        STATUS_MAP = {'active': 'active', 'paused': 'paused', 'pending': 'pending',
+                      'canceled': 'canceled', 'deactivated': 'canceled'}
+        mapped = STATUS_MAP.get(sq_status)
+        if not mapped:
+            return
+        try:
+            member_sub = MemberSubscription.objects.get(square_subscription_id=subscription_id)
+            member_sub.status = mapped
+            member_sub.save(update_fields=['status', 'updated_at'])
+            logger.info('MemberSubscription %s status → %s', subscription_id, mapped)
+        except MemberSubscription.DoesNotExist:
+            pass
+
+    def _handle_subscription_canceled(self, data):
+        """subscription.canceled — mark as canceled."""
+        from .models import MemberSubscription
+        from django.utils import timezone
+        sub_obj = data.get('object', {}).get('subscription', {})
+        subscription_id = sub_obj.get('id', '')
+        if not subscription_id:
+            return
+        try:
+            member_sub = MemberSubscription.objects.get(square_subscription_id=subscription_id)
+            member_sub.status = 'canceled'
+            if not member_sub.canceled_at:
+                member_sub.canceled_at = timezone.now()
+            member_sub.save(update_fields=['status', 'canceled_at', 'updated_at'])
+            logger.info('MemberSubscription %s marked canceled via webhook', subscription_id)
+        except MemberSubscription.DoesNotExist:
+            pass
+
+    def _handle_invoice_charge_failed(self, data):
+        """
+        invoice.scheduled_charge_failed — Square tried to auto-charge the member
+        for a subscription renewal but the payment failed (expired card, NSF, etc.).
+
+        Square will automatically retry the charge. If all retries fail, Square
+        cancels the subscription and fires subscription.updated with status=CANCELED.
+
+        We log the failure here so admins can see it in the server logs.
+        The member retains access until Square actually cancels the subscription.
+        """
+        from .models import MemberSubscription
+
+        invoice = data.get('object', {}).get('invoice', {})
+        subscription_id = invoice.get('subscription_id', '')
+        invoice_id = invoice.get('id', '')
+
+        if not subscription_id:
+            logger.warning('invoice.scheduled_charge_failed: no subscription_id in payload')
+            return
+
+        try:
+            member_sub = MemberSubscription.objects.select_related('client', 'package').get(
+                square_subscription_id=subscription_id
+            )
+            logger.warning(
+                'PAYMENT FAILED: Membership renewal charge failed for user=%s (id=%s), '
+                'package=%s, sub_id=%s, invoice_id=%s. '
+                'Square will retry automatically. Member retains access until Square cancels.',
+                member_sub.client.phone,
+                member_sub.client_id,
+                member_sub.package.title if member_sub.package else 'N/A',
+                subscription_id,
+                invoice_id,
+            )
+        except MemberSubscription.DoesNotExist:
+            logger.warning(
+                'invoice.scheduled_charge_failed: no MemberSubscription found for sub_id=%s invoice_id=%s',
+                subscription_id, invoice_id
+            )
 
 
 # ===========================================================================
@@ -1079,4 +1277,308 @@ class SquareConfigView(APIView):
             'application_id': app_id,
             'location_id': resolved_location_id,
             'environment': env,
+            'currency': getattr(settings, 'SQUARE_CURRENCY', 'CAD'),
         })
+
+
+# ===========================================================================
+# MEMBERSHIP SUBSCRIPTION VIEWS
+# ===========================================================================
+
+class MembershipSubscribeView(APIView):
+    """
+    POST /api/square/memberships/subscribe/
+
+    Body:
+        {
+            "source_id": "<card nonce from Square Web SDK>",
+            "package_id": <int>,
+            "location_id": "<GHL location ID>",
+            "idempotency_key": "<optional UUID>"
+        }
+
+    Flow:
+        1. Validate package is active + is_membership
+        2. Check no existing active subscription
+        3. Look up per-location Square credentials
+        4. Upsert Square customer + save card on file
+        5. Upsert Square subscription plan (Catalog API)
+        6. Create Square subscription
+        7. Create SimulatorPackagePurchase with monthly_hours
+        8. Create MemberSubscription record
+    """
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request):
+        from coaching.models import (
+            SimulatorPackage, SimulatorPackagePurchase,
+            CoachingPackage, CoachingPackagePurchase
+        )
+        from .models import LocationSquareAccount, MemberSubscription
+        from .services import (
+            get_or_create_square_customer,
+            save_card_on_file,
+            upsert_subscription_plan,
+            create_square_subscription,
+        )
+        from django.utils import timezone
+
+        source_id = request.data.get('source_id', '').strip()
+        package_id = request.data.get('package_id')
+        package_type = request.data.get('package_type', 'simulator') # Default to simulator for backward compatibility
+        ghl_location_id = request.data.get('location_id', '').strip()
+        
+        import hashlib
+        
+        # Append part of the source_id to the idempotency key so that frontend retries
+        # don't trigger Square's "idempotency key can only be retried with same data" error.
+        # Square restricts idempotency keys to 45 chars max.
+        # We hash the base key to 15 chars to leave plenty of room for -card and -sub suffixes.
+        raw_idem_key = request.data.get('idempotency_key') or str(uuid.uuid4())
+        short_base = hashlib.md5(raw_idem_key.encode()).hexdigest()[:15]
+        source_id_suffix = source_id[-8:] if source_id else ''
+        idempotency_key = f"{short_base}-{source_id_suffix}"
+
+        if not source_id:
+            return Response({'error': 'source_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not package_id:
+            return Response({'error': 'package_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not ghl_location_id:
+            return Response({'error': 'location_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Validate package
+        package = None
+        sim_pkg = None
+        coach_pkg = None
+        try:
+            if package_type == 'coaching':
+                coach_pkg = CoachingPackage.objects.get(id=package_id, is_active=True, is_membership=True)
+                package = coach_pkg
+            else:
+                sim_pkg = SimulatorPackage.objects.get(id=package_id, is_active=True, is_membership=True)
+                package = sim_pkg
+        except (SimulatorPackage.DoesNotExist, CoachingPackage.DoesNotExist):
+            return Response({'error': 'Membership package not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Check for existing active subscription
+        existing_q = MemberSubscription.objects.filter(
+            client=request.user,
+            status__in=['active', 'pending']
+        )
+        if sim_pkg:
+            existing_q = existing_q.filter(package=sim_pkg)
+        else:
+            existing_q = existing_q.filter(coaching_package=coach_pkg)
+            
+        existing = existing_q.first()
+        if existing:
+            return Response(
+                {'error': 'You already have an active subscription for this membership.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Resolve Square credentials for this location
+        try:
+            account = LocationSquareAccount.objects.get(
+                ghl_location__location_id=ghl_location_id,
+                is_connected=True,
+            )
+        except LocationSquareAccount.DoesNotExist:
+            return Response(
+                {'error': 'This golf center has not connected a Square account yet.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        access_token = account.access_token
+        square_location_id = account.square_location_id
+
+        try:
+            # Step 1: upsert Square customer
+            customer_id = get_or_create_square_customer(access_token, request.user)
+
+            # Step 2: save card on file
+            card_id = save_card_on_file(
+                access_token, customer_id, source_id,
+                idempotency_key=idempotency_key + '-card',
+            )
+
+            # Step 3: upsert subscription plan in Square Catalog
+            _, plan_variation_id = upsert_subscription_plan(access_token, square_location_id, package)
+
+            # Step 4: create the subscription
+            sub_data = create_square_subscription(
+                access_token=access_token,
+                location_id=square_location_id,
+                plan_variation_id=plan_variation_id,
+                customer_id=customer_id,
+                card_id=card_id,
+                idempotency_key=idempotency_key + '-sub',
+            )
+        except ValueError as exc:
+            logger.error('MembershipSubscribeView error for user %s: %s', request.user.id, exc)
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Step 5: create Purchase
+        purchase = None
+        coaching_purchase = None
+        if sim_pkg:
+            monthly_hours = sim_pkg.monthly_hours
+            purchase = SimulatorPackagePurchase.objects.create(
+                client=request.user,
+                package=sim_pkg,
+                purchase_name=f'{sim_pkg.title} Membership',
+                hours_total=monthly_hours,
+                hours_remaining=monthly_hours,
+                notes='Monthly membership — hours reset each billing cycle. No carry-over.',
+                package_status='active',
+            )
+        else:
+            coaching_purchase = CoachingPackagePurchase.objects.create(
+                client=request.user,
+                package=coach_pkg,
+                purchase_name=f'{coach_pkg.title} Membership',
+                sessions_total=coach_pkg.monthly_sessions,
+                sessions_remaining=coach_pkg.monthly_sessions,
+                simulator_hours_total=coach_pkg.monthly_simulator_hours,
+                simulator_hours_remaining=coach_pkg.monthly_simulator_hours,
+                category_hours_total=coach_pkg.monthly_category_hours,
+                category_hours_remaining=coach_pkg.monthly_category_hours,
+                notes='Monthly membership — hours/sessions reset each billing cycle. No carry-over.',
+                package_status='active',
+            )
+
+        # Step 6: create MemberSubscription
+        now = timezone.now()
+        try:
+            from dateutil.relativedelta import relativedelta
+            period_end = now + relativedelta(months=1)
+        except ImportError:
+            period_end = now + timezone.timedelta(days=30)
+
+        member_sub = MemberSubscription.objects.create(
+            client=request.user,
+            package=sim_pkg,
+            coaching_package=coach_pkg,
+            purchase=purchase,
+            coaching_purchase=coaching_purchase,
+            ghl_location_id=ghl_location_id,
+            square_subscription_id=sub_data['id'],
+            square_plan_variation_id=plan_variation_id,
+            square_customer_id=customer_id,
+            status='active',
+            current_period_start=now,
+            current_period_end=period_end,
+        )
+
+        logger.info(
+            'MemberSubscription created: user=%s package=%s sub_id=%s',
+            request.user.id, package.id, sub_data['id'],
+        )
+
+        purchase_id = purchase.id if purchase else coaching_purchase.id
+        granted_msg = f"{sim_pkg.monthly_hours} hours" if sim_pkg else "sessions/hours"
+
+        return Response({
+            'message': f'Successfully subscribed to {package.title}!',
+            'subscription_id': sub_data['id'],
+            'purchase_id': purchase_id,
+            'hours_granted': granted_msg,
+            'next_billing_date': period_end.isoformat(),
+        }, status=status.HTTP_201_CREATED)
+
+
+
+
+class MembershipCancelView(APIView):
+    """
+    POST /api/square/memberships/<subscription_id>/cancel/
+
+    Cancels the Square subscription. Member retains hours until end of period.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, subscription_id):
+        from .models import MemberSubscription, LocationSquareAccount
+        from .services import cancel_square_subscription
+        from django.utils import timezone
+
+        try:
+            member_sub = MemberSubscription.objects.get(
+                square_subscription_id=subscription_id,
+                client=request.user,
+            )
+        except MemberSubscription.DoesNotExist:
+            return Response({'error': 'Subscription not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if member_sub.status == 'canceled':
+            return Response({'error': 'Subscription is already canceled.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            account = LocationSquareAccount.objects.get(
+                ghl_location__location_id=member_sub.ghl_location_id,
+                is_connected=True,
+            )
+        except LocationSquareAccount.DoesNotExist:
+            return Response(
+                {'error': 'Square account not found for this location.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            cancel_square_subscription(account.access_token, subscription_id)
+        except ValueError as exc:
+            exc_str = str(exc).lower()
+            if "already has a pending cancel date" in exc_str or "already canceled" in exc_str or "already cancelled" in exc_str:
+                logger.info('Subscription %s already canceled in Square. Syncing local state.', subscription_id)
+            else:
+                return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        member_sub.status = 'canceled'
+        member_sub.canceled_at = timezone.now()
+        member_sub.save(update_fields=['status', 'canceled_at', 'updated_at'])
+
+        logger.info('MemberSubscription canceled: user=%s sub=%s', request.user.id, subscription_id)
+
+        return Response({
+            'message': 'Subscription canceled. Your hours remain active until the end of your current billing period.',
+            'subscription_id': subscription_id,
+            'access_until': member_sub.current_period_end.isoformat() if member_sub.current_period_end else None,
+        })
+
+
+class MembershipStatusView(APIView):
+    """
+    GET /api/square/memberships/my/
+    Returns all MemberSubscription records for the logged-in user.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from .models import MemberSubscription
+
+        subs = MemberSubscription.objects.filter(
+            client=request.user
+        ).select_related('package', 'purchase').order_by('-created_at')
+
+        data = []
+        for sub in subs:
+            purchase = sub.purchase
+            data.append({
+                'subscription_id': sub.square_subscription_id,
+                'package_id': sub.package_id,
+                'package_title': sub.package.title,
+                'package_price': str(sub.package.price),
+                'monthly_hours': str(sub.package.monthly_hours),
+                'status': sub.status,
+                'current_period_start': sub.current_period_start.isoformat() if sub.current_period_start else None,
+                'current_period_end': sub.current_period_end.isoformat() if sub.current_period_end else None,
+                'canceled_at': sub.canceled_at.isoformat() if sub.canceled_at else None,
+                'hours_remaining': str(purchase.hours_remaining) if purchase else '0',
+                'hours_total': str(purchase.hours_total) if purchase else '0',
+                'purchase_id': purchase.id if purchase else None,
+                'created_at': sub.created_at.isoformat(),
+            })
+
+        return Response({'subscriptions': data, 'count': len(data)})
+

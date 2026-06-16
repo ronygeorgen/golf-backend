@@ -36,6 +36,26 @@ class CoachingPackage(models.Model):
         related_name='coaching_packages',
         help_text="Service category this package belongs to (Phase C).",
     )
+    is_membership = models.BooleanField(
+        default=False,
+        help_text="If True, this package is a recurring monthly membership (billed via Square Subscriptions API)."
+    )
+    monthly_sessions = models.PositiveIntegerField(
+        default=0,
+        help_text="Coaching sessions granted each billing cycle (memberships only). Resets on every renewal — no carry-over."
+    )
+    monthly_simulator_hours = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        default=0,
+        help_text="Simulator hours granted each billing cycle (memberships only). Resets on every renewal — no carry-over."
+    )
+    monthly_category_hours = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        default=0,
+        help_text="Category asset hours granted each billing cycle (memberships only). Resets on every renewal — no carry-over."
+    )
 
     def __str__(self):
         return self.title
@@ -463,7 +483,18 @@ class SimulatorPackage(models.Model):
     hours = models.DecimalField(
         max_digits=6,
         decimal_places=2,
-        help_text="Number of simulator hours included in this package"
+        default=0,
+        help_text="Number of simulator hours included in this package (one-time). For memberships, use monthly_hours instead."
+    )
+    is_membership = models.BooleanField(
+        default=False,
+        help_text="If True, this package is a recurring monthly membership (billed via Square Subscriptions API)."
+    )
+    monthly_hours = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        default=0,
+        help_text="Simulator hours granted each billing cycle (memberships only). Resets on every renewal — no carry-over."
     )
     redirect_url = models.URLField(max_length=500, blank=True, null=True, help_text="URL to redirect to after package purchase")
     is_active = models.BooleanField(default=True)
