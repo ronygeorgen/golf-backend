@@ -1162,16 +1162,27 @@ class SquareWebhookView(APIView):
         sq_status = sub_obj.get('status', '').lower()
         if not subscription_id:
             return
+        # pending_cancellation = sub is canceled but still active until period end → treat as canceled
         STATUS_MAP = {'active': 'active', 'paused': 'paused', 'pending': 'pending',
-                      'canceled': 'canceled', 'deactivated': 'canceled'}
+                      'canceled': 'canceled', 'deactivated': 'canceled',
+                      'pending_cancellation': 'canceled'}
         mapped = STATUS_MAP.get(sq_status)
         if not mapped:
             return
         try:
             member_sub = MemberSubscription.objects.get(square_subscription_id=subscription_id)
+            # Never downgrade a locally-canceled subscription back to active/paused/pending.
+            # Square fires subscription.updated with status=ACTIVE even after a cancel-at-period-end
+            # because the sub is still technically active until the billing period expires.
+            if member_sub.status == 'canceled' and mapped in ('active', 'paused', 'pending'):
+                logger.info(
+                    'MemberSubscription %s is already canceled locally — ignoring Square status update to %s',
+                    subscription_id, sq_status
+                )
+                return
             member_sub.status = mapped
             member_sub.save(update_fields=['status', 'updated_at'])
-            logger.info('MemberSubscription %s status → %s', subscription_id, mapped)
+            logger.info('MemberSubscription %s status → %s (from Square status=%s)', subscription_id, mapped, sq_status)
         except MemberSubscription.DoesNotExist:
             pass
 
