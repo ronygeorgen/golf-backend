@@ -3,12 +3,23 @@ from django.db import transaction
 from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated, IsAdminUser
+from rest_framework.permissions import IsAuthenticated, BasePermission
 
 from .models import Coupon, CouponUsage
 from .serializers import CouponSerializer, CouponUsageSerializer, CouponValidateSerializer
 
 logger = logging.getLogger(__name__)
+
+
+class IsAdminOrSuperAdmin(BasePermission):
+    """Allow access to users with role 'admin' or 'superadmin' only."""
+
+    def has_permission(self, request, view):
+        return (
+            request.user
+            and request.user.is_authenticated
+            and getattr(request.user, 'role', None) in ('admin', 'superadmin')
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -17,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 class CouponListCreateView(APIView):
     """GET all coupons / POST create a new coupon (admin only)."""
-    permission_classes = [IsAuthenticated, IsAdminUser]
+    permission_classes = [IsAuthenticated, IsAdminOrSuperAdmin]
 
     def get(self, request):
         coupons = Coupon.objects.all()
@@ -34,7 +45,7 @@ class CouponListCreateView(APIView):
 
 class CouponDetailView(APIView):
     """GET / PUT / DELETE a single coupon (admin only)."""
-    permission_classes = [IsAuthenticated, IsAdminUser]
+    permission_classes = [IsAuthenticated, IsAdminOrSuperAdmin]
 
     def _get_coupon(self, pk):
         try:
@@ -73,7 +84,7 @@ class CouponDetailView(APIView):
 
 class CouponUsageListView(APIView):
     """GET all coupon usage records (admin only)."""
-    permission_classes = [IsAuthenticated, IsAdminUser]
+    permission_classes = [IsAuthenticated, IsAdminOrSuperAdmin]
 
     def get(self, request):
         usages = CouponUsage.objects.select_related('coupon', 'user').all()
