@@ -921,7 +921,7 @@ class InitiateSquarePaymentView(APIView):
             Coupon.objects.filter(pk=coupon_obj.pk).update(uses_count=models.F('uses_count') + 1)
             logger.info("CouponUsage recorded: %s, payment=%s", coupon_code, payment_id)
 
-        # ── Finalize booking/purchase/event ──────────────────────────────────
+        # ── Finalize booking/purchase/event ────────────────────────────────────
         try:
             if payment_type == 'simulator':
                 result = _finalize_simulator_booking(temp_id_str, payment_id)
@@ -951,6 +951,57 @@ class InitiateSquarePaymentView(APIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
 
+        # ── Send invoice email (async, never blocks payment response) ─────────
+        try:
+            from django.utils import timezone as tz
+            from .tasks import send_invoice_email_task
+
+            # Resolve customer info for invoice
+            _inv_email = ''
+            _inv_name = ''
+            _inv_ghl_loc_id = ''
+
+            if request.user.is_authenticated:
+                _inv_email = getattr(request.user, 'email', '') or ''
+                _fn = getattr(request.user, 'first_name', '') or ''
+                _ln = getattr(request.user, 'last_name', '') or ''
+                _inv_name = f"{_fn} {_ln}".strip() or getattr(request.user, 'username', '') or _inv_email
+                _inv_ghl_loc_id = getattr(request.user, 'ghl_location_id', '') or ''
+            else:
+                # Guest: use phone from temp booking to look up user
+                if guest_phone:
+                    try:
+                        from users.models import User
+                        _buyer = User.objects.filter(phone=guest_phone).first()
+                        if _buyer:
+                            _inv_email = getattr(_buyer, 'email', '') or ''
+                            _fn = getattr(_buyer, 'first_name', '') or ''
+                            _ln = getattr(_buyer, 'last_name', '') or ''
+                            _inv_name = f"{_fn} {_ln}".strip() or _inv_email
+                            _inv_ghl_loc_id = getattr(_buyer, 'ghl_location_id', '') or ''
+                    except Exception:
+                        pass
+                _inv_email = _inv_email or guest_email
+
+            send_invoice_email_task.delay(
+                customer_email=_inv_email,
+                customer_name=_inv_name,
+                payment_id=payment_id,
+                payment_type=payment_type,
+                item_description=item_label or payment_type.replace('_', ' ').title(),
+                base_amount=float(original_amount),
+                discount_amount=float(discount_amount),
+                coupon_code=coupon_code,
+                tax_rate=HST_RATE,
+                tax_amount=float(tax_amount),
+                total_amount=float(final_amount_with_tax),
+                ghl_location_id=_inv_ghl_loc_id,
+                booking_date_iso=tz.now().isoformat(),
+            )
+            logger.info("Invoice email task queued for payment %s → %s", payment_id, _inv_email)
+        except Exception as _inv_exc:
+            logger.warning("Invoice email task could not be queued for payment %s: %s", payment_id, _inv_exc)
+
         return Response({
             'message': 'Payment successful.',
             'payment_id': payment_id,
@@ -964,6 +1015,7 @@ class InitiateSquarePaymentView(APIView):
             'total_charged': final_amount_with_tax,
             'result': result,
         }, status=status.HTTP_201_CREATED)
+
 
 
 # ===========================================================================
@@ -1153,6 +1205,14 @@ class SquareWebhookView(APIView):
             'Membership reset: user=%s sub=%s reset=[%s] next_end=%s',
             member_sub.client_id, subscription_id, reset_msg, period_end,
         )
+
+        # Queue renewal invoice email asynchronously
+        try:
+            from .tasks import send_subscription_renewal_invoice_task
+            send_subscription_renewal_invoice_task.delay(member_subscription_id=member_sub.pk)
+            logger.info('Subscription renewal invoice task queued for MemberSubscription pk=%s', member_sub.pk)
+        except Exception as _exc:
+            logger.warning('Could not queue renewal invoice task for sub %s: %s', subscription_id, _exc)
 
     def _handle_subscription_updated(self, data):
         """subscription.updated / subscription.created — sync status."""

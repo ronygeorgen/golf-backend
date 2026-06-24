@@ -16,6 +16,21 @@ class GHLLocation(models.Model):
         blank=True,
         help_text="Company logo (912×273 recommended, max 1 MB)"
     )
+    # Invoice / contact details — shown on payment receipt emails
+    contact_phone = models.CharField(
+        max_length=50,
+        blank=True,
+        help_text="Location phone number shown on invoice emails (e.g. +1 902-555-0100)."
+    )
+    support_email = models.EmailField(
+        blank=True,
+        help_text="Location support email shown on invoice emails (e.g. support@mygolfcenter.com)."
+    )
+    business_id = models.CharField(
+        max_length=100,
+        blank=True,
+        help_text="Business registration / GST-HST number shown on invoice emails."
+    )
     status = models.CharField(max_length=50, blank=True)
     webhook_url = models.URLField(blank=True)
     webhook_secret = models.CharField(max_length=255, blank=True)

@@ -15,6 +15,10 @@ class GHLLocationSerializer(serializers.ModelSerializer):
             'timezone',
             'logo',
             'logo_url',
+            # Invoice / contact details
+            'contact_phone',
+            'support_email',
+            'business_id',
             'status',
             'webhook_url',
             'webhook_secret',

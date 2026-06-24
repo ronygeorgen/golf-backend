@@ -275,3 +275,11 @@ if crontab:
     }
 else:
     CELERY_BEAT_SCHEDULE = {}
+
+# Resend Email Service
+RESEND_API_KEY = config('RESEND_API_KEY', default='')
+RESEND_FROM_EMAIL = config('RESEND_FROM_EMAIL', default='noreply@performgolf.net')
+# Absolute base URL of this backend — used to build logo image URLs in invoice emails.
+# Local dev: set to your ngrok URL. Production: set to your real API domain.
+BACKEND_BASE_URL = config('BACKEND_BASE_URL', default='').rstrip('/')
+

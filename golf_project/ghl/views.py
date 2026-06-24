@@ -538,6 +538,22 @@ def update_ghl_location_company_name(request, location_id):
             )
         location.timezone = timezone_str
         update_fields.append('timezone')
+
+    # Invoice contact fields
+    contact_phone = request.data.get('contact_phone')
+    if contact_phone is not None:
+        location.contact_phone = contact_phone.strip()
+        update_fields.append('contact_phone')
+
+    support_email = request.data.get('support_email')
+    if support_email is not None:
+        location.support_email = support_email.strip()
+        update_fields.append('support_email')
+
+    business_id = request.data.get('business_id')
+    if business_id is not None:
+        location.business_id = business_id.strip()
+        update_fields.append('business_id')
     
     location.save(update_fields=update_fields)
     

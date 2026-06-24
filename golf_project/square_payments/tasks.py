@@ -16,6 +16,177 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+# ===========================================================================
+# INVOICE EMAIL TASKS
+# ===========================================================================
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=60)
+def send_invoice_email_task(
+    self,
+    *,
+    customer_email: str,
+    customer_name: str,
+    payment_id: str,
+    payment_type: str,
+    item_description: str,
+    base_amount: float,
+    discount_amount: float = 0.0,
+    coupon_code: str = '',
+    tax_rate: float = 0.14,
+    tax_amount: float = 0.0,
+    total_amount: float,
+    ghl_location_id: str = '',
+    booking_date_iso: str = '',
+):
+    """
+    Asynchronous Celery task — send a payment invoice email via Resend.
+
+    Called after every successful Square payment so the invoice sending
+    never blocks or delays the payment confirmation response.
+
+    Args:
+        ghl_location_id : GHLLocation.location_id string used to fetch
+                          logo and contact details for the invoice.
+        booking_date_iso: ISO-8601 datetime string for the invoice date.
+    """
+    try:
+        from email_service import send_invoice_email
+        from django.utils.dateparse import parse_datetime
+
+        # Resolve GHL location branding
+        ghl_location = None
+        if ghl_location_id:
+            try:
+                from ghl.models import GHLLocation
+                ghl_location = GHLLocation.objects.get(location_id=ghl_location_id)
+            except Exception as exc:
+                logger.warning("send_invoice_email_task: could not load GHLLocation %s: %s", ghl_location_id, exc)
+
+        # Parse optional booking date
+        booking_date = None
+        if booking_date_iso:
+            try:
+                booking_date = parse_datetime(booking_date_iso)
+            except Exception:
+                pass
+
+        success = send_invoice_email(
+            customer_email=customer_email,
+            customer_name=customer_name,
+            payment_id=payment_id,
+            payment_type=payment_type,
+            item_description=item_description,
+            base_amount=base_amount,
+            discount_amount=discount_amount,
+            coupon_code=coupon_code,
+            tax_rate=tax_rate,
+            tax_amount=tax_amount,
+            total_amount=total_amount,
+            ghl_location=ghl_location,
+            booking_date=booking_date,
+        )
+        return {'success': success, 'payment_id': payment_id}
+
+    except Exception as exc:
+        logger.error(
+            "send_invoice_email_task failed for payment %s: %s",
+            payment_id, exc, exc_info=True,
+        )
+        raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=60)
+def send_subscription_renewal_invoice_task(self, *, member_subscription_id: int):
+    """
+    Send a monthly membership renewal invoice to the subscriber.
+
+    Called after invoice.payment_made webhook resets the member's hours.
+
+    Args:
+        member_subscription_id: PK of the MemberSubscription record.
+    """
+    try:
+        from .models import MemberSubscription
+        from email_service import send_invoice_email
+        from django.utils import timezone
+
+        member_sub = MemberSubscription.objects.select_related(
+            'client',
+            'package',
+            'coaching_package',
+        ).get(pk=member_subscription_id)
+
+        client = member_sub.client
+        customer_email = getattr(client, 'email', '') or ''
+        if not customer_email:
+            logger.info(
+                "send_subscription_renewal_invoice_task: client %s has no email, skipping.",
+                client.id,
+            )
+            return {'success': False, 'reason': 'no_email'}
+
+        first = getattr(client, 'first_name', '') or ''
+        last = getattr(client, 'last_name', '') or ''
+        customer_name = f"{first} {last}".strip() or getattr(client, 'username', '') or customer_email
+
+        # Determine package info
+        pkg = member_sub.package or member_sub.coaching_package
+        pkg_title = pkg.title if pkg else 'Membership'
+        monthly_price = getattr(pkg, 'monthly_price', None) or getattr(pkg, 'price', 0) or 0
+        try:
+            monthly_price = float(monthly_price)
+        except (TypeError, ValueError):
+            monthly_price = 0.0
+
+        HST_RATE = 0.14
+        tax_amount = round(monthly_price * HST_RATE, 2)
+        total_amount = round(monthly_price + tax_amount, 2)
+
+        # Resolve GHL location branding
+        ghl_location = None
+        ghl_location_id = member_sub.ghl_location_id
+        if ghl_location_id:
+            try:
+                from ghl.models import GHLLocation
+                ghl_location = GHLLocation.objects.get(location_id=ghl_location_id)
+            except Exception as exc:
+                logger.warning(
+                    "send_subscription_renewal_invoice_task: could not load GHLLocation %s: %s",
+                    ghl_location_id, exc,
+                )
+
+        success = send_invoice_email(
+            customer_email=customer_email,
+            customer_name=customer_name,
+            payment_id=f"sub_{member_sub.square_subscription_id}_{timezone.now().strftime('%Y%m')}",
+            payment_type='subscription',
+            item_description=f"Monthly Membership — {pkg_title}",
+            base_amount=monthly_price,
+            discount_amount=0.0,
+            coupon_code='',
+            tax_rate=HST_RATE,
+            tax_amount=tax_amount,
+            total_amount=total_amount,
+            ghl_location=ghl_location,
+            booking_date=timezone.now(),
+        )
+        logger.info(
+            "Subscription renewal invoice sent=%s for sub_id=%s client=%s",
+            success, member_sub.square_subscription_id, client.id,
+        )
+        return {'success': success, 'member_subscription_id': member_subscription_id}
+
+    except MemberSubscription.DoesNotExist:
+        logger.error("send_subscription_renewal_invoice_task: MemberSubscription %s not found.", member_subscription_id)
+        return {'success': False, 'reason': 'not_found'}
+    except Exception as exc:
+        logger.error(
+            "send_subscription_renewal_invoice_task failed for sub %s: %s",
+            member_subscription_id, exc, exc_info=True,
+        )
+        raise self.retry(exc=exc)
+
+
 @shared_task(bind=True, max_retries=3, default_retry_delay=300)
 def refresh_square_tokens_task(self):
     """
