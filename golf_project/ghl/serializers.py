@@ -19,6 +19,7 @@ class GHLLocationSerializer(serializers.ModelSerializer):
             'contact_phone',
             'support_email',
             'business_id',
+            'refund_policy',
             'status',
             'webhook_url',
             'webhook_secret',
@@ -48,21 +49,19 @@ class GHLLocationSerializer(serializers.ModelSerializer):
         """Return the absolute URL for the logo if it exists."""
         if not obj.logo:
             return None
-            
+
         from django.conf import settings
+
+        # ── Priority 1: Use BACKEND_BASE_URL if configured (always correct in prod) ──
+        backend_base = getattr(settings, 'BACKEND_BASE_URL', '').rstrip('/')
+        if backend_base:
+            return f"{backend_base}{obj.logo.url}"
+
+        # ── Priority 2: Build from request (works locally when no BACKEND_BASE_URL set) ──
         request = self.context.get('request')
-        
         if request:
-            url = request.build_absolute_uri(obj.logo.url)
-            # Fallback if reverse proxy headers aren't passing the real domain
-            if 'localhost' in url and getattr(settings, 'BACKEND_BASE_URL', '') and 'localhost' not in settings.BACKEND_BASE_URL:
-                return f"{settings.BACKEND_BASE_URL}{obj.logo.url}"
-            return url
-            
-        # Fallback if no request in context
-        if getattr(settings, 'BACKEND_BASE_URL', ''):
-            return f"{settings.BACKEND_BASE_URL}{obj.logo.url}"
-            
+            return request.build_absolute_uri(obj.logo.url)
+
         return obj.logo.url
 
 

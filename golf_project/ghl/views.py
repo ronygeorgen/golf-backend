@@ -554,6 +554,11 @@ def update_ghl_location_company_name(request, location_id):
     if business_id is not None:
         location.business_id = business_id.strip()
         update_fields.append('business_id')
+
+    refund_policy = request.data.get('refund_policy')
+    if refund_policy is not None:
+        location.refund_policy = refund_policy.strip()
+        update_fields.append('refund_policy')
     
     location.save(update_fields=update_fields)
     

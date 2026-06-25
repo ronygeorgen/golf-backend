@@ -57,6 +57,7 @@ def _build_invoice_html(
     contact_phone: str,
     support_email: str,
     business_id: str,
+    refund_policy: str,
     invoice_date: str,
 ) -> str:
     """Return a complete HTML string for the invoice email."""
@@ -120,6 +121,33 @@ def _build_invoice_html(
             f'<span>🏢 Business ID: {business_id}</span>'
         )
     contact_html = '&nbsp;&nbsp;|&nbsp;&nbsp;'.join(contact_parts) if contact_parts else ''
+
+    # ── Refund policy block (only shown when set) ─────────────────────────
+    if refund_policy:
+        # Replace newlines with <br> for HTML rendering
+        refund_policy_html_text = refund_policy.replace('\n', '<br/>')
+        refund_policy_block = f'''
+          <!-- ── Refund Policy ─────────────────────────────────────────── -->
+          <tr>
+            <td style="padding:0 40px 28px;">
+              <table width="100%" cellpadding="0" cellspacing="0" role="presentation"
+                     style="border:1px solid #e2e8f0; border-radius:10px; overflow:hidden;">
+                <tr style="background:#f8fafc;">
+                  <td style="padding:10px 16px; border-bottom:1px solid #e2e8f0;">
+                    <span style="font-size:12px; font-weight:700; color:#64748b;
+                                 text-transform:uppercase; letter-spacing:.6px;">Refund &amp; Cancellation Policy</span>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding:14px 16px; font-size:13px; color:#475569; line-height:1.7;">
+                    {refund_policy_html_text}
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>'''
+    else:
+        refund_policy_block = ''
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -273,6 +301,7 @@ def _build_invoice_html(
           </tr>
 
           <!-- ── Footer ─────────────────────────────────────────────────── -->
+          {refund_policy_block}
           <tr>
             <td style="background:#f8fafc; padding:24px 40px;
                         border-top:1px solid #e2e8f0; text-align:center;">
@@ -361,12 +390,14 @@ def send_invoice_email(
     contact_phone = ''
     support_email = ''
     business_id = ''
+    refund_policy = ''
 
     if ghl_location:
         company_name = ghl_location.company_name or company_name
         contact_phone = ghl_location.contact_phone or ''
         support_email = ghl_location.support_email or ''
         business_id = ghl_location.business_id or ''
+        refund_policy = ghl_location.refund_policy or ''
 
         # Build absolute logo URL — stored as a relative media path
         if ghl_location.logo:
@@ -404,6 +435,7 @@ def send_invoice_email(
         contact_phone=contact_phone,
         support_email=support_email,
         business_id=business_id,
+        refund_policy=refund_policy,
         invoice_date=invoice_date,
     )
 

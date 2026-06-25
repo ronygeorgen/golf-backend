@@ -31,6 +31,10 @@ class GHLLocation(models.Model):
         blank=True,
         help_text="Business registration / GST-HST number shown on invoice emails."
     )
+    refund_policy = models.TextField(
+        blank=True,
+        help_text="Refund / cancellation policy text shown on invoice emails."
+    )
     status = models.CharField(max_length=50, blank=True)
     webhook_url = models.URLField(blank=True)
     webhook_secret = models.CharField(max_length=255, blank=True)
