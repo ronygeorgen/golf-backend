@@ -48,9 +48,21 @@ class GHLLocationSerializer(serializers.ModelSerializer):
         """Return the absolute URL for the logo if it exists."""
         if not obj.logo:
             return None
+            
+        from django.conf import settings
         request = self.context.get('request')
+        
         if request:
-            return request.build_absolute_uri(obj.logo.url)
+            url = request.build_absolute_uri(obj.logo.url)
+            # Fallback if reverse proxy headers aren't passing the real domain
+            if 'localhost' in url and getattr(settings, 'BACKEND_BASE_URL', '') and 'localhost' not in settings.BACKEND_BASE_URL:
+                return f"{settings.BACKEND_BASE_URL}{obj.logo.url}"
+            return url
+            
+        # Fallback if no request in context
+        if getattr(settings, 'BACKEND_BASE_URL', ''):
+            return f"{settings.BACKEND_BASE_URL}{obj.logo.url}"
+            
         return obj.logo.url
 
 
