@@ -60,32 +60,65 @@ class Coupon(models.Model):
         # Purpose check
         if payment_type and self.applicable_to != 'all':
             allowed_types = [t.strip() for t in self.applicable_to.split(',') if t.strip()]
-            
+            purpose_valid = False
+
             # 1. Exact match (e.g. 'simulator' in ['simulator', 'package'])
             if payment_type in allowed_types:
-                return True, ""
-            
-            # 2. General 'asset' match for specific asset requests (e.g. 'asset:5' matches 'asset')
-            if payment_type.startswith('asset:') and 'asset' in allowed_types:
-                return True, ""
-            
-            # 3. None match
-            purpose_map = dict(self.APPLICABLE_CHOICES)
-            # If it's a specific asset, try to find a nice label if it's in the allowed list
-            allowed_labels = []
-            for t in allowed_types:
-                if t.startswith('asset:'):
-                    try:
-                        from categories.models import CategoryAsset
-                        asset_id = t.split(':')[1]
-                        asset_obj = CategoryAsset.objects.get(id=asset_id)
-                        allowed_labels.append(f"Asset: {asset_obj.name}")
-                    except Exception:
-                        allowed_labels.append(purpose_map.get(t, t))
-                else:
-                    allowed_labels.append(purpose_map.get(t, t))
+                purpose_valid = True
 
-            return False, f"This coupon is only valid for: {', '.join(allowed_labels)}."
+            # 2. General 'asset' match for specific asset requests (e.g. 'asset:5' matches 'asset')
+            elif payment_type.startswith('asset:') and 'asset' in allowed_types:
+                purpose_valid = True
+
+            # 3. Specific package match: 'package:5' matches 'package:5' in allowed_types
+            #    OR 'package' (all packages) in allowed_types covers any package:ID
+            elif payment_type.startswith('package:'):
+                if 'package' in allowed_types or payment_type in allowed_types:
+                    purpose_valid = True
+                else:
+                    return False, "This coupon is not valid for the selected package."
+
+            # 4. Specific event match: 'event:5' matches 'event:5' in allowed_types
+            #    OR 'event' (all events) in allowed_types covers any event:ID
+            elif payment_type.startswith('event:'):
+                if 'event' in allowed_types or payment_type in allowed_types:
+                    purpose_valid = True
+                else:
+                    return False, "This coupon is not valid for the selected event."
+
+            if not purpose_valid:
+                # 5. No match — build a readable error
+                purpose_map = dict(self.APPLICABLE_CHOICES)
+                allowed_labels = []
+                for t in allowed_types:
+                    if t.startswith('asset:'):
+                        try:
+                            from categories.models import CategoryAsset
+                            asset_id = t.split(':')[1]
+                            asset_obj = CategoryAsset.objects.get(id=asset_id)
+                            allowed_labels.append(f"Asset: {asset_obj.name}")
+                        except Exception:
+                            allowed_labels.append(purpose_map.get(t, t))
+                    elif t.startswith('package:'):
+                        try:
+                            from coaching.models import CoachingPackage
+                            pkg_id = t.split(':')[1]
+                            pkg_obj = CoachingPackage.objects.get(id=pkg_id)
+                            allowed_labels.append(f"Package: {pkg_obj.title}")
+                        except Exception:
+                            allowed_labels.append(f"Package #{t.split(':')[1]}")
+                    elif t.startswith('event:'):
+                        try:
+                            from special_events.models import SpecialEvent
+                            evt_id = t.split(':')[1]
+                            evt_obj = SpecialEvent.objects.get(id=evt_id)
+                            allowed_labels.append(f"Event: {evt_obj.title}")
+                        except Exception:
+                            allowed_labels.append(f"Event #{t.split(':')[1]}")
+                    else:
+                        allowed_labels.append(purpose_map.get(t, t))
+
+                return False, f"This coupon is only valid for: {', '.join(allowed_labels)}."
 
         # Per-user limit check (if info provided)
         if self.per_user_limit:

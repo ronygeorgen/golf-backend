@@ -9,6 +9,10 @@ class CoachingPackage(models.Model):
     title = models.CharField(max_length=200)
     description = models.TextField()
     price = models.DecimalField(max_digits=8, decimal_places=2)
+    hide_price_on_card = models.BooleanField(
+        default=False, 
+        help_text="If True, hides the price on the package card but shows it in the checkout modal."
+    )
     location_id = models.CharField(max_length=100, blank=True, null=True, help_text="GHL location ID for this package")
     staff_members = models.ManyToManyField('users.User', limit_choices_to={'role': 'staff'})
     session_count = models.PositiveIntegerField(default=1, help_text="How many coaching sessions are included.")
@@ -479,6 +483,10 @@ class SimulatorPackage(models.Model):
     title = models.CharField(max_length=200)
     description = models.TextField()
     price = models.DecimalField(max_digits=8, decimal_places=2)
+    hide_price_on_card = models.BooleanField(
+        default=False, 
+        help_text="If True, hides the price on the package card but shows it in the checkout modal."
+    )
     location_id = models.CharField(max_length=100, blank=True, null=True, help_text="GHL location ID for this simulator package")
     hours = models.DecimalField(
         max_digits=6,

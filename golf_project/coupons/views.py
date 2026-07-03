@@ -142,6 +142,18 @@ class CouponValidateView(APIView):
         code = serializer.validated_data['code'].upper().strip()
         amount = float(serializer.validated_data['amount'])
         payment_type = serializer.validated_data.get('payment_type')
+        package_id = serializer.validated_data.get('package_id')
+        event_id = serializer.validated_data.get('event_id')
+
+        # If a specific package_id is provided and payment_type is 'package',
+        # construct the specific token so per-package coupon restrictions work.
+        if payment_type == 'package' and package_id:
+            payment_type = f'package:{package_id}'
+
+        # If a specific event_id is provided and payment_type is 'event',
+        # construct the specific token so per-event coupon restrictions work.
+        if payment_type == 'event' and event_id:
+            payment_type = f'event:{event_id}'
 
         # Resolve identity from authenticated user
         user = request.user

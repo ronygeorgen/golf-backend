@@ -67,3 +67,7 @@ class CouponValidateSerializer(serializers.Serializer):
     amount = serializers.DecimalField(max_digits=10, decimal_places=2)
     # payment_type is a free string — validation against applicable_to is done in is_valid()
     payment_type = serializers.CharField(max_length=30, required=False)
+    # Optional: specific package ID for per-package coupon restriction checks
+    package_id = serializers.IntegerField(required=False)
+    # Optional: specific event ID for per-event coupon restriction checks
+    event_id = serializers.IntegerField(required=False)

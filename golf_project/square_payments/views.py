@@ -482,12 +482,13 @@ def _resolve_square_credentials(temp_id_str: str, payment_type: str):
                 buyer = User.objects.filter(phone=tp.buyer_phone).first()
                 ghl_location_id = getattr(buyer, 'ghl_location_id', None) if buyer else None
         elif payment_type == 'event':
-            from special_events.models import TempEventRegistration
-            ter = TempEventRegistration.objects.filter(temp_id=temp_id_str).first()
+            from special_events.models import TempSpecialEventBooking
+            ter = TempSpecialEventBooking.objects.filter(temp_id=temp_id_str).first()
             if ter:
-                from users.models import User
-                buyer = User.objects.filter(phone=ter.phone).first()
-                ghl_location_id = getattr(buyer, 'ghl_location_id', None) if buyer else None
+                if ter.event and ter.event.location_id:
+                    ghl_location_id = ter.event.location_id
+                elif ter.user:
+                    ghl_location_id = getattr(ter.user, 'ghl_location_id', None)
     except Exception as exc:
         logger.warning("_resolve_square_credentials: error resolving location: %s", exc)
 
@@ -793,6 +794,8 @@ class InitiateSquarePaymentView(APIView):
         guest_email = ''
 
         try:
+            tp = None  # Will be populated for 'package' payment type
+
             if payment_type == 'simulator':
                 item_label = 'Simulator Booking'
                 from bookings.models import TempBooking
@@ -806,13 +809,14 @@ class InitiateSquarePaymentView(APIView):
                     guest_phone = tp.buyer_phone
                     item_label = tp.package.title if tp.package else (tp.simulator_package.title if tp.simulator_package else 'Package Purchase')
             elif payment_type == 'event':
-                from special_events.models import TempEventRegistration
-                ter = TempEventRegistration.objects.filter(temp_id=temp_id_str).first()
+                from special_events.models import TempSpecialEventBooking
+                ter = TempSpecialEventBooking.objects.filter(temp_id=temp_id_str).first()
                 if ter:
-                    guest_phone = ter.phone
-                    guest_email = ter.email
-                    if ter.occurrence:
-                        item_label = f"Event: {ter.occurrence.event.title}"
+                    if ter.user:
+                        guest_phone = getattr(ter.user, 'phone', '')
+                        guest_email = getattr(ter.user, 'email', '')
+                    if ter.event:
+                        item_label = f"Event: {ter.event.title}"
             elif payment_type == 'asset' or (payment_type and payment_type.startswith('asset:')):
                 from bookings.models import TempBooking
                 tb = TempBooking.objects.filter(temp_id=temp_id_str).first()
@@ -846,7 +850,17 @@ class InitiateSquarePaymentView(APIView):
             email = getattr(request.user, 'email', None) or guest_email
             phone = getattr(request.user, 'phone', None) or guest_phone
 
-            valid, err = coupon_obj.is_valid(payment_type=payment_type, user=user_obj, email=email, phone=phone)
+            valid, err = coupon_obj.is_valid(
+                payment_type=(
+                    # Use specific package token if a package is involved so that
+                    # per-package coupon restrictions (package:ID in applicable_to) are enforced.
+                    f'package:{tp.package.id}' if payment_type == 'package' and tp and tp.package
+                    else f'package:{tp.simulator_package.id}' if payment_type == 'package' and tp and tp.simulator_package
+                    else f'event:{ter.event.id}' if payment_type == 'event' and ter and ter.event
+                    else payment_type
+                ),
+                user=user_obj, email=email, phone=phone)
+
             if not valid:
                 return Response({'error': err}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -1399,6 +1413,7 @@ class MembershipSubscribeView(APIView):
         package_id = request.data.get('package_id')
         package_type = request.data.get('package_type', 'simulator') # Default to simulator for backward compatibility
         ghl_location_id = request.data.get('location_id', '').strip()
+        coupon_code = (request.data.get('coupon_code') or '').strip().upper()
         
         import hashlib
         
@@ -1463,6 +1478,27 @@ class MembershipSubscribeView(APIView):
 
         access_token = account.access_token
         square_location_id = account.square_location_id
+
+        # ── Validate coupon if provided ──────────────────────────────────────
+        coupon_obj = None
+        discount_amount = 0.0
+        if coupon_code:
+            from coupons.models import Coupon, CouponUsage
+            try:
+                coupon_obj = Coupon.objects.select_for_update().get(code=coupon_code)
+            except Coupon.DoesNotExist:
+                return Response({'error': f'Coupon "{coupon_code}" is invalid.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            valid, err = coupon_obj.is_valid(
+                payment_type=f'package:{package.id}',
+                user=request.user,
+                email=getattr(request.user, 'email', None),
+                phone=getattr(request.user, 'phone', None),
+            )
+            if not valid:
+                return Response({'error': err}, status=status.HTTP_400_BAD_REQUEST)
+
+            discount_amount = coupon_obj.calculate_discount(float(package.price or 0))
 
         try:
             # Step 1: upsert Square customer
@@ -1546,6 +1582,25 @@ class MembershipSubscribeView(APIView):
             'MemberSubscription created: user=%s package=%s sub_id=%s',
             request.user.id, package.id, sub_data['id'],
         )
+
+        if coupon_obj:
+            from coupons.models import Coupon as CouponModel, CouponUsage
+            CouponUsage.objects.create(
+                coupon=coupon_obj,
+                user=request.user,
+                customer_email=getattr(request.user, 'email', '') or '',
+                customer_phone=getattr(request.user, 'phone', '') or '',
+                payment_id=sub_data['id'],
+                payment_type='package',
+                item_label=package.title,
+                discount_amount=discount_amount,
+                original_amount=float(package.price or 0),
+                final_amount=float(package.price or 0) - discount_amount,
+            )
+            # Increment the uses_count counter on the coupon itself
+            CouponModel.objects.filter(pk=coupon_obj.pk).update(uses_count=models.F('uses_count') + 1)
+            logger.info("CouponUsage recorded for membership: %s, sub=%s", coupon_obj.code, sub_data['id'])
+
 
         purchase_id = purchase.id if purchase else coaching_purchase.id
         granted_msg = f"{sim_pkg.monthly_hours} hours" if sim_pkg else "sessions/hours"
