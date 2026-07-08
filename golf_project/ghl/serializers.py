@@ -20,6 +20,7 @@ class GHLLocationSerializer(serializers.ModelSerializer):
             'support_email',
             'business_id',
             'refund_policy',
+            'tax_rate',
             'status',
             'webhook_url',
             'webhook_secret',

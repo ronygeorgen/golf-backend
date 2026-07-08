@@ -35,6 +35,12 @@ class GHLLocation(models.Model):
         blank=True,
         help_text="Refund / cancellation policy text shown on invoice emails."
     )
+    tax_rate = models.DecimalField(
+        max_digits=5,
+        decimal_places=4,
+        default=0.14,
+        help_text="Tax rate as a decimal fraction (e.g. 0.14 for 14% HST). Applied to all Square payments at this location."
+    )
     status = models.CharField(max_length=50, blank=True)
     webhook_url = models.URLField(blank=True)
     webhook_secret = models.CharField(max_length=255, blank=True)

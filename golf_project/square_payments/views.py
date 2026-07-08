@@ -514,7 +514,7 @@ def _resolve_square_credentials(temp_id_str: str, payment_type: str):
         "Using per-location Square token for location %s (merchant=%s)",
         ghl_location_id, account.merchant_id,
     )
-    return account.access_token, account.square_location_id
+    return account.access_token, account.square_location_id, ghl_location_id
 
 
 # ===========================================================================
@@ -831,9 +831,6 @@ class InitiateSquarePaymentView(APIView):
         except (ValueError, TypeError):
             return Response({'error': 'Invalid amount.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Nova Scotia HST rate (14%, effective April 1 2025: 5% federal GST + 9% provincial)
-        HST_RATE = 0.14
-
         coupon_obj = None
         discount_amount = 0.0
         final_amount = original_amount  # post-coupon base (still pre-tax)
@@ -868,19 +865,31 @@ class InitiateSquarePaymentView(APIView):
             final_amount = round(original_amount - discount_amount, 2)  # post-coupon base, still pre-tax
             logger.info("Coupon %s applied: -%s → discounted_base=%s", coupon_code, discount_amount, final_amount)
 
-        # ── Apply Nova Scotia HST (14%) on top of post-coupon base ───────────
-        tax_amount = round(final_amount * HST_RATE, 2)
-        final_amount_with_tax = round(final_amount + tax_amount, 2)
-        logger.info(
-            "HST 14%% applied: base=%s, tax=%s, total_with_tax=%s",
-            final_amount, tax_amount, final_amount_with_tax,
-        )
-
         # ── Resolve per-location Square credentials ──────────────────────────
         try:
-            sq_access_token, sq_location_id = _resolve_square_credentials(temp_id_str, payment_type)
+            sq_access_token, sq_location_id, ghl_location_id = _resolve_square_credentials(temp_id_str, payment_type)
         except ValueError as exc:
             return Response({'error': str(exc)}, status=status.HTTP_402_PAYMENT_REQUIRED)
+
+        # ── Look up this location's tax rate ─────────────────────────────────
+        from decimal import Decimal as _Decimal
+        TAX_RATE = _Decimal('0.14')  # safe fallback (14% HST)
+        try:
+            from ghl.models import GHLLocation
+            _loc = GHLLocation.objects.filter(location_id=ghl_location_id).only('tax_rate').first()
+            if _loc is not None and _loc.tax_rate is not None:
+                TAX_RATE = _Decimal(str(_loc.tax_rate))
+            logger.info("Tax rate for location %s: %s", ghl_location_id, TAX_RATE)
+        except Exception as _tax_exc:
+            logger.warning("Could not fetch tax_rate for location %s, using default 0.14: %s", ghl_location_id, _tax_exc)
+
+        # ── Apply location-specific tax on top of post-coupon base ───────────
+        tax_amount = round(float(final_amount) * float(TAX_RATE), 2)
+        final_amount_with_tax = round(final_amount + tax_amount, 2)
+        logger.info(
+            "Tax %.4f%% applied: base=%s, tax=%s, total_with_tax=%s",
+            float(TAX_RATE) * 100, final_amount, tax_amount, final_amount_with_tax,
+        )
 
         # ── Charge Square (tax-inclusive total) ───────────────────────────────
         amount_cents = int(round(final_amount_with_tax * 100))
@@ -902,7 +911,7 @@ class InitiateSquarePaymentView(APIView):
                 note=(
                     f"Golf booking ({payment_type})"
                     f"{' | coupon:' + coupon_code if coupon_code else ''}"
-                    f" | HST 14%: ${tax_amount:.2f}"
+                    f" | Tax {float(TAX_RATE)*100:.2f}%: ${tax_amount:.2f}"
                 ),
                 metadata=metadata,
                 access_token=sq_access_token,
@@ -1006,7 +1015,7 @@ class InitiateSquarePaymentView(APIView):
                 base_amount=float(original_amount),
                 discount_amount=float(discount_amount),
                 coupon_code=coupon_code,
-                tax_rate=HST_RATE,
+                tax_rate=float(TAX_RATE),
                 tax_amount=float(tax_amount),
                 total_amount=float(final_amount_with_tax),
                 ghl_location_id=_inv_ghl_loc_id,
@@ -1024,7 +1033,7 @@ class InitiateSquarePaymentView(APIView):
             'coupon_applied': coupon_code or None,
             'discount_amount': discount_amount,
             'base_amount': original_amount,
-            'tax_rate': 0.14,
+            'tax_rate': float(TAX_RATE),
             'tax_amount': tax_amount,
             'total_charged': final_amount_with_tax,
             'result': result,
@@ -1337,6 +1346,16 @@ class SquareConfigView(APIView):
 
     def get(self, request):
         ghl_location_id = request.query_params.get('location_id', '').strip()
+        temp_id = request.query_params.get('temp_id', '').strip()
+        payment_type = request.query_params.get('payment_type', '').strip()
+
+        # If temp_id and payment_type are provided, try to resolve the location
+        if temp_id and payment_type and not ghl_location_id:
+            try:
+                from .views import _resolve_square_credentials
+                _, _, ghl_location_id = _resolve_square_credentials(temp_id, payment_type)
+            except Exception:
+                pass
 
         app_id = settings.SQUARE_APPLICATION_ID
         env = settings.SQUARE_ENVIRONMENT
@@ -1354,15 +1373,27 @@ class SquareConfigView(APIView):
             except LocationSquareAccount.DoesNotExist:
                 pass  # Fall back to global
 
+        # Try to resolve tax_rate
+        tax_rate = 0.14
+        if ghl_location_id:
+            try:
+                from ghl.models import GHLLocation
+                loc = GHLLocation.objects.filter(location_id=ghl_location_id).only('tax_rate').first()
+                if loc and loc.tax_rate is not None:
+                    tax_rate = float(loc.tax_rate)
+            except Exception:
+                pass
+
         logger.info(
-            "Square config requested. app_id=%s..., env=%s, location_id=%s",
-            app_id[:10], env, resolved_location_id,
+            "Square config requested. app_id=%s..., env=%s, location_id=%s, tax_rate=%s",
+            app_id[:10], env, resolved_location_id, tax_rate
         )
         return Response({
             'application_id': app_id,
             'location_id': resolved_location_id,
             'environment': env,
             'currency': getattr(settings, 'SQUARE_CURRENCY', 'CAD'),
+            'tax_rate': tax_rate,
         })
 
 
@@ -1511,7 +1542,16 @@ class MembershipSubscribeView(APIView):
             )
 
             # Step 3: upsert subscription plan in Square Catalog
-            _, plan_variation_id = upsert_subscription_plan(access_token, square_location_id, package)
+            # Fetch this location's configured tax rate
+            _sub_tax_rate = 0.14  # fallback
+            try:
+                from ghl.models import GHLLocation as _GHLLoc
+                _gloc = _GHLLoc.objects.filter(location_id=ghl_location_id).only('tax_rate').first()
+                if _gloc and _gloc.tax_rate is not None:
+                    _sub_tax_rate = float(_gloc.tax_rate)
+            except Exception:
+                pass
+            _, plan_variation_id = upsert_subscription_plan(access_token, square_location_id, package, tax_rate=_sub_tax_rate)
 
             # Step 4: create the subscription
             sub_data = create_square_subscription(

@@ -567,19 +567,22 @@ def save_card_on_file(access_token: str, customer_id: str, source_id: str, idemp
         raise ValueError(human_msg)
 
 
-def upsert_subscription_plan(access_token: str, location_id: str, package) -> tuple:
+def upsert_subscription_plan(access_token: str, location_id: str, package, tax_rate: float = 0.14) -> tuple:
     """
     Upsert a Square Catalog subscription plan for the given SimulatorPackage.
     Uses the package ID as an idempotency key — safe to call repeatedly.
     Returns (catalog_item_id, plan_variation_id).
+
+    Args:
+        tax_rate: Tax rate as a decimal fraction (e.g. 0.14 for 14% HST).
+                  Defaults to 0.14 for backward compatibility.
     """
     client = get_square_client(access_token)
 
     plan_name = f'{package.title} — Monthly Membership'
-    # Calculate tax-inclusive price (HST 14%)
-    HST_RATE = 0.14
+    # Calculate tax-inclusive price using the location's configured tax rate
     base_price = float(package.price)
-    tax_amount = round(base_price * HST_RATE, 2)
+    tax_amount = round(base_price * float(tax_rate), 2)
     tax_inclusive_price = round(base_price + tax_amount, 2)
     price_cents = int(round(tax_inclusive_price * 100))
     import hashlib

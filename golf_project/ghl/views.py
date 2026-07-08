@@ -559,6 +559,24 @@ def update_ghl_location_company_name(request, location_id):
     if refund_policy is not None:
         location.refund_policy = refund_policy.strip()
         update_fields.append('refund_policy')
+
+    tax_rate = request.data.get('tax_rate')
+    if tax_rate is not None:
+        try:
+            from decimal import Decimal
+            tax_rate_decimal = Decimal(str(tax_rate))
+            if not (0 <= tax_rate_decimal <= 1):
+                return Response(
+                    {'error': 'tax_rate must be a decimal between 0 and 1 (e.g. 0.14 for 14%).'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            location.tax_rate = tax_rate_decimal
+            update_fields.append('tax_rate')
+        except Exception:
+            return Response(
+                {'error': 'Invalid tax_rate value. Must be a number between 0 and 1.'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
     
     location.save(update_fields=update_fields)
     
