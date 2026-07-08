@@ -94,7 +94,8 @@ def sync_purchase_with_ghl_task(self, purchase_id):
             return None
         
         user = purchase.client
-        location_id = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+        from .services import get_notifications_location_id
+        location_id = get_notifications_location_id(getattr(user, 'ghl_location_id', None))
         
         if not location_id:
             logger.warning("No GHL location for purchase %s", purchase_id)

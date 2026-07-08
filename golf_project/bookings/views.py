@@ -2047,8 +2047,9 @@ class BookingViewSet(viewsets.ModelViewSet):
         # Update GHL custom fields after booking cancellation
         try:
             from ghl.tasks import update_user_ghl_custom_fields_task, update_ghl_cancellation_fields_task
+            from ghl.services import get_notifications_location_id
             # Use booking-specific location or default
-            ghl_loc_id = getattr(booking, 'location_id', None) or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            ghl_loc_id = get_notifications_location_id(getattr(booking, 'location_id', None))
             
             # Track the cancelled date (asynchronously)
             update_ghl_cancellation_fields_task.delay(booking.client.id, booking_id=booking.id, location_id=ghl_loc_id)

@@ -7,11 +7,13 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.authtoken.models import Token
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from users.permissions import IsActiveLocationMember
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
 from .utils import get_location_id_from_request, filter_by_location, get_users_by_location
+
+from ghl.services import get_notifications_location_id
 
 try:
     from ghl.tasks import sync_user_contact_task
@@ -19,6 +21,7 @@ try:
 except ImportError:
     CELERY_AVAILABLE = False
     sync_user_contact_task = None
+
 from .models import User, LiabilityWaiverAcceptance
 from .serializers import (
     PhoneLoginSerializer, 
@@ -29,7 +32,6 @@ from .serializers import (
 )
 
 logger = logging.getLogger(__name__)
-
 
 class MemberListPagination(PageNumberPagination):
     page_size = 10
@@ -138,7 +140,7 @@ def request_otp(request):
         if not resolved_location:
             # If user doesn't have location_id, try to get from request or use default
             request_location_id = get_location_id_from_request(request)
-            resolved_location = request_location_id or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            resolved_location = get_notifications_location_id(request_location_id)
             # Update user's ghl_location_id if we got one from request
             if request_location_id:
                 user.ghl_location_id = request_location_id
@@ -244,7 +246,7 @@ def verify_otp(request):
                 if not resolved_location:
                     # If user doesn't have location_id, try to get from request or use default
                     request_location_id = get_location_id_from_request(request)
-                    resolved_location = request_location_id or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+                    resolved_location = get_notifications_location_id(request_location_id)
                     # Update user's ghl_location_id if we got one from request
                     if request_location_id:
                         user.ghl_location_id = request_location_id
@@ -507,12 +509,12 @@ def signup(request):
             except GHLLocation.DoesNotExist:
                 logger.warning("Invalid location_id %s provided during signup for user %s", location_id, user.id)
                 # Fallback to default if provided location is invalid
-                resolved_location = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+                resolved_location = get_notifications_location_id(None)
                 if resolved_location:
                     user.ghl_location_id = resolved_location
         else:
             # Fallback to default location if not provided
-            resolved_location = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            resolved_location = get_notifications_location_id(None)
             if resolved_location:
                 user.ghl_location_id = resolved_location
         
@@ -537,7 +539,7 @@ def signup(request):
         # Sync user to GHL (create contact if doesn't exist)
         try:
             # Use user's ghl_location_id if set, otherwise fallback to default
-            resolved_location = user.ghl_location_id or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            resolved_location = get_notifications_location_id(user.ghl_location_id)
             
             if resolved_location:
                 if CELERY_AVAILABLE and sync_user_contact_task:
@@ -602,12 +604,12 @@ def signup_without_otp(request):
             except GHLLocation.DoesNotExist:
                 logger.warning("Invalid location_id %s provided during signup for user %s", location_id, user.id)
                 # Fallback to default if provided location is invalid
-                resolved_location = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+                resolved_location = get_notifications_location_id(None)
                 if resolved_location:
                     user.ghl_location_id = resolved_location
         else:
             # Fallback to default location if not provided
-            resolved_location = getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            resolved_location = get_notifications_location_id(None)
             if resolved_location:
                 user.ghl_location_id = resolved_location
         
@@ -623,7 +625,7 @@ def signup_without_otp(request):
         # Sync user to GHL (create contact if doesn't exist)
         try:
             # Use user's ghl_location_id if set, otherwise fallback to default
-            resolved_location = user.ghl_location_id or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            resolved_location = get_notifications_location_id(user.ghl_location_id)
             
             if resolved_location:
                 if CELERY_AVAILABLE and sync_user_contact_task:
@@ -776,7 +778,7 @@ def profile(request):
             
             # Sync to GHL if any standard fields changed (including DOB)
             try:
-                resolved_location = getattr(user, 'ghl_location_id', None) or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+                resolved_location = get_notifications_location_id(getattr(user, 'ghl_location_id', None))
                 if resolved_location:
                     if CELERY_AVAILABLE and sync_user_contact_task:
                         # Queue async task to sync with GHL
@@ -844,7 +846,7 @@ def update_dob(request):
         
         # Sync DOB to GHL
         try:
-            resolved_location = getattr(user, 'ghl_location_id', None) or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+            resolved_location = get_notifications_location_id(getattr(user, 'ghl_location_id', None))
             if resolved_location:
                 if CELERY_AVAILABLE and sync_user_contact_task:
                     # Queue async task to sync with GHL
@@ -1273,3 +1275,4 @@ def accept_waiver(request):
         return Response({
             'error': 'Failed to accept waiver'
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+

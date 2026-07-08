@@ -696,6 +696,31 @@ def purchase_custom_fields(purchase_name, amount):
     }
 
 
+def get_notifications_location_id(golf_center_location_id: str) -> str:
+    """
+    Resolve which GHL subaccount should receive notification pushes
+    for users belonging to the given golf center.
+    
+    Priority:
+      1. location.notifications_location (if set by superadmin)
+      2. the golf center's own location_id
+      3. GHL_DEFAULT_LOCATION from settings (env fallback)
+    """
+    from django.conf import settings
+    if not golf_center_location_id:
+        return getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+    
+    try:
+        loc = GHLLocation.objects.select_related('notifications_location').get(
+            location_id=golf_center_location_id
+        )
+        if loc.notifications_location:
+            return loc.notifications_location.location_id
+        return golf_center_location_id
+    except GHLLocation.DoesNotExist:
+        return getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+
+
 def sync_user_contact(user, *, location_id: Optional[str] = None,
                       tags: Optional[List[str]] = None, custom_fields: Optional[dict] = None):
     """
@@ -706,8 +731,10 @@ def sync_user_contact(user, *, location_id: Optional[str] = None,
         logger.warning("Cannot sync user to GHL: user or phone missing")
         return None, None
 
-    # Resolve location: use provided location_id, or user's ghl_location_id, or default from settings
-    resolved_location = location_id or getattr(user, 'ghl_location_id', None) or getattr(settings, 'GHL_DEFAULT_LOCATION', None)
+    # Resolve location: user's location -> resolved to notifications account if set
+    user_location = location_id or getattr(user, 'ghl_location_id', None)
+    resolved_location = get_notifications_location_id(user_location)
+    
     if not resolved_location:
         logger.warning("No GHL location available for user %s", user.id)
         return None, None

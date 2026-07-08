@@ -189,9 +189,9 @@ def run_deactivate_simulator_reassign(
             from django.conf import settings
             from ghl.tasks import update_user_ghl_custom_fields_task
 
-            ghl_loc_id = getattr(booking, 'location_id', None) or getattr(
-                settings, 'GHL_DEFAULT_LOCATION', None
-            )
+            from ghl.services import get_notifications_location_id
+
+            ghl_loc_id = get_notifications_location_id(getattr(booking, 'location_id', None))
             update_user_ghl_custom_fields_task.delay(booking.client_id, location_id=ghl_loc_id)
         except Exception as exc:
             logger.warning(

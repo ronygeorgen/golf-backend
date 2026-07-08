@@ -583,6 +583,21 @@ def update_ghl_location_company_name(request, location_id):
     if status_val in ['active', 'inactive']:
         location.status = status_val
         update_fields.append('status')
+        
+    notifications_location_id = request.data.get('notifications_location_id')
+    if notifications_location_id is not None:
+        if notifications_location_id == '':
+            location.notifications_location = None
+        else:
+            try:
+                notif_loc = GHLLocation.objects.get(location_id=notifications_location_id)
+                location.notifications_location = notif_loc
+            except GHLLocation.DoesNotExist:
+                return Response(
+                    {'error': f'Notifications location {notifications_location_id} not found.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        update_fields.append('notifications_location')
     
     location.save(update_fields=update_fields)
     

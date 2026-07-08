@@ -5,6 +5,12 @@ from .models import GHLLocation
 class GHLLocationSerializer(serializers.ModelSerializer):
     is_token_valid = serializers.SerializerMethodField()
     logo_url = serializers.SerializerMethodField()
+    notifications_location_id = serializers.CharField(
+        source='notifications_location.location_id',
+        read_only=True,
+        allow_null=True,
+        default=None,
+    )
 
     class Meta:
         model = GHLLocation
@@ -31,11 +37,12 @@ class GHLLocationSerializer(serializers.ModelSerializer):
             'metadata',
             'onboarded_at',
             'created_at',
+            'notifications_location_id',
         ]
         read_only_fields = [
             'id', 'status', 'webhook_secret', 'token_expires_at',
             'is_token_valid', 'metadata', 'onboarded_at', 'created_at',
-            'logo_url',
+            'logo_url', 'notifications_location_id',
         ]
         extra_kwargs = {
             'access_token': {'write_only': True},

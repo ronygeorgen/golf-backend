@@ -44,6 +44,17 @@ class GHLLocation(models.Model):
     status = models.CharField(max_length=50, blank=True)
     webhook_url = models.URLField(blank=True)
     webhook_secret = models.CharField(max_length=255, blank=True)
+    
+    # Notifications Routing
+    notifications_location = models.ForeignKey(
+        'self',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='notification_targets',
+        help_text="GHL subaccount to push all notifications for this center's users through. If blank, uses this location's own credentials."
+    )
+    
     # OAuth tokens
     access_token = models.TextField(blank=True, help_text="OAuth access token")
     refresh_token = models.TextField(blank=True, help_text="OAuth refresh token")
