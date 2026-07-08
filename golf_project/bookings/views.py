@@ -3,7 +3,8 @@ from rest_framework import viewsets, status
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.permissions import IsAuthenticated, AllowAny
+from users.permissions import IsActiveLocationMember
 from rest_framework.views import APIView
 from rest_framework import serializers
 from django.db import transaction
@@ -180,7 +181,7 @@ class FivePerPagePagination(PageNumberPagination):
 
 class BookingViewSet(viewsets.ModelViewSet):
     serializer_class = BookingSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
     lock_window = timedelta(hours=24)
     pagination_class = TenPerPagePagination
     
@@ -198,7 +199,7 @@ class BookingViewSet(viewsets.ModelViewSet):
         )
         if phone and is_check_availability:
             return [AllowAny()]
-        return [IsAuthenticated()]
+        return [IsAuthenticated(), IsActiveLocationMember()]
     
     def _check_special_event_conflict(self, start_time, end_time=None):
         """

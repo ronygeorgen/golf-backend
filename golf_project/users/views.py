@@ -7,7 +7,8 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.authtoken.models import Token
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from users.permissions import IsActiveLocationMember
 from rest_framework.response import Response
 from rest_framework.pagination import PageNumberPagination
 from .utils import get_location_id_from_request, filter_by_location, get_users_by_location
@@ -214,6 +215,16 @@ def verify_otp(request):
                 return Response({
                     'error': 'User account is disabled.'
                 }, status=status.HTTP_403_FORBIDDEN)
+            
+            # Check if location is active
+            location_id = getattr(user, 'ghl_location_id', None)
+            if location_id and user.role != 'superadmin':
+                from ghl.models import GHLLocation
+                loc = GHLLocation.objects.filter(location_id=location_id).only('status').first()
+                if loc and loc.status != 'active':
+                    return Response({
+                        'error': 'Your location is currently inactive. Please contact support.'
+                    }, status=status.HTTP_403_FORBIDDEN)
             
             # Check if OTP is valid and not expired (5 minutes)
             if (user.otp_code == otp and 
@@ -668,6 +679,17 @@ def login(request):
     serializer = LoginSerializer(data=request.data)
     if serializer.is_valid():
         user = serializer.validated_data['user']
+        
+        # Check if location is active
+        location_id = getattr(user, 'ghl_location_id', None)
+        if location_id and user.role != 'superadmin':
+            from ghl.models import GHLLocation
+            loc = GHLLocation.objects.filter(location_id=location_id).only('status').first()
+            if loc and loc.status != 'active':
+                return Response({
+                    'error': 'Your location is currently inactive. Please contact support.'
+                }, status=status.HTTP_403_FORBIDDEN)
+
         # Get or create authentication token
         token, created = Token.objects.get_or_create(user=user)
         
@@ -697,7 +719,7 @@ def login(request):
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 @api_view(['POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsActiveLocationMember])
 def logout(request):
     """User logout endpoint - deletes the token"""
     try:
@@ -711,7 +733,7 @@ def logout(request):
         }, status=status.HTTP_400_BAD_REQUEST)
 
 @api_view(['GET', 'PUT'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsActiveLocationMember])
 def profile(request):
     """Get or update current user profile"""
     user = request.user
@@ -794,7 +816,7 @@ def profile(request):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 @api_view(['PUT'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsActiveLocationMember])
 def update_dob(request):
     """Update user's date of birth"""
     user = request.user
@@ -893,6 +915,16 @@ def auto_login(request):
             return Response({
                 'error': 'Your account has been paused. Please contact support.'
             }, status=status.HTTP_403_FORBIDDEN)
+            
+        # Check if location is active
+        location_id = getattr(user, 'ghl_location_id', None)
+        if location_id and user.role != 'superadmin':
+            from ghl.models import GHLLocation
+            loc = GHLLocation.objects.filter(location_id=location_id).only('status').first()
+            if loc and loc.status != 'active':
+                return Response({
+                    'error': 'Your location is currently inactive. Please contact support.'
+                }, status=status.HTTP_403_FORBIDDEN)
         
         # Get or create authentication token
         token, created = Token.objects.get_or_create(user=user)
@@ -915,7 +947,7 @@ def auto_login(request):
 
 
 @api_view(['GET'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsActiveLocationMember])
 def member_list(request):
     """
     Get list of clients (members) for staff/admin's location with custom fields.
@@ -1121,7 +1153,7 @@ def get_active_waiver(request):
 
 
 @api_view(['GET'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsActiveLocationMember])
 def check_waiver_acceptance(request):
     """
     Check if the current user has accepted the active waiver.
@@ -1173,7 +1205,7 @@ def check_waiver_acceptance(request):
 
 
 @api_view(['POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsActiveLocationMember])
 def accept_waiver(request):
     """
     Accept the active liability waiver.

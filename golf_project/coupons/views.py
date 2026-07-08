@@ -3,7 +3,8 @@ from django.db import transaction
 from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated, BasePermission
+from rest_framework.permissions import IsAuthenticated, BasePermission
+from users.permissions import IsActiveLocationMember
 
 from .models import Coupon, CouponUsage
 from .serializers import CouponSerializer, CouponUsageSerializer, CouponValidateSerializer
@@ -28,7 +29,7 @@ class IsAdminOrSuperAdmin(BasePermission):
 
 class CouponListCreateView(APIView):
     """GET all coupons / POST create a new coupon (admin only)."""
-    permission_classes = [IsAuthenticated, IsAdminOrSuperAdmin]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember, IsAdminOrSuperAdmin]
 
     def get(self, request):
         coupons = Coupon.objects.all()
@@ -45,7 +46,7 @@ class CouponListCreateView(APIView):
 
 class CouponDetailView(APIView):
     """GET / PUT / DELETE a single coupon (admin only)."""
-    permission_classes = [IsAuthenticated, IsAdminOrSuperAdmin]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember, IsAdminOrSuperAdmin]
 
     def _get_coupon(self, pk):
         try:
@@ -84,7 +85,7 @@ class CouponDetailView(APIView):
 
 class CouponUsageListView(APIView):
     """GET all coupon usage records (admin only)."""
-    permission_classes = [IsAuthenticated, IsAdminOrSuperAdmin]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember, IsAdminOrSuperAdmin]
 
     def get(self, request):
         usages = CouponUsage.objects.select_related('coupon', 'user').all()
@@ -132,7 +133,7 @@ class CouponUsageListView(APIView):
 
 class CouponValidateView(APIView):
     """POST validate a coupon code and return discount info. Does NOT consume the coupon."""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
 
     def post(self, request):
         serializer = CouponValidateSerializer(data=request.data)

@@ -40,7 +40,8 @@ from django.conf import settings
 from django.http import HttpResponse
 from django.shortcuts import redirect
 from rest_framework.views import APIView
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from users.permissions import IsActiveLocationMember
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.exceptions import PermissionDenied
@@ -159,7 +160,7 @@ class SquareOAuthAuthorizeView(APIView):
     - Superadmin: can connect / reconnect / disconnect any location at any time.
     - Admin: can connect / reconnect / disconnect their own location at any time.
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
 
     def get(self, request):
         user_role = getattr(request.user, 'role', None)
@@ -322,7 +323,7 @@ class SquareOAuthStatusView(APIView):
     Returns the Square connection status for a GHL location.
     Accessible by authenticated users (staff/admin check in frontend).
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
 
     def get(self, request, ghl_location_id):
         from .models import LocationSquareAccount
@@ -358,7 +359,7 @@ class SquareOAuthDisconnectView(APIView):
     Admin or superadmin can disconnect Square for a location.
     Clears tokens but keeps the record for auditing.
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
 
     def post(self, request, ghl_location_id):
         user_role = getattr(request.user, 'role', None)
@@ -399,7 +400,7 @@ class SquareOAuthListView(APIView):
     location appears — connected or not — allowing the superadmin to action
     any location directly from the table.
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
 
     def get(self, request):
         if request.user.role != 'superadmin':
@@ -871,17 +872,23 @@ class InitiateSquarePaymentView(APIView):
         except ValueError as exc:
             return Response({'error': str(exc)}, status=status.HTTP_402_PAYMENT_REQUIRED)
 
-        # ── Look up this location's tax rate ─────────────────────────────────
+        # ── Look up this location's tax rate & status ─────────────────────────────────
         from decimal import Decimal as _Decimal
         TAX_RATE = _Decimal('0.14')  # safe fallback (14% HST)
         try:
             from ghl.models import GHLLocation
-            _loc = GHLLocation.objects.filter(location_id=ghl_location_id).only('tax_rate').first()
-            if _loc is not None and _loc.tax_rate is not None:
-                TAX_RATE = _Decimal(str(_loc.tax_rate))
+            _loc = GHLLocation.objects.filter(location_id=ghl_location_id).only('tax_rate', 'status').first()
+            if _loc is not None:
+                if _loc.status != 'active':
+                    return Response(
+                        {'error': 'This location is currently inactive. Payments are disabled.'},
+                        status=status.HTTP_403_FORBIDDEN
+                    )
+                if _loc.tax_rate is not None:
+                    TAX_RATE = _Decimal(str(_loc.tax_rate))
             logger.info("Tax rate for location %s: %s", ghl_location_id, TAX_RATE)
         except Exception as _tax_exc:
-            logger.warning("Could not fetch tax_rate for location %s, using default 0.14: %s", ghl_location_id, _tax_exc)
+            logger.warning("Could not fetch tax_rate/status for location %s, using default 0.14: %s", ghl_location_id, _tax_exc)
 
         # ── Apply location-specific tax on top of post-coupon base ───────────
         tax_amount = round(float(final_amount) * float(TAX_RATE), 2)
@@ -1423,7 +1430,7 @@ class MembershipSubscribeView(APIView):
         7. Create SimulatorPackagePurchase with monthly_hours
         8. Create MemberSubscription record
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
 
     @transaction.atomic
     def post(self, request):
@@ -1662,7 +1669,7 @@ class MembershipCancelView(APIView):
 
     Cancels the Square subscription. Member retains hours until end of period.
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
 
     def post(self, request, subscription_id):
         from .models import MemberSubscription, LocationSquareAccount
@@ -1718,7 +1725,7 @@ class MembershipStatusView(APIView):
     GET /api/square/memberships/my/
     Returns all MemberSubscription records for the logged-in user.
     """
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
 
     def get(self, request):
         from .models import MemberSubscription

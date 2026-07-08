@@ -2,7 +2,8 @@ import logging
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated
+from users.permissions import IsActiveLocationMember
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.pagination import PageNumberPagination
 from django.db import transaction
@@ -907,7 +908,7 @@ class StaffViewSet(viewsets.ModelViewSet):
 
 
 class AdminOverrideViewSet(viewsets.ViewSet):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
     
     def _ensure_admin(self, request):
         if getattr(request.user, 'role', None) not in ['admin', 'superadmin'] and not getattr(request.user, 'is_superuser', False):
@@ -1191,7 +1192,7 @@ class UserViewSet(viewsets.ModelViewSet):
     """
     queryset = User.objects.all().order_by('-date_joined')
     serializer_class = UserSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
     pagination_class = UserPagination
     
     def get_serializer_class(self):
@@ -1347,7 +1348,7 @@ class ClosedDayViewSet(viewsets.ModelViewSet):
     """
     queryset = ClosedDay.objects.all().order_by('-start_date', '-start_time')
     serializer_class = ClosedDaySerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
     
     def get_queryset(self):
         """Filter closed days based on query parameters and location"""
@@ -1707,7 +1708,7 @@ class LiabilityWaiverViewSet(viewsets.ModelViewSet):
     """
     queryset = LiabilityWaiver.objects.all().order_by('-created_at')
     serializer_class = LiabilityWaiverSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
     
     def get_queryset(self):
         """Filter waivers based on query parameters"""

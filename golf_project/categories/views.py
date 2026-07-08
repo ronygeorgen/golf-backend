@@ -3,7 +3,8 @@ from datetime import datetime
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from users.permissions import IsActiveLocationMember
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -72,7 +73,7 @@ class ServiceCategoryViewSet(viewsets.ModelViewSet):
     """
 
     serializer_class = ServiceCategoryAdminSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
 
     def _require_admin(self):
         if not _is_admin_or_superadmin(self.request.user):
@@ -138,7 +139,7 @@ class CategoryAssetViewSet(viewsets.ModelViewSet):
     """
 
     serializer_class = CategoryAssetSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
 
     def _require_admin(self):
         if not _is_admin_or_superadmin(self.request.user):

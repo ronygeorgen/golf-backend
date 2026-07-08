@@ -11,7 +11,8 @@ from django.conf import settings
 from django.shortcuts import redirect
 from django.utils import timezone
 from rest_framework import status
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from users.permissions import IsActiveLocationMember
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.decorators import api_view, permission_classes
@@ -322,7 +323,7 @@ class GHLOnboardView(APIView):
 
 
 @api_view(['GET'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsActiveLocationMember])
 def test_contact_custom_fields(request):
     """
     Test endpoint to check custom fields for the current user's contact
@@ -479,7 +480,7 @@ def test_purchase_custom_field(request):
 
 
 @api_view(['GET'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsActiveLocationMember])
 def list_all_ghl_locations(request):
     """
     List all GHL locations for superadmin.
@@ -498,7 +499,7 @@ def list_all_ghl_locations(request):
 
 
 @api_view(['PUT', 'PATCH'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsActiveLocationMember])
 def update_ghl_location_company_name(request, location_id):
     """
     Update company name and/or timezone for a GHL location.
@@ -577,6 +578,11 @@ def update_ghl_location_company_name(request, location_id):
                 {'error': 'Invalid tax_rate value. Must be a number between 0 and 1.'},
                 status=status.HTTP_400_BAD_REQUEST
             )
+            
+    status_val = request.data.get('status')
+    if status_val in ['active', 'inactive']:
+        location.status = status_val
+        update_fields.append('status')
     
     location.save(update_fields=update_fields)
     
@@ -588,7 +594,7 @@ def update_ghl_location_company_name(request, location_id):
 
 
 @api_view(['POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsActiveLocationMember])
 def set_ghl_location_company_name(request):
     """
     Set company name for a GHL location.
@@ -628,7 +634,7 @@ def set_ghl_location_company_name(request):
 
 
 @api_view(['POST'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsActiveLocationMember])
 def upload_ghl_location_logo(request, location_id):
     """
     Upload (or replace) the logo for a GHL location.
@@ -693,7 +699,7 @@ def upload_ghl_location_logo(request, location_id):
 
 
 @api_view(['DELETE'])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, IsActiveLocationMember])
 def delete_ghl_location_logo(request, location_id):
     """
     Delete the logo for a GHL location.

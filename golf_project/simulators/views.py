@@ -1,7 +1,8 @@
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated, IsAdminUser, AllowAny
+from rest_framework.permissions import IsAuthenticated, IsAdminUser, AllowAny
+from users.permissions import IsActiveLocationMember
 from rest_framework.exceptions import PermissionDenied
 from django.utils import timezone
 from datetime import datetime
@@ -25,9 +26,9 @@ class SimulatorViewSet(viewsets.ModelViewSet):
             permission_classes = [AllowAny]  # Public access for viewing simulators
         elif self.action == 'deactivate_and_reassign':
             # Role check in the action; JWT staff may not have Django is_staff.
-            permission_classes = [IsAuthenticated]
+            permission_classes = [IsAuthenticated, IsActiveLocationMember]
         else:
-            permission_classes = [IsAuthenticated, IsAdminUser]  # Admin only for create/update/delete
+            permission_classes = [IsAuthenticated, IsActiveLocationMember, IsAdminUser]  # Admin only for create/update/delete
         return [permission() for permission in permission_classes]
     
     def get_queryset(self):
@@ -329,7 +330,7 @@ class DurationPriceViewSet(viewsets.ModelViewSet):
         if self.action in ['list', 'retrieve']:
             permission_classes = [AllowAny]  # Public access for viewing prices
         else:
-            permission_classes = [IsAuthenticated, IsAdminUser]  # Admin only for create/update/delete
+            permission_classes = [IsAuthenticated, IsActiveLocationMember, IsAdminUser]  # Admin only for create/update/delete
         return [permission() for permission in permission_classes]
     
     def perform_create(self, serializer):
@@ -344,7 +345,7 @@ class DurationPriceViewSet(viewsets.ModelViewSet):
 
 class SimulatorCreditViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = SimulatorCreditSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
     
     def get_queryset(self):
         user = self.request.user

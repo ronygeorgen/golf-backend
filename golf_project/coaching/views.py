@@ -10,7 +10,8 @@ from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.pagination import PageNumberPagination
 from rest_framework import permissions
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from users.permissions import IsActiveLocationMember
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -83,7 +84,7 @@ class CoachingPackageViewSet(viewsets.ModelViewSet):
         if self.action in ['list', 'retrieve', 'active_packages']:
             permission_classes = [AllowAny]  # Public access for viewing packages
         else:
-            permission_classes = [IsAuthenticated, IsAdminOrSuperadminRole]
+            permission_classes = [IsAuthenticated, IsActiveLocationMember, IsAdminOrSuperadminRole]
         return [permission() for permission in permission_classes]
     
     def get_queryset(self):
@@ -188,7 +189,7 @@ class CoachingPackageViewSet(viewsets.ModelViewSet):
 
 class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
     serializer_class = CoachingPackagePurchaseSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
     
     def get_queryset(self):
         user = self.request.user
@@ -697,7 +698,7 @@ class CoachingPackagePurchaseViewSet(viewsets.ModelViewSet):
 
 class GiftClaimView(APIView):
     """Handle gift claim (accept/reject) for both coaching and simulator packages"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
     
     def post(self, request, token):
         # Try to find coaching package purchase first
@@ -790,7 +791,7 @@ class GiftClaimView(APIView):
 
 class SessionTransferViewSet(viewsets.ModelViewSet):
     serializer_class = SessionTransferSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
     
     def get_queryset(self):
         user = self.request.user
@@ -927,7 +928,7 @@ class SessionTransferViewSet(viewsets.ModelViewSet):
 
 class SimulatorHoursTransferViewSet(viewsets.ModelViewSet):
     serializer_class = SimulatorHoursTransferSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
     
     def get_queryset(self):
         user = self.request.user
@@ -1057,7 +1058,7 @@ class SimulatorHoursTransferViewSet(viewsets.ModelViewSet):
 
 class UserPhoneCheckView(APIView):
     """Check if user exists by phone number"""
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
     
     def get(self, request):
         phone = request.query_params.get('phone')
@@ -1945,7 +1946,7 @@ class SimulatorPackageViewSet(viewsets.ModelViewSet):
         if self.action in ['list', 'retrieve', 'active_packages']:
             permission_classes = [AllowAny]  # Public access for viewing packages
         else:
-            permission_classes = [IsAuthenticated, IsAdminOrSuperadminRole]
+            permission_classes = [IsAuthenticated, IsActiveLocationMember, IsAdminOrSuperadminRole]
         return [permission() for permission in permission_classes]
     
     def get_queryset(self):
@@ -2082,7 +2083,7 @@ class SimulatorPackageViewSet(viewsets.ModelViewSet):
 class SimulatorPackagePurchaseViewSet(viewsets.ModelViewSet):
     queryset = SimulatorPackagePurchase.objects.all().order_by('-purchased_at')
     serializer_class = SimulatorPackagePurchaseSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
     
     def get_queryset(self):
         user = self.request.user

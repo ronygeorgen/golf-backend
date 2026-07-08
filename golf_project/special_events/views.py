@@ -1,7 +1,8 @@
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.permissions import IsAuthenticated, AllowAny
+from users.permissions import IsActiveLocationMember
 from rest_framework.views import APIView
 from django.utils import timezone
 from django.db import transaction
@@ -17,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 class SpecialEventViewSet(viewsets.ModelViewSet):
     serializer_class = SpecialEventSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
     
     def get_queryset(self):
         from users.utils import get_location_id_from_request
@@ -805,7 +806,7 @@ class SpecialEventViewSet(viewsets.ModelViewSet):
 
 class SpecialEventRegistrationViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = SpecialEventRegistrationSerializer
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsActiveLocationMember]
     
     def get_queryset(self):
         # Users can see their own registrations
