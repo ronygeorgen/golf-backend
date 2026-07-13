@@ -1,8 +1,21 @@
 import logging
-from rest_framework import viewsets, status
+import os
+import openpyxl
+from io import BytesIO
+from django.core.files.storage import default_storage
+from django.http import HttpResponse
+from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import action
+from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, IsAdminUser
+from .models import BulkUploadTask
+from .tasks import process_bulk_upload_task
+
+class IsSuperAdminUser(permissions.BasePermission):
+    def has_permission(self, request, view):
+        return bool(request.user and request.user.is_authenticated and getattr(request.user, 'role', '') == 'superadmin')
+
 from users.permissions import IsActiveLocationMember
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.pagination import PageNumberPagination
@@ -1857,3 +1870,218 @@ class LiabilityWaiverViewSet(viewsets.ModelViewSet):
             'previous': page > 1,
             'users': paginated_users
         })
+
+class BulkUploadViewSet(viewsets.GenericViewSet):
+    permission_classes = [IsSuperAdminUser]
+
+    @action(detail=False, methods=['get'])
+    def template(self, request):
+        from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+        from openpyxl.worksheet.datavalidation import DataValidation
+
+        wb = openpyxl.Workbook()
+        wb.remove(wb.active)
+
+        # ── Shared style helpers ───────────────────────────────────────────────
+        header_fill      = PatternFill("solid", fgColor="1F4E79")
+        mandatory_fill   = PatternFill("solid", fgColor="FCE4D6")
+        optional_fill    = PatternFill("solid", fgColor="E2EFDA")
+        header_font      = Font(bold=True, color="FFFFFF", size=11)
+        mandatory_font   = Font(bold=True, color="843C0C", size=10)
+        optional_font    = Font(bold=True, color="375623", size=10)
+        center_align     = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        thin_border_side = Side(style="thin", color="BFBFBF")
+        thin_border      = Border(left=thin_border_side, right=thin_border_side,
+                                  top=thin_border_side, bottom=thin_border_side)
+
+        def style_header(ws, columns):
+            ws.row_dimensions[1].height = 36
+            for col_idx, (header, is_mandatory, width) in enumerate(columns, 1):
+                cell = ws.cell(row=1, column=col_idx, value=header)
+                cell.fill      = header_fill
+                cell.font      = header_font
+                cell.alignment = center_align
+                cell.border    = thin_border
+                ws.column_dimensions[get_column_letter(col_idx)].width = width
+            ws.row_dimensions[2].height = 20
+            for col_idx, (_, is_mandatory, _) in enumerate(columns, 1):
+                cell = ws.cell(row=2, column=col_idx,
+                               value="MANDATORY" if is_mandatory else "optional")
+                cell.fill      = mandatory_fill if is_mandatory else optional_fill
+                cell.font      = mandatory_font if is_mandatory else optional_font
+                cell.alignment = center_align
+                cell.border    = thin_border
+
+        def add_example_row(ws, values, row=3):
+            ws.row_dimensions[row].height = 18
+            for col_idx, val in enumerate(values, 1):
+                cell = ws.cell(row=row, column=col_idx, value=val)
+                cell.font      = Font(italic=True, color="595959", size=9)
+                cell.alignment = Alignment(horizontal="center")
+                cell.border    = thin_border
+
+        def add_dropdown(ws, col_letter, formula, first_row=4, last_row=2000):
+            dv = DataValidation(
+                type="list",
+                formula1=formula,
+                allow_blank=True,
+                showDropDown=False,
+                showErrorMessage=True,
+                errorTitle="Invalid value",
+                error="Please choose from the dropdown list."
+            )
+            ws.add_data_validation(dv)
+            dv.sqref = f"{col_letter}{first_row}:{col_letter}{last_row}"
+
+        # Tab 1: Customers
+        ws_cust = wb.create_sheet("Customers")
+        cust_cols = [
+            ("Full Name",     True,  22),
+            ("Phone",         True,  18),
+            ("Email",         False, 28),
+            ("Date of Birth", False, 18),
+        ]
+        style_header(ws_cust, cust_cols)
+        add_example_row(ws_cust, ["John Smith", "+14165550101", "john@example.com", "1985-06-15"])
+
+        # Tab 2: Packages
+        ws_pkg = wb.create_sheet("Packages")
+        pkg_cols = [
+            ("Customer Phone",          True,  18),
+            ("Package Name",            True,  30),
+            ("Package Type",            True,  18),
+            ("Sessions Remaining",      False, 22),
+            ("Hours Remaining",         False, 20),
+            ("Purchase Label / Notes",  False, 30),
+        ]
+        style_header(ws_pkg, pkg_cols)
+        add_example_row(ws_pkg, ["+14165550101", "10-Session Golf Coaching", "coaching", 7, "", "Migrated"])
+        add_example_row(ws_pkg, ["+14165550102", "20-Hour Simulator Pack", "simulator", "", 15, ""], row=4)
+        add_dropdown(ws_pkg, "C", '"coaching,simulator"', first_row=4)
+
+        # Tab 3: Bookings
+        ws_book = wb.create_sheet("Bookings")
+        book_cols = [
+            ("Customer Phone", True,  18),
+            ("Booking Type",   True,  18),
+            ("Category Name",  False, 24),
+            ("Start Time",     True,  24),
+            ("End Time",       True,  24),
+            ("Status",         False, 18),
+            ("Total Price",    False, 16),
+        ]
+        style_header(ws_book, book_cols)
+        add_example_row(ws_book, ["+14165550101", "simulator", "", "2024-03-15 09:00", "2024-03-15 10:00", "completed", "0.00"])
+        add_example_row(ws_book, ["+14165550102", "category", "Table Tennis", "2024-03-16 14:00", "2024-03-16 15:00", "completed", "15.00"], row=4)
+        add_dropdown(ws_book, "B", '"simulator,coaching,category"', first_row=4)
+        add_dropdown(ws_book, "F", '"completed,confirmed,no_show,cancelled"', first_row=4)
+
+        # Tab 4: Events
+        ws_evt = wb.create_sheet("Events")
+        evt_cols = [
+            ("Customer Phone",      True,  18),
+            ("Event Name",          True,  30),
+            ("Occurrence Date",     True,  20),
+            ("Registration Status", False, 22),
+        ]
+        style_header(ws_evt, evt_cols)
+        add_example_row(ws_evt, ["+14165550101", "Weekend Golf Clinic", "2024-03-10", "showed_up"])
+        add_dropdown(ws_evt, "D", '"showed_up,registered"', first_row=4)
+
+        # Tab 5: Instructions
+        ws_info = wb.create_sheet("Instructions")
+        ws_info.column_dimensions["A"].width = 90
+        info_rows = [
+            ("BULK DATA ONBOARDING - HOW TO USE THIS TEMPLATE", True, "1F4E79", "FFFFFF"),
+            ("", False, None, None),
+            ("GENERAL RULES", True, None, "1F4E79"),
+            ("Do NOT rename or delete any tab.", False, None, None),
+            ("Do NOT modify row 1 (headers) or row 2 (mandatory labels).", False, None, None),
+            ("Enter your data from row 4 downwards. Row 3 is an example - delete or overwrite it.", False, None, None),
+            ("Dates: YYYY-MM-DD format. DateTimes: YYYY-MM-DD HH:MM (24-hour, local time).", False, None, None),
+            ("Phone numbers must exactly match across all tabs - they are the unique customer key.", False, None, None),
+            ("Processing order: Customers first, then Packages, then Bookings, then Events.", False, None, None),
+            ("Rows that fail validation are skipped and recorded in the downloadable error report.", False, None, None),
+            ("", False, None, None),
+            ("TAB: Customers", True, None, "1F4E79"),
+            ("  Full Name    - MANDATORY. First and Last name space-separated.", False, None, None),
+            ("  Phone        - MANDATORY. Used as the unique customer identifier across all tabs.", False, None, None),
+            ("  Email        - optional.", False, None, None),
+            ("  Date of Birth - optional. Format: YYYY-MM-DD.", False, None, None),
+            ("", False, None, None),
+            ("TAB: Packages", True, None, "1F4E79"),
+            ("  Customer Phone  - MANDATORY. Must match a Phone in Customers tab.", False, None, None),
+            ("  Package Name    - MANDATORY. Must exactly match an existing package name in the system.", False, None, None),
+            ("  Package Type    - MANDATORY. Either 'coaching' or 'simulator'.", False, None, None),
+            ("  Sessions Remaining - optional. For coaching packages only. Defaults to the full package amount if blank.", False, None, None),
+            ("  Hours Remaining    - optional. For simulator packages only. Defaults to the full package amount if blank.", False, None, None),
+            ("  Purchase Label / Notes - optional. A label for this purchase record.", False, None, None),
+            ("", False, None, None),
+            ("TAB: Bookings", True, None, "1F4E79"),
+            ("  Customer Phone - MANDATORY.", False, None, None),
+            ("  Booking Type   - MANDATORY. 'simulator', 'coaching', or 'category'.", False, None, None),
+            ("  Category Name  - optional. Required only if Booking Type is 'category' (e.g. 'Table Tennis').", False, None, None),
+            ("  Start Time     - MANDATORY. Format: YYYY-MM-DD HH:MM", False, None, None),
+            ("  End Time       - MANDATORY. Format: YYYY-MM-DD HH:MM", False, None, None),
+            ("  Status         - optional. completed / confirmed / no_show / cancelled. Defaults to 'completed'.", False, None, None),
+            ("  Total Price    - optional. Defaults to 0.00.", False, None, None),
+            ("", False, None, None),
+            ("TAB: Events", True, None, "1F4E79"),
+            ("  Customer Phone      - MANDATORY.", False, None, None),
+            ("  Event Name         - MANDATORY. Must exactly match an existing Special Event title in the system.", False, None, None),
+            ("  Occurrence Date    - MANDATORY. Format: YYYY-MM-DD.", False, None, None),
+            ("  Registration Status - optional. 'showed_up' or 'registered'. Defaults to 'showed_up'.", False, None, None),
+        ]
+        for row_idx, (text, bold, bg, fg) in enumerate(info_rows, 1):
+            cell = ws_info.cell(row=row_idx, column=1, value=text)
+            cell.font = Font(bold=bold, size=11 if row_idx == 1 else 10,
+                             color=fg if fg else "000000")
+            if bg:
+                cell.fill = PatternFill("solid", fgColor=bg)
+            cell.alignment = Alignment(wrap_text=True)
+
+        out = BytesIO()
+        wb.save(out)
+        response = HttpResponse(
+            out.getvalue(),
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+        response['Content-Disposition'] = 'attachment; filename=bulk_upload_template.xlsx'
+        return response
+
+    @action(detail=False, methods=['post'], parser_classes=[MultiPartParser, FormParser])
+    def upload(self, request):
+        file = request.FILES.get('file')
+        location_id = request.data.get('location_id')
+
+        if not file:
+            return Response({'error': 'No file provided'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not file.name.endswith('.xlsx'):
+            return Response({'error': 'File must be a .xlsx Excel file'}, status=status.HTTP_400_BAD_REQUEST)
+
+        task = BulkUploadTask.objects.create(admin=request.user, location_id=location_id)
+
+        file_path = default_storage.save(f'tmp/bulk_upload_{task.id}.xlsx', file)
+        full_path = default_storage.path(file_path)
+
+        process_bulk_upload_task.delay(task.id, full_path)
+
+        return Response({'task_id': task.id, 'status': task.status})
+
+    @action(detail=True, methods=['get'])
+    def status(self, request, pk=None):
+        try:
+            task = BulkUploadTask.objects.get(id=pk)
+        except BulkUploadTask.DoesNotExist:
+            return Response({'error': 'Task not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        data = {
+            'status': task.status,
+            'total_rows': task.total_rows,
+            'processed_rows': task.processed_rows,
+            'error_file_url': request.build_absolute_uri(task.error_file.url) if task.error_file else None
+        }
+        return Response(data)
+

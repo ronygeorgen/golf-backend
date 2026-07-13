@@ -1,4 +1,5 @@
 from django.db import models
+from django.conf import settings
 from django.utils import timezone
 from datetime import datetime, timedelta
 import pytz
@@ -326,3 +327,27 @@ class LiabilityWaiver(models.Model):
         import json
         content_str = json.dumps(self.content, sort_keys=True)
         return hashlib.md5(content_str.encode()).hexdigest()
+
+class BulkUploadTask(models.Model):
+    STATUS_CHOICES = (
+        ('pending', 'Pending'),
+        ('processing', 'Processing'),
+        ('completed', 'Completed'),
+        ('failed', 'Failed'),
+    )
+    admin = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='bulk_uploads')
+    location_id = models.CharField(max_length=100, blank=True, null=True, help_text="Location ID this data belongs to")
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    total_rows = models.IntegerField(default=0)
+    processed_rows = models.IntegerField(default=0)
+    error_file = models.FileField(upload_to='bulk_errors/', null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'Bulk Upload Task'
+        verbose_name_plural = 'Bulk Upload Tasks'
+        
+    def __str__(self):
+        return f"UploadTask {self.id} - {self.status}"

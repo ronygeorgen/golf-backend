@@ -20,6 +20,7 @@ router.register(r'liability-waiver', views.LiabilityWaiverViewSet, basename='adm
 router.register(r'categories', ServiceCategoryViewSet, basename='admin-categories')
 # category-assets flat router: filter by ?category_id=X for listing
 router.register(r'category-assets', CategoryAssetViewSet, basename='admin-category-assets')
+router.register(r'bulk-upload', views.BulkUploadViewSet, basename='admin-bulk-upload')
 
 urlpatterns = [
     path('', include(router.urls)),
