@@ -2089,29 +2089,36 @@ class SimulatorPackagePurchaseViewSet(viewsets.ModelViewSet):
         user = self.request.user
         location_id = get_location_id_from_request(self.request)
         queryset = SimulatorPackagePurchase.objects.all()
-        
-        is_privileged = user.role in ['admin', 'staff', 'superadmin'] or user.is_superuser
-        
-        # Regular users can only see their own purchases
+
+        is_superadmin = getattr(user, 'is_superuser', False) or getattr(user, 'role', '') == 'superadmin'
+        is_privileged = is_superadmin or user.role in ['admin', 'staff', 'superadmin']
+
         if not is_privileged:
+            # Regular clients see only their own purchases
             queryset = queryset.filter(client=user)
-        elif location_id and not user.is_superuser and user.role != 'superadmin':
-            # Filter by location_id for admin/staff (not superadmin)
-            queryset = queryset.filter(
-                Q(package__location_id=location_id) | 
-                Q(package__location_id__isnull=True)
-            )
-        
+        elif not is_superadmin:
+            # Admin/staff: always scope to their location.
+            # If location_id is missing from the request, return empty queryset
+            # to prevent accidental full-platform data exposure.
+            if location_id:
+                queryset = queryset.filter(
+                    Q(package__location_id=location_id) |
+                    Q(package__location_id__isnull=True)
+                )
+            else:
+                queryset = queryset.none()
+        # Superadmin: no location filter — sees everything
+
         # Filter by purchase type
         purchase_type = self.request.query_params.get('purchase_type')
         if purchase_type:
             queryset = queryset.filter(purchase_type=purchase_type)
-        
+
         # Filter by status
         package_status = self.request.query_params.get('package_status')
         if package_status:
             queryset = queryset.filter(package_status=package_status)
-        
+
         return queryset.select_related('package', 'client', 'original_owner')
     
     @action(detail=False, methods=['get'], url_path='my')

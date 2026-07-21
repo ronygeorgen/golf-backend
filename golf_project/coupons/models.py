@@ -21,6 +21,12 @@ class Coupon(models.Model):
     discount_type = models.CharField(max_length=20, choices=DISCOUNT_TYPES, default='percentage')
     discount_value = models.DecimalField(max_digits=10, decimal_places=2)
     
+    # Location scoping — coupons are per-location unless location_id is NULL (global)
+    location_id = models.CharField(
+        max_length=100, blank=True, null=True,
+        help_text="GHL location ID this coupon belongs to. NULL means global (all locations)."
+    )
+    
     applicable_to = models.CharField(
         max_length=255,
         default='all',

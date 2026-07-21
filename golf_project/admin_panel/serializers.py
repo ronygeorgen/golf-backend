@@ -345,22 +345,32 @@ class LiabilityWaiverSerializer(serializers.ModelSerializer):
         model = LiabilityWaiver
         fields = [
             'id',
+            'location_id',
             'content',
             'is_active',
             'created_at',
             'updated_at',
         ]
         read_only_fields = ['created_at', 'updated_at']
-    
+
     def validate(self, attrs):
-        # Check if there's already an active waiver when creating a new one
+        # Check if there's already an active waiver for this location when creating a new one
         if self.instance is None:  # Creating new waiver
             is_active = attrs.get('is_active', True)
             if is_active:
-                existing_active = LiabilityWaiver.objects.filter(is_active=True).exists()
-                if existing_active:
+                from django.db.models import Q
+                location_id = attrs.get('location_id')
+                # Determine location from request context if not in data
+                if not location_id and self.context.get('request'):
+                    from users.utils import get_location_id_from_request
+                    location_id = get_location_id_from_request(self.context['request'])
+                existing_qs = LiabilityWaiver.objects.filter(is_active=True)
+                if location_id:
+                    existing_qs = existing_qs.filter(
+                        Q(location_id=location_id) | Q(location_id__isnull=True) | Q(location_id='')
+                    )
+                if existing_qs.exists():
                     raise serializers.ValidationError({
-                        'is_active': 'An active waiver already exists. Only one active waiver can exist at a time. Please deactivate the existing waiver first or update it instead.'
+                        'is_active': 'An active waiver already exists for this location. Only one active waiver can exist at a time. Please deactivate the existing waiver first or update it instead.'
                     })
         return attrs
-

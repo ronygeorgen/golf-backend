@@ -348,16 +348,38 @@ class SimulatorCreditViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAuthenticated, IsActiveLocationMember]
     
     def get_queryset(self):
+        from users.utils import get_location_id_from_request
         user = self.request.user
         queryset = SimulatorCredit.objects.select_related('client', 'source_booking').order_by('-issued_at')
-        
+
         status_filter = self.request.query_params.get('status')
         if status_filter:
             queryset = queryset.filter(status=status_filter)
-        
-        if getattr(user, 'role', None) in ['admin', 'staff'] or getattr(user, 'is_superuser', False):
+
+        is_superadmin = getattr(user, 'is_superuser', False) or getattr(user, 'role', '') == 'superadmin'
+        is_privileged = is_superadmin or getattr(user, 'role', None) in ['admin', 'staff']
+
+        if is_privileged:
+            location_id = get_location_id_from_request(self.request)
             client_id = self.request.query_params.get('client_id')
+
             if client_id:
+                # Validate that the requested client belongs to this admin's location
+                if not is_superadmin and location_id:
+                    from users.models import User as UserModel
+                    try:
+                        target_client = UserModel.objects.get(id=client_id)
+                        if target_client.ghl_location_id != location_id:
+                            # Return empty queryset — client is from a different location
+                            return queryset.none()
+                    except UserModel.DoesNotExist:
+                        return queryset.none()
                 return queryset.filter(client_id=client_id)
-        
+
+            # No client_id: return all credits for this admin's location
+            if not is_superadmin and location_id:
+                queryset = queryset.filter(client__ghl_location_id=location_id)
+            return queryset
+
+        # Regular clients see only their own credits
         return queryset.filter(client=user)

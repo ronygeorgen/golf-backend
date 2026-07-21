@@ -292,9 +292,13 @@ class ClosedDay(models.Model):
 class LiabilityWaiver(models.Model):
     """
     Model to store liability waiver content.
-    Only one active waiver can exist at a time.
+    Only one active waiver can exist at a time per location.
     Supports rich text formatting (heading, bold, italic, new lines).
     """
+    location_id = models.CharField(
+        max_length=100, blank=True, null=True,
+        help_text="GHL location ID this waiver belongs to. NULL means global."
+    )
     content = models.JSONField(
         help_text="Rich text content as JSON array. Each item has 'type' (heading/paragraph), 'text', and optional 'bold', 'italic'"
     )
@@ -315,10 +319,19 @@ class LiabilityWaiver(models.Model):
         return f"Liability Waiver ({status}) - {self.created_at.strftime('%Y-%m-%d')}"
     
     def save(self, *args, **kwargs):
-        # Ensure only one active waiver exists
+        # Ensure only one active waiver exists per location
         if self.is_active:
-            # Deactivate all other waivers
-            LiabilityWaiver.objects.filter(is_active=True).exclude(pk=self.pk if self.pk else None).update(is_active=False)
+            # Deactivate all other active waivers for the same location
+            qs = LiabilityWaiver.objects.filter(is_active=True).exclude(pk=self.pk if self.pk else None)
+            if self.location_id:
+                qs = qs.filter(location_id=self.location_id)
+            else:
+                # Global waiver: deactivate other global waivers (where location_id is NULL or empty)
+                qs = qs.filter(location_id__isnull=True) | qs.filter(location_id='')
+                qs.update(is_active=False)
+                super().save(*args, **kwargs)
+                return
+            qs.update(is_active=False)
         super().save(*args, **kwargs)
     
     def get_content_hash(self):

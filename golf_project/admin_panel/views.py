@@ -1717,100 +1717,122 @@ class LiabilityWaiverViewSet(viewsets.ModelViewSet):
     """
     ViewSet for managing liability waivers.
     Only accessible by admin and superadmin users.
-    Only one active waiver can exist at a time.
+    Only one active waiver can exist at a time per location.
     """
     queryset = LiabilityWaiver.objects.all().order_by('-created_at')
     serializer_class = LiabilityWaiverSerializer
     permission_classes = [IsAuthenticated, IsActiveLocationMember]
-    
+
+    def _is_admin_or_superadmin(self, user):
+        return user.role in ['admin', 'superadmin'] or getattr(user, 'is_superuser', False)
+
+    def _is_superadmin(self, user):
+        return getattr(user, 'is_superuser', False) or getattr(user, 'role', '') == 'superadmin'
+
     def get_queryset(self):
-        """Filter waivers based on query parameters"""
+        """Filter waivers by location for non-superadmin users."""
         queryset = LiabilityWaiver.objects.all().order_by('-created_at')
-        
+
+        # Scope to admin's location unless superadmin
+        if not self._is_superadmin(self.request.user):
+            location_id = get_location_id_from_request(self.request)
+            if location_id:
+                from django.db.models import Q as DQ
+                queryset = queryset.filter(
+                    DQ(location_id=location_id) | DQ(location_id__isnull=True) | DQ(location_id='')
+                )
+
         # Filter by active status
         is_active = self.request.query_params.get('is_active', None)
         if is_active is not None:
             is_active_bool = is_active.lower() == 'true'
             queryset = queryset.filter(is_active=is_active_bool)
-        
+
         return queryset
-    
+
     def list(self, request, *args, **kwargs):
         """List all waivers"""
-        # Check if user is admin or superadmin
-        if not (request.user.role in ['admin', 'superadmin'] or request.user.is_superuser):
+        if not self._is_admin_or_superadmin(request.user):
             raise PermissionDenied("Administrator privileges are required.")
-        
         return super().list(request, *args, **kwargs)
-    
+
+    def perform_create(self, serializer):
+        """Attach location_id when creating a waiver."""
+        location_id = get_location_id_from_request(self.request)
+        serializer.save(location_id=location_id if location_id else None)
+
     def create(self, request, *args, **kwargs):
         """Create a new waiver"""
-        # Check if user is admin or superadmin
-        if not (request.user.role in ['admin', 'superadmin'] or request.user.is_superuser):
+        if not self._is_admin_or_superadmin(request.user):
             raise PermissionDenied("Administrator privileges are required.")
-        
-        # Check if there's already an active waiver
+
+        # Check if there's already an active waiver for this location
         is_active = request.data.get('is_active', True)
         if is_active:
-            existing_active = LiabilityWaiver.objects.filter(is_active=True).exists()
-            if existing_active:
+            location_id = get_location_id_from_request(request)
+            from django.db.models import Q as DQ
+            existing_qs = LiabilityWaiver.objects.filter(is_active=True)
+            if location_id:
+                existing_qs = existing_qs.filter(
+                    DQ(location_id=location_id) | DQ(location_id__isnull=True) | DQ(location_id='')
+                )
+            if existing_qs.exists():
                 return Response({
-                    'error': 'An active waiver already exists. Only one active waiver can exist at a time. Please deactivate the existing waiver first or update it instead.'
+                    'error': 'An active waiver already exists for this location. Only one active waiver can exist at a time. Please deactivate the existing waiver first or update it instead.'
                 }, status=status.HTTP_400_BAD_REQUEST)
-        
+
         return super().create(request, *args, **kwargs)
-    
+
+
     def update(self, request, *args, **kwargs):
         """Update a waiver"""
-        # Check if user is admin or superadmin
-        if not (request.user.role in ['admin', 'superadmin'] or request.user.is_superuser):
+        if not self._is_admin_or_superadmin(request.user):
             raise PermissionDenied("Administrator privileges are required.")
-        
         return super().update(request, *args, **kwargs)
-    
+
     def partial_update(self, request, *args, **kwargs):
         """Partially update a waiver"""
-        # Check if user is admin or superadmin
-        if not (request.user.role in ['admin', 'superadmin'] or request.user.is_superuser):
+        if not self._is_admin_or_superadmin(request.user):
             raise PermissionDenied("Administrator privileges are required.")
-        
         return super().partial_update(request, *args, **kwargs)
-    
+
     def destroy(self, request, *args, **kwargs):
         """Delete a waiver"""
-        # Check if user is admin or superadmin
-        if not (request.user.role in ['admin', 'superadmin'] or request.user.is_superuser):
+        if not self._is_admin_or_superadmin(request.user):
             raise PermissionDenied("Administrator privileges are required.")
-        
         return super().destroy(request, *args, **kwargs)
-    
+
     @action(detail=True, methods=['get'], url_path='acceptances')
     def acceptances(self, request, pk=None):
         """
         Get all users who have accepted (or not accepted) this waiver.
         Supports pagination and search by name, email, phone.
         """
-        # Check if user is admin or superadmin
-        if not (request.user.role in ['admin', 'superadmin'] or request.user.is_superuser):
+        if not self._is_admin_or_superadmin(request.user):
             raise PermissionDenied("Administrator privileges are required.")
-        
+
         from users.models import LiabilityWaiverAcceptance, User
         from rest_framework.pagination import PageNumberPagination
         from django.db.models import Q
-        
+
         waiver = self.get_object()
-        
+
         # Get search query
         search_query = request.query_params.get('search', '').strip()
-        
+
         # Get page number
         page = int(request.query_params.get('page', 1))
         page_size = int(request.query_params.get('page_size', 10))
-        
-        # Get all users (both accepted and not accepted)
-        # Start with all users
+
+        # Get all users for this location
         users = User.objects.filter(role='client')
-        
+
+        # Scope to the admin's location unless superadmin
+        if not self._is_superadmin(request.user):
+            location_id = get_location_id_from_request(request)
+            if location_id:
+                users = users.filter(ghl_location_id=location_id)
+
         # Apply search filter if provided
         if search_query:
             users = users.filter(

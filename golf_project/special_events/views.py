@@ -810,15 +810,20 @@ class SpecialEventRegistrationViewSet(viewsets.ReadOnlyModelViewSet):
     
     def get_queryset(self):
         # Users can see their own registrations
-        # Admin/staff can see all registrations
-        # Check if user is admin or staff (including superuser)
-        is_admin_or_staff = (
-            self.request.user.role in ['admin', 'staff'] or 
-            getattr(self.request.user, 'is_superuser', False)
-        )
-        
+        # Admin/staff can see all registrations for their location
+        # Superadmin can see all registrations across all locations
+        user = self.request.user
+        is_superadmin = getattr(user, 'is_superuser', False) or getattr(user, 'role', '') == 'superadmin'
+        is_admin_or_staff = user.role in ['admin', 'staff'] or is_superadmin
+
         if is_admin_or_staff:
-            return SpecialEventRegistration.objects.all().select_related('user', 'event')
+            qs = SpecialEventRegistration.objects.select_related('user', 'event')
+            # Superadmin sees everything; regular admin/staff are scoped to their location
+            if not is_superadmin:
+                location_id = get_location_id_from_request(self.request)
+                if location_id:
+                    qs = qs.filter(event__location_id=location_id)
+            return qs
         else:
             return SpecialEventRegistration.objects.filter(
                 user=self.request.user
