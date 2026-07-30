@@ -3,7 +3,8 @@ from rest_framework import viewsets, status
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.permissions import IsAuthenticated, AllowAny
+
 from users.permissions import IsActiveLocationMember
 from rest_framework.views import APIView
 from rest_framework import serializers
@@ -2224,6 +2225,171 @@ class BookingViewSet(viewsets.ModelViewSet):
             'lock_overridden': lock_applies and force_override and self._is_admin(request.user)
         })
     
+
+    # ---------------------------------------------------------------------------
+    # Change-Coach actions (admin / superadmin only)
+    # ---------------------------------------------------------------------------
+
+    @action(detail=True, methods=['get'], url_path='available_coaches')
+    def available_coaches(self, request, pk=None):
+        """Return all active staff at this booking's location. Admin/superadmin only."""
+        if not (request.user.is_superuser or getattr(request.user, 'role', '') in ('admin', 'superadmin')):
+            return Response({'error': 'Permission denied.'}, status=status.HTTP_403_FORBIDDEN)
+        booking = self.get_object()
+        location_id = booking.location_id or get_location_id_from_request(request)
+        coaches_qs = User.objects.filter(role__in=['staff', 'admin'], is_active=True)
+        if location_id:
+            coaches_qs = coaches_qs.filter(ghl_location_id=location_id)
+        coaches_qs = coaches_qs.order_by('first_name', 'last_name')
+        data = [
+            {'id': c.id, 'first_name': c.first_name, 'last_name': c.last_name or '', 'role': c.role}
+            for c in coaches_qs
+        ]
+        return Response({'coaches': data})
+
+    @action(detail=True, methods=['get'], url_path='check_coach_availability')
+    def check_coach_availability(self, request, pk=None):
+        """Check if a new coach is free for the booking slot. Admin/superadmin only."""
+        if not (request.user.is_superuser or getattr(request.user, 'role', '') in ('admin', 'superadmin')):
+            return Response({'error': 'Permission denied.'}, status=status.HTTP_403_FORBIDDEN)
+        booking = self.get_object()
+        if booking.booking_type != 'coaching':
+            return Response({'error': 'Only coaching bookings can have their coach changed.'}, status=status.HTTP_400_BAD_REQUEST)
+        new_coach_id = request.query_params.get('new_coach_id')
+        if not new_coach_id:
+            return Response({'error': 'new_coach_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            new_coach = User.objects.get(id=int(new_coach_id), role__in=['staff', 'admin'], is_active=True)
+        except (User.DoesNotExist, ValueError, TypeError):
+            return Response({'error': 'Coach not found or is not active.'}, status=status.HTTP_404_NOT_FOUND)
+        slot_start = booking.start_time
+        slot_end = booking.end_time
+        booking_date = slot_start.date()
+        location_id = booking.location_id or get_location_id_from_request(request)
+        from golf_project.timezone_utils import get_center_timezone
+        center_tz = get_center_timezone(location_id)
+        booking_conflict = Booking.objects.filter(
+            coach=new_coach, start_time__lt=slot_end, end_time__gt=slot_start,
+            status__in=['confirmed', 'completed'],
+        ).exclude(id=booking.id).exists()
+        if booking_conflict:
+            name = f'{new_coach.first_name} {new_coach.last_name or ""}'.strip()
+            return Response({'available': False, 'conflict_type': 'booking_conflict',
+                'message': f'{name} already has a booking at this time. Cannot override a booking conflict.'})
+        from users.models import StaffAvailability, StaffDayAvailability, StaffBlockedDate
+        day_of_week = booking_date.weekday()
+        name = f'{new_coach.first_name} {new_coach.last_name or ""}'.strip()
+        if StaffBlockedDate.objects.filter(staff=new_coach, date=booking_date, start_time__isnull=True, end_time__isnull=True).exists():
+            return Response({'available': False, 'conflict_type': 'working_hours',
+                'message': f'{name} has a full-day block on this date.'})
+        for b in StaffBlockedDate.objects.filter(staff=new_coach, date=booking_date, start_time__isnull=False, end_time__isnull=False).values('start_time', 'end_time'):
+            s_naive = datetime.combine(booking_date, b['start_time'])
+            e_naive = datetime.combine(booking_date, b['end_time'])
+            if b['end_time'] <= b['start_time']:
+                e_naive += timedelta(days=1)
+            b_start_utc = center_tz.localize(s_naive).astimezone(pytz.UTC)
+            b_end_utc = center_tz.localize(e_naive).astimezone(pytz.UTC)
+            if slot_start < b_end_utc and slot_end > b_start_utc:
+                return Response({'available': False, 'conflict_type': 'working_hours',
+                    'message': f'{name} is blocked during this time slot.'})
+        availabilities = list(StaffDayAvailability.objects.filter(staff=new_coach, date=booking_date).values('start_time', 'end_time'))
+        if not availabilities:
+            availabilities = list(StaffAvailability.objects.filter(staff=new_coach, day_of_week=day_of_week).values('start_time', 'end_time'))
+        if not availabilities:
+            return Response({'available': False, 'conflict_type': 'working_hours',
+                'message': f'{name} has no scheduled working hours on this day.'})
+        is_covered = False
+        for a in availabilities:
+            s_naive = datetime.combine(booking_date, a['start_time'])
+            e_naive = datetime.combine(booking_date, a['end_time'])
+            if a['end_time'] <= a['start_time']:
+                e_naive += timedelta(days=1)
+            s_utc = center_tz.localize(s_naive).astimezone(pytz.UTC)
+            e_utc = center_tz.localize(e_naive).astimezone(pytz.UTC)
+            if s_utc <= slot_start and e_utc >= slot_end:
+                is_covered = True
+                break
+        if not is_covered:
+            return Response({'available': False, 'conflict_type': 'working_hours',
+                'message': f'{name} is outside their scheduled working hours for this slot.'})
+        return Response({'available': True})
+
+    @action(detail=True, methods=['post'], url_path='change_coach')
+    def change_coach(self, request, pk=None):
+        """Reassign the coach for a coaching booking. Admin/superadmin only."""
+        if not (request.user.is_superuser or getattr(request.user, 'role', '') in ('admin', 'superadmin')):
+            return Response({'error': 'Permission denied.'}, status=status.HTTP_403_FORBIDDEN)
+        booking = self.get_object()
+        if booking.booking_type != 'coaching':
+            return Response({'error': 'Only coaching bookings can have their coach changed.'}, status=status.HTTP_400_BAD_REQUEST)
+        if booking.status in ('cancelled', 'completed'):
+            return Response({'error': f'Cannot change coach on a {booking.status} booking.'}, status=status.HTTP_400_BAD_REQUEST)
+        new_coach_id = request.data.get('new_coach_id')
+        force_override_raw = request.data.get('force_override', False)
+        force_override = str(force_override_raw).lower() in ('1', 'true', 'yes')
+        if not new_coach_id:
+            return Response({'error': 'new_coach_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            new_coach = User.objects.get(id=int(new_coach_id), role__in=['staff', 'admin'], is_active=True)
+        except (User.DoesNotExist, ValueError, TypeError):
+            return Response({'error': 'Coach not found or is not active.'}, status=status.HTTP_404_NOT_FOUND)
+        if booking.coach_id == new_coach.id:
+            return Response({'error': 'The selected coach is already assigned to this booking.'}, status=status.HTTP_400_BAD_REQUEST)
+        new_name = f'{new_coach.first_name} {new_coach.last_name or ""}'.strip()
+        booking_conflict = Booking.objects.filter(
+            coach=new_coach, start_time__lt=booking.end_time, end_time__gt=booking.start_time,
+            status__in=['confirmed', 'completed'],
+        ).exclude(id=booking.id).exists()
+        if booking_conflict:
+            return Response({'error': f'{new_name} already has a booking at this time. Cannot override a booking conflict.',
+                'conflict_type': 'booking_conflict'}, status=status.HTTP_400_BAD_REQUEST)
+        if not force_override:
+            from golf_project.timezone_utils import get_center_timezone
+            from users.models import StaffAvailability, StaffDayAvailability, StaffBlockedDate
+            location_id = booking.location_id or get_location_id_from_request(request)
+            center_tz = get_center_timezone(location_id)
+            slot_start = booking.start_time
+            slot_end = booking.end_time
+            booking_date = slot_start.date()
+            day_of_week = booking_date.weekday()
+            if StaffBlockedDate.objects.filter(staff=new_coach, date=booking_date, start_time__isnull=True, end_time__isnull=True).exists():
+                return Response({'error': f'{new_name} has a full-day block on this date.', 'conflict_type': 'working_hours'}, status=status.HTTP_400_BAD_REQUEST)
+            for b in StaffBlockedDate.objects.filter(staff=new_coach, date=booking_date, start_time__isnull=False, end_time__isnull=False).values('start_time', 'end_time'):
+                s_naive = datetime.combine(booking_date, b['start_time'])
+                e_naive = datetime.combine(booking_date, b['end_time'])
+                if b['end_time'] <= b['start_time']:
+                    e_naive += timedelta(days=1)
+                b_start_utc = center_tz.localize(s_naive).astimezone(pytz.UTC)
+                b_end_utc = center_tz.localize(e_naive).astimezone(pytz.UTC)
+                if slot_start < b_end_utc and slot_end > b_start_utc:
+                    return Response({'error': f'{new_name} is blocked during this time slot. Use force override.', 'conflict_type': 'working_hours'}, status=status.HTTP_400_BAD_REQUEST)
+            availabilities = list(StaffDayAvailability.objects.filter(staff=new_coach, date=booking_date).values('start_time', 'end_time'))
+            if not availabilities:
+                availabilities = list(StaffAvailability.objects.filter(staff=new_coach, day_of_week=day_of_week).values('start_time', 'end_time'))
+            if not availabilities:
+                return Response({'error': f'{new_name} has no scheduled working hours on this day. Use force override.', 'conflict_type': 'working_hours'}, status=status.HTTP_400_BAD_REQUEST)
+            is_covered = False
+            for a in availabilities:
+                s_naive = datetime.combine(booking_date, a['start_time'])
+                e_naive = datetime.combine(booking_date, a['end_time'])
+                if a['end_time'] <= a['start_time']:
+                    e_naive += timedelta(days=1)
+                s_utc = center_tz.localize(s_naive).astimezone(pytz.UTC)
+                e_utc = center_tz.localize(e_naive).astimezone(pytz.UTC)
+                if s_utc <= slot_start and e_utc >= slot_end:
+                    is_covered = True
+                    break
+            if not is_covered:
+                return Response({'error': f'{new_name} is outside their scheduled working hours for this slot. Use force override.', 'conflict_type': 'working_hours'}, status=status.HTTP_400_BAD_REQUEST)
+        old_name = f'{booking.coach.first_name} {booking.coach.last_name or ""}'.strip() if booking.coach else 'Unassigned'
+        booking.coach = new_coach
+        booking.save(update_fields=['coach', 'updated_at'])
+        logger.info('Booking #%s coach changed from "%s" to "%s" by %s (force_override=%s)', booking.id, old_name, new_name, request.user, force_override)
+        serializer = self.get_serializer(booking)
+        return Response({'message': f'Coach changed from {old_name} to {new_name}.', 'force_overridden': force_override, 'booking': serializer.data})
+
+    # ---------------------------------------------------------------------------
+
     @action(detail=False, methods=['get'])
     def calendar_events(self, request):
         """Get bookings for calendar view"""
