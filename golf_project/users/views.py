@@ -30,6 +30,25 @@ from .serializers import (
 logger = logging.getLogger(__name__)
 
 
+def _absolute_logo_url(logo_field, request=None):
+    """Build a public absolute URL for a location logo ImageField."""
+    if not logo_field:
+        return None
+    try:
+        relative = logo_field.url
+    except Exception:
+        return None
+    backend_base = getattr(settings, 'BACKEND_BASE_URL', '').rstrip('/')
+    if backend_base:
+        return f"{backend_base}{relative}"
+    if request is not None:
+        try:
+            return request.build_absolute_uri(relative)
+        except Exception:
+            return None
+    return relative
+
+
 class MemberListPagination(PageNumberPagination):
     page_size = 10
     page_size_query_param = 'page_size'
@@ -62,18 +81,11 @@ def list_ghl_locations(request):
         location_list = []
         for location in locations:
             display_name = location.company_name if location.company_name else location.location_id
-            # Build absolute logo URL if one is set
-            logo_url = None
-            if location.logo:
-                try:
-                    logo_url = request.build_absolute_uri(location.logo.url)
-                except Exception:
-                    pass
             location_list.append({
                 'location_id': location.location_id,
                 'display_name': display_name,
                 'company_name': location.company_name or '',
-                'logo_url': logo_url,
+                'logo_url': _absolute_logo_url(location.logo, request),
             })
         
         return Response({
@@ -301,11 +313,7 @@ def verify_otp(request):
                 try:
                     from ghl.models import GHLLocation
                     loc = GHLLocation.objects.get(location_id=resolved_location)
-                    if loc.logo:
-                        base_url = request.build_absolute_uri('/').rstrip('/')
-                        response_data['location_logo_url'] = base_url + loc.logo.url
-                    else:
-                        response_data['location_logo_url'] = None
+                    response_data['location_logo_url'] = _absolute_logo_url(loc.logo, request)
                 except Exception:
                     response_data['location_logo_url'] = None
                 
@@ -680,9 +688,7 @@ def login(request):
         try:
             from ghl.models import GHLLocation
             loc = GHLLocation.objects.get(location_id=user.ghl_location_id)
-            if loc.logo:
-                base_url = request.build_absolute_uri('/').rstrip('/')
-                location_logo_url = base_url + loc.logo.url
+            location_logo_url = _absolute_logo_url(loc.logo, request)
         except Exception:
             pass
         
