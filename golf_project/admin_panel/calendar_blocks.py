@@ -107,6 +107,128 @@ def _public_cancel_stats(cancel_stats):
     }
 
 
+def _parse_resource_ids(data):
+    """
+    Accept resource_ids (list) and/or resource_id (single).
+    Returns (ids: list[int], error_response|None).
+    """
+    raw_ids = data.get('resource_ids')
+    ids = []
+    if raw_ids is not None:
+        if not isinstance(raw_ids, (list, tuple)):
+            return None, Response(
+                {'error': 'resource_ids must be a list of IDs.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        for item in raw_ids:
+            try:
+                ids.append(int(item))
+            except (TypeError, ValueError):
+                return None, Response(
+                    {'error': f'Invalid resource id: {item}'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+    single = data.get('resource_id')
+    if single not in (None, '', 0, '0'):
+        try:
+            sid = int(single)
+        except (TypeError, ValueError):
+            return None, Response(
+                {'error': 'Invalid resource_id.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if sid not in ids:
+            ids.append(sid)
+    # Preserve order, unique
+    seen = set()
+    unique = []
+    for i in ids:
+        if i not in seen:
+            seen.add(i)
+            unique.append(i)
+    if not unique:
+        return None, Response(
+            {'error': 'resource_id or resource_ids is required.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return unique, None
+
+
+def _merge_cancel_stats(acc, nxt):
+    if not nxt:
+        return acc
+    if not acc:
+        return nxt
+    acc_bookings = (acc.get('_email_ctx') or {}).get('bookings') or []
+    nxt_bookings = (nxt.get('_email_ctx') or {}).get('bookings') or []
+    seen = set()
+    merged_bookings = []
+    for b in list(acc_bookings) + list(nxt_bookings):
+        bid = getattr(b, 'id', None)
+        if bid is None or bid in seen:
+            continue
+        seen.add(bid)
+        merged_bookings.append(b)
+
+    ids = list(dict.fromkeys(
+        (acc.get('cancelled_booking_ids') or []) + (nxt.get('cancelled_booking_ids') or [])
+    ))
+    ctx = dict(acc.get('_email_ctx') or {})
+    ctx.update(nxt.get('_email_ctx') or {})
+    labels = []
+    for part in (acc.get('_email_ctx') or {}).get('resource_label', ''), (nxt.get('_email_ctx') or {}).get('resource_label', ''):
+        if part and part not in labels:
+            labels.append(part)
+    # Prefer concatenated labels from resource_label fields on stats if present
+    prev_label = (acc.get('_email_ctx') or {}).get('resource_label') or ''
+    next_label = (nxt.get('_email_ctx') or {}).get('resource_label') or ''
+    if prev_label and next_label and prev_label != next_label:
+        ctx['resource_label'] = f'{prev_label}, {next_label}'
+    elif next_label:
+        ctx['resource_label'] = next_label
+    elif prev_label:
+        ctx['resource_label'] = prev_label
+    ctx['bookings'] = merged_bookings
+
+    return {
+        'cancelled_bookings': len(ids),
+        'cancelled_booking_ids': ids,
+        'refunded_sessions': (acc.get('refunded_sessions') or 0) + (nxt.get('refunded_sessions') or 0),
+        'refunded_simulator_hours': float(acc.get('refunded_simulator_hours') or 0) + float(
+            nxt.get('refunded_simulator_hours') or 0
+        ),
+        'refunded_category_hours': float(acc.get('refunded_category_hours') or 0) + float(
+            nxt.get('refunded_category_hours') or 0
+        ),
+        'emails_sent': (acc.get('emails_sent') or 0) + (nxt.get('emails_sent') or 0),
+        '_email_ctx': ctx,
+    }
+
+
+def _merge_preview(acc, nxt):
+    if not nxt:
+        return acc
+    if not acc:
+        return nxt
+    by_id = {b['id']: b for b in (acc.get('bookings') or [])}
+    for b in nxt.get('bookings') or []:
+        by_id[b['id']] = b
+    labels = [x for x in [acc.get('resource_label'), nxt.get('resource_label')] if x]
+    # de-dupe label parts
+    label_parts = []
+    for lab in labels:
+        for part in str(lab).split(', '):
+            if part and part not in label_parts:
+                label_parts.append(part)
+    bookings = list(by_id.values())
+    return {
+        **nxt,
+        'resource_label': ', '.join(label_parts) if label_parts else nxt.get('resource_label'),
+        'count': len(bookings),
+        'bookings': bookings,
+    }
+
+
 class CalendarBlockView(APIView):
     """
     POST /api/admin/calendar-blocks/
@@ -257,12 +379,15 @@ class CalendarBlockView(APIView):
             return Response({'error': 'Staff or admin only.'}, status=status.HTTP_403_FORBIDDEN)
 
         resource_type = (request.data.get('resource_type') or '').strip().lower()
-        resource_id = request.data.get('resource_id')
-        if resource_type not in ('staff', 'simulator', 'asset') or not resource_id:
+        if resource_type not in ('staff', 'simulator', 'asset'):
             return Response(
-                {'error': 'resource_type (staff|simulator|asset) and resource_id are required.'},
+                {'error': 'resource_type (staff|simulator|asset) is required.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        resource_ids, ids_err = _parse_resource_ids(request.data)
+        if ids_err:
+            return ids_err
 
         parsed, err = _parse_block_times(request.data)
         if err:
@@ -284,42 +409,45 @@ class CalendarBlockView(APIView):
         # ── Preview only: list overlapping bookings, do not create/cancel ──
         if preview_only:
             try:
-                if resource_type == 'staff':
-                    from users.models import User
-                    try:
-                        staff = _get_blockable_coach(resource_id)
-                    except User.DoesNotExist:
-                        return Response({'error': 'Coach not found.'}, status=status.HTTP_404_NOT_FOUND)
-                    if location_id and staff.ghl_location_id and staff.ghl_location_id != location_id:
-                        return Response({'error': 'Coach not in your location.'}, status=status.HTTP_403_FORBIDDEN)
-                    data = preview_for_staff_block(
-                        staff, parsed['date'], parsed['start_time'], parsed['end_time'],
-                        location_id or staff.ghl_location_id,
-                    )
-                elif resource_type == 'simulator':
-                    from simulators.models import Simulator
-                    try:
-                        sim = Simulator.objects.get(id=resource_id)
-                    except Simulator.DoesNotExist:
-                        return Response({'error': 'Simulator not found.'}, status=status.HTTP_404_NOT_FOUND)
-                    if location_id and sim.location_id and sim.location_id != location_id:
-                        return Response({'error': 'Simulator not in your location.'}, status=status.HTTP_403_FORBIDDEN)
-                    data = preview_for_simulator_block(
-                        sim, parsed['date'], parsed['start_time'], parsed['end_time'],
-                        location_id or sim.location_id,
-                    )
-                else:
-                    from categories.models import CategoryAsset
-                    try:
-                        asset = CategoryAsset.objects.get(id=resource_id)
-                    except CategoryAsset.DoesNotExist:
-                        return Response({'error': 'Asset not found.'}, status=status.HTTP_404_NOT_FOUND)
-                    if location_id and asset.location_id and asset.location_id != location_id:
-                        return Response({'error': 'Asset not in your location.'}, status=status.HTTP_403_FORBIDDEN)
-                    data = preview_for_asset_block(
-                        asset, parsed['date'], parsed['start_time'], parsed['end_time'],
-                        location_id or asset.location_id,
-                    )
+                merged = None
+                for resource_id in resource_ids:
+                    if resource_type == 'staff':
+                        from users.models import User
+                        try:
+                            staff = _get_blockable_coach(resource_id)
+                        except User.DoesNotExist:
+                            return Response({'error': f'Coach not found (id={resource_id}).'}, status=status.HTTP_404_NOT_FOUND)
+                        if location_id and staff.ghl_location_id and staff.ghl_location_id != location_id:
+                            return Response({'error': 'Coach not in your location.'}, status=status.HTTP_403_FORBIDDEN)
+                        data = preview_for_staff_block(
+                            staff, parsed['date'], parsed['start_time'], parsed['end_time'],
+                            location_id or staff.ghl_location_id,
+                        )
+                    elif resource_type == 'simulator':
+                        from simulators.models import Simulator
+                        try:
+                            sim = Simulator.objects.get(id=resource_id)
+                        except Simulator.DoesNotExist:
+                            return Response({'error': f'Simulator not found (id={resource_id}).'}, status=status.HTTP_404_NOT_FOUND)
+                        if location_id and sim.location_id and sim.location_id != location_id:
+                            return Response({'error': 'Simulator not in your location.'}, status=status.HTTP_403_FORBIDDEN)
+                        data = preview_for_simulator_block(
+                            sim, parsed['date'], parsed['start_time'], parsed['end_time'],
+                            location_id or sim.location_id,
+                        )
+                    else:
+                        from categories.models import CategoryAsset
+                        try:
+                            asset = CategoryAsset.objects.get(id=resource_id)
+                        except CategoryAsset.DoesNotExist:
+                            return Response({'error': f'Asset not found (id={resource_id}).'}, status=status.HTTP_404_NOT_FOUND)
+                        if location_id and asset.location_id and asset.location_id != location_id:
+                            return Response({'error': 'Asset not in your location.'}, status=status.HTTP_403_FORBIDDEN)
+                        data = preview_for_asset_block(
+                            asset, parsed['date'], parsed['start_time'], parsed['end_time'],
+                            location_id or asset.location_id,
+                        )
+                    merged = _merge_preview(merged, data)
             except Exception:
                 logger.exception('Block preview failed')
                 return Response(
@@ -333,114 +461,138 @@ class CalendarBlockView(APIView):
                 'start_time': parsed['start_time'].strftime('%H:%M') if parsed['start_time'] else None,
                 'end_time': parsed['end_time'].strftime('%H:%M') if parsed['end_time'] else None,
                 'is_full_day': not (parsed['start_time'] and parsed['end_time']),
-                **data,
+                'resource_ids': resource_ids,
+                **(merged or {'count': 0, 'bookings': [], 'resource_label': ''}),
             })
 
-        payload = None
+        payloads = []
         cancel_stats = None
+
+        # Validate all resources before creating any blocks
+        resolved = []
+        for resource_id in resource_ids:
+            if resource_type == 'staff':
+                from users.models import User
+                try:
+                    staff = _get_blockable_coach(resource_id)
+                except User.DoesNotExist:
+                    return Response({'error': f'Coach not found (id={resource_id}).'}, status=status.HTTP_404_NOT_FOUND)
+                if location_id and staff.ghl_location_id and staff.ghl_location_id != location_id:
+                    return Response({'error': 'Coach not in your location.'}, status=status.HTTP_403_FORBIDDEN)
+                resolved.append(('staff', staff))
+            elif resource_type == 'simulator':
+                from simulators.models import Simulator
+                try:
+                    sim = Simulator.objects.get(id=resource_id)
+                except Simulator.DoesNotExist:
+                    return Response({'error': f'Simulator not found (id={resource_id}).'}, status=status.HTTP_404_NOT_FOUND)
+                if location_id and sim.location_id and sim.location_id != location_id:
+                    return Response({'error': 'Simulator not in your location.'}, status=status.HTTP_403_FORBIDDEN)
+                resolved.append(('simulator', sim))
+            else:
+                from categories.models import CategoryAsset
+                try:
+                    asset = CategoryAsset.objects.get(id=resource_id)
+                except CategoryAsset.DoesNotExist:
+                    return Response({'error': f'Asset not found (id={resource_id}).'}, status=status.HTTP_404_NOT_FOUND)
+                if location_id and asset.location_id and asset.location_id != location_id:
+                    return Response({'error': 'Asset not in your location.'}, status=status.HTTP_403_FORBIDDEN)
+                resolved.append(('asset', asset))
+
+        raw_cat = request.data.get('category_id')
+        category_id = None
+        if raw_cat not in (None, '', 0, '0'):
+            try:
+                category_id = int(raw_cat)
+            except (TypeError, ValueError):
+                return Response({'error': 'Invalid category_id.'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             with transaction.atomic():
-                if resource_type == 'staff':
-                    from users.models import User, StaffBlockedDate
-                    try:
-                        staff = _get_blockable_coach(resource_id)
-                    except User.DoesNotExist:
-                        return Response({'error': 'Coach not found.'}, status=status.HTTP_404_NOT_FOUND)
-                    if location_id and staff.ghl_location_id and staff.ghl_location_id != location_id:
-                        return Response({'error': 'Coach not in your location.'}, status=status.HTTP_403_FORBIDDEN)
+                for kind, obj in resolved:
+                    if kind == 'staff':
+                        from users.models import StaffBlockedDate
+                        block = StaffBlockedDate.objects.create(
+                            staff=obj,
+                            date=parsed['date'],
+                            start_time=parsed['start_time'],
+                            end_time=parsed['end_time'],
+                            reason=parsed['reason'],
+                            created_by=request.user,
+                            service_category_id=category_id,
+                        )
+                        stats = cancel_for_staff_block(
+                            staff=obj,
+                            block_date=parsed['date'],
+                            start_time=parsed['start_time'],
+                            end_time=parsed['end_time'],
+                            location_id=location_id or obj.ghl_location_id,
+                            issued_by=request.user,
+                            reason=parsed['reason'],
+                            send_email=False,
+                        )
+                        cancel_stats = _merge_cancel_stats(cancel_stats, stats)
+                        payloads.append(_block_payload(block, 'staff', obj.id))
 
-                    raw_cat = request.data.get('category_id')
-                    category_id = None
-                    if raw_cat not in (None, '', 0, '0'):
-                        try:
-                            category_id = int(raw_cat)
-                        except (TypeError, ValueError):
-                            return Response({'error': 'Invalid category_id.'}, status=status.HTTP_400_BAD_REQUEST)
+                    elif kind == 'simulator':
+                        from simulators.models import SimulatorBlockedDate
+                        block = SimulatorBlockedDate.objects.create(
+                            simulator=obj,
+                            date=parsed['date'],
+                            start_time=parsed['start_time'],
+                            end_time=parsed['end_time'],
+                            reason=parsed['reason'],
+                            created_by=request.user,
+                        )
+                        stats = cancel_for_simulator_block(
+                            simulator=obj,
+                            block_date=parsed['date'],
+                            start_time=parsed['start_time'],
+                            end_time=parsed['end_time'],
+                            location_id=location_id or obj.location_id,
+                            issued_by=request.user,
+                            reason=parsed['reason'],
+                            send_email=False,
+                        )
+                        cancel_stats = _merge_cancel_stats(cancel_stats, stats)
+                        payloads.append(_block_payload(block, 'simulator', obj.id))
 
-                    block = StaffBlockedDate.objects.create(
-                        staff=staff,
-                        date=parsed['date'],
-                        start_time=parsed['start_time'],
-                        end_time=parsed['end_time'],
-                        reason=parsed['reason'],
-                        created_by=request.user,
-                        service_category_id=category_id,
-                    )
-                    cancel_stats = cancel_for_staff_block(
-                        staff=staff,
-                        block_date=parsed['date'],
-                        start_time=parsed['start_time'],
-                        end_time=parsed['end_time'],
-                        location_id=location_id or staff.ghl_location_id,
-                        issued_by=request.user,
-                        reason=parsed['reason'],
-                        send_email=False,
-                    )
-                    payload = _block_payload(block, 'staff', staff.id)
-
-                elif resource_type == 'simulator':
-                    from simulators.models import Simulator, SimulatorBlockedDate
-                    try:
-                        sim = Simulator.objects.get(id=resource_id)
-                    except Simulator.DoesNotExist:
-                        return Response({'error': 'Simulator not found.'}, status=status.HTTP_404_NOT_FOUND)
-                    if location_id and sim.location_id and sim.location_id != location_id:
-                        return Response({'error': 'Simulator not in your location.'}, status=status.HTTP_403_FORBIDDEN)
-
-                    block = SimulatorBlockedDate.objects.create(
-                        simulator=sim,
-                        date=parsed['date'],
-                        start_time=parsed['start_time'],
-                        end_time=parsed['end_time'],
-                        reason=parsed['reason'],
-                        created_by=request.user,
-                    )
-                    cancel_stats = cancel_for_simulator_block(
-                        simulator=sim,
-                        block_date=parsed['date'],
-                        start_time=parsed['start_time'],
-                        end_time=parsed['end_time'],
-                        location_id=location_id or sim.location_id,
-                        issued_by=request.user,
-                        reason=parsed['reason'],
-                        send_email=False,
-                    )
-                    payload = _block_payload(block, 'simulator', sim.id)
-
-                else:
-                    from categories.models import CategoryAsset, CategoryAssetBlockedDate
-                    try:
-                        asset = CategoryAsset.objects.get(id=resource_id)
-                    except CategoryAsset.DoesNotExist:
-                        return Response({'error': 'Asset not found.'}, status=status.HTTP_404_NOT_FOUND)
-                    if location_id and asset.location_id and asset.location_id != location_id:
-                        return Response({'error': 'Asset not in your location.'}, status=status.HTTP_403_FORBIDDEN)
-
-                    block = CategoryAssetBlockedDate.objects.create(
-                        asset=asset,
-                        date=parsed['date'],
-                        start_time=parsed['start_time'],
-                        end_time=parsed['end_time'],
-                        reason=parsed['reason'],
-                        created_by=request.user,
-                    )
-                    cancel_stats = cancel_for_asset_block(
-                        asset=asset,
-                        block_date=parsed['date'],
-                        start_time=parsed['start_time'],
-                        end_time=parsed['end_time'],
-                        location_id=location_id or asset.location_id,
-                        issued_by=request.user,
-                        reason=parsed['reason'],
-                        send_email=False,
-                    )
-                    payload = _block_payload(block, 'asset', asset.id)
+                    else:
+                        from categories.models import CategoryAssetBlockedDate
+                        block = CategoryAssetBlockedDate.objects.create(
+                            asset=obj,
+                            date=parsed['date'],
+                            start_time=parsed['start_time'],
+                            end_time=parsed['end_time'],
+                            reason=parsed['reason'],
+                            created_by=request.user,
+                        )
+                        stats = cancel_for_asset_block(
+                            asset=obj,
+                            block_date=parsed['date'],
+                            start_time=parsed['start_time'],
+                            end_time=parsed['end_time'],
+                            location_id=location_id or obj.location_id,
+                            issued_by=request.user,
+                            reason=parsed['reason'],
+                            send_email=False,
+                        )
+                        cancel_stats = _merge_cancel_stats(cancel_stats, stats)
+                        payloads.append(_block_payload(block, 'asset', obj.id))
         except IntegrityError:
             return Response(
-                {'error': 'This time is already blocked for that resource.'},
+                {'error': 'This time is already blocked for one of the selected resources.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        payload = {
+            'blocks': payloads,
+            'resource_ids': resource_ids,
+            'count': len(payloads),
+        }
+        # Back-compat single-block shape when only one resource
+        if len(payloads) == 1:
+            payload.update(payloads[0])
 
         if cancel_stats is not None:
             finalize_block_cancel_emails(cancel_stats)
@@ -448,7 +600,8 @@ class CalendarBlockView(APIView):
             stats = _public_cancel_stats(cancel_stats)
             payload.update(stats)
             payload['message'] = (
-                f"Time blocked. Cancelled {stats['cancelled_bookings']} booking(s); "
+                f"Time blocked for {len(payloads)} resource(s). "
+                f"Cancelled {stats['cancelled_bookings']} booking(s); "
                 f"emailed {stats['emails_sent']} client(s)."
             )
         return Response(payload, status=status.HTTP_201_CREATED)

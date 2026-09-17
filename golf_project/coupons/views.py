@@ -5,7 +5,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated, BasePermission
 
-from .models import Coupon, CouponUsage
+from .models import Coupon, CouponUsage, resolve_for_quick_checkout
 from .serializers import CouponSerializer, CouponUsageSerializer, CouponValidateSerializer
 
 logger = logging.getLogger(__name__)
@@ -155,10 +155,19 @@ class CouponValidateView(APIView):
         if payment_type == 'event' and event_id:
             payment_type = f'event:{event_id}'
 
-        # Resolve identity from authenticated user
+        # Resolve identity: prefer explicit customer fields (staff Quick Checkout),
+        # otherwise fall back to the authenticated user.
+        customer_email = (serializer.validated_data.get('customer_email') or '').strip() or None
+        customer_phone = (serializer.validated_data.get('customer_phone') or '').strip() or None
         user = request.user
-        email = getattr(user, 'email', None)
-        phone = getattr(user, 'phone', None)
+        if customer_email or customer_phone:
+            email = customer_email
+            phone = customer_phone
+            user_for_limit = None
+        else:
+            email = getattr(user, 'email', None)
+            phone = getattr(user, 'phone', None)
+            user_for_limit = user
 
         try:
             coupon = Coupon.objects.get(code=code)
@@ -168,9 +177,10 @@ class CouponValidateView(APIView):
         # Check validity (payment_type + per-user limit)
         valid, error_msg = coupon.is_valid(
             payment_type=payment_type,
-            user=user,
+            user=user_for_limit,
             email=email,
-            phone=phone
+            phone=phone,
+            for_quick_checkout=resolve_for_quick_checkout(request),
         )
         if not valid:
             return Response({'error': error_msg}, status=status.HTTP_400_BAD_REQUEST)
@@ -190,3 +200,111 @@ class CouponValidateView(APIView):
             'final_amount': final_amount,
             'description': coupon.description,
         })
+
+
+class CouponQuickCreateView(APIView):
+    """
+    POST /api/coupons/quick-create/
+
+    Staff/admin creates a one-time coupon for Quick Checkout (existing package discount).
+    Body:
+      {
+        "discount_type": "percentage" | "fixed",
+        "discount_value": 10,
+        "package_id": 5,          # optional — scopes to that package
+        "code": "OPTIONAL",       # optional custom code
+        "amount": 100.00          # optional — if set, response includes discount preview
+      }
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        user = request.user
+        if not (
+            user.is_superuser
+            or getattr(user, 'role', None) in ('admin', 'staff', 'superadmin')
+        ):
+            return Response({'error': 'Staff or admin only.'}, status=status.HTTP_403_FORBIDDEN)
+
+        discount_type = (request.data.get('discount_type') or 'percentage').strip().lower()
+        if discount_type not in ('percentage', 'fixed'):
+            return Response(
+                {'error': 'discount_type must be percentage or fixed.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            discount_value = float(request.data.get('discount_value'))
+        except (TypeError, ValueError):
+            return Response({'error': 'Invalid discount_value.'}, status=status.HTTP_400_BAD_REQUEST)
+        if discount_value <= 0:
+            return Response({'error': 'discount_value must be greater than 0.'}, status=status.HTTP_400_BAD_REQUEST)
+        if discount_type == 'percentage' and discount_value > 100:
+            return Response({'error': 'Percentage cannot exceed 100.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        package_id = request.data.get('package_id')
+        applicable_to = 'package'
+        if package_id not in (None, '', 0, '0'):
+            try:
+                package_id = int(package_id)
+            except (TypeError, ValueError):
+                return Response({'error': 'Invalid package_id.'}, status=status.HTTP_400_BAD_REQUEST)
+            applicable_to = f'package:{package_id}'
+
+        raw_code = (request.data.get('code') or '').strip().upper()
+        if raw_code:
+            code = raw_code
+        else:
+            import secrets
+            code = f'QC{secrets.token_hex(4).upper()}'
+
+        if Coupon.objects.filter(code=code).exists():
+            return Response(
+                {'error': f'Coupon code "{code}" already exists.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        coupon = Coupon.objects.create(
+            code=code,
+            description=f'Quick Checkout custom discount by {getattr(user, "username", user.id)}',
+            discount_type=discount_type,
+            discount_value=discount_value,
+            applicable_to=applicable_to,
+            max_uses=1,
+            per_user_limit=1,
+            is_active=True,
+            quick_checkout_only=True,
+        )
+
+        amount = request.data.get('amount')
+        payload = {
+            'valid': True,
+            'coupon_id': coupon.id,
+            'code': coupon.code,
+            'discount_type': coupon.discount_type,
+            'discount_value': float(coupon.discount_value),
+            'description': coupon.description,
+            'max_uses': 1,
+            'applicable_to': applicable_to,
+        }
+        if amount is not None:
+            try:
+                original = float(amount)
+            except (TypeError, ValueError):
+                coupon.delete()
+                return Response({'error': 'Invalid amount.'}, status=status.HTTP_400_BAD_REQUEST)
+            discount_amount = coupon.calculate_discount(original)
+            final_amount = round(original - discount_amount, 2)
+            if final_amount <= 0:
+                coupon.delete()
+                return Response(
+                    {'error': 'Discount cannot bring the price to $0.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            payload.update({
+                'discount_amount': discount_amount,
+                'original_amount': original,
+                'final_amount': final_amount,
+            })
+
+        return Response(payload, status=status.HTTP_201_CREATED)

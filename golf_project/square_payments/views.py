@@ -45,6 +45,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.exceptions import PermissionDenied
 
+from coupons.models import resolve_for_quick_checkout
 from .services import (
     create_payment,
     create_payment_link,
@@ -867,9 +868,15 @@ class InitiateSquarePaymentView(APIView):
                 return Response({'error': f'Coupon "{coupon_code}" is invalid.'}, status=status.HTTP_400_BAD_REQUEST)
 
             is_auth = request.user.is_authenticated
-            user_obj = request.user if is_auth else None
-            email = getattr(request.user, 'email', None) or guest_email
-            phone = getattr(request.user, 'phone', None) or guest_phone
+            # Staff Quick Checkout: prefer guest (member) identity for per-user coupon limits
+            if guest_phone or guest_email:
+                user_obj = None
+                email = guest_email or None
+                phone = guest_phone or None
+            else:
+                user_obj = request.user if is_auth else None
+                email = getattr(request.user, 'email', None) if is_auth else None
+                phone = getattr(request.user, 'phone', None) if is_auth else None
 
             valid, err = coupon_obj.is_valid(
                 payment_type=(
@@ -880,7 +887,11 @@ class InitiateSquarePaymentView(APIView):
                     else f'event:{ter.event.id}' if payment_type == 'event' and ter and ter.event
                     else payment_type
                 ),
-                user=user_obj, email=email, phone=phone)
+                user=user_obj,
+                email=email,
+                phone=phone,
+                for_quick_checkout=resolve_for_quick_checkout(request),
+            )
 
             if not valid:
                 return Response({'error': err}, status=status.HTTP_400_BAD_REQUEST)
@@ -1193,15 +1204,47 @@ class SquareWebhookView(APIView):
                 else:
                     logger.warning("Square webhook: unknown payment_type=%s", payment_type)
 
-                # Mark payment link paid if present
+                # Mark payment link paid if present; record coupon usage if applied
                 try:
                     from .models import PendingPaymentLink
                     from django.utils import timezone as dj_tz
-                    PendingPaymentLink.objects.filter(
+                    from django.db.models import F
+                    link = PendingPaymentLink.objects.filter(
                         temp_id=temp_id_str, status='pending'
-                    ).update(status='paid', paid_at=dj_tz.now())
-                except Exception:
-                    pass
+                    ).first()
+                    if link:
+                        coupon_code = (link.coupon_code or '').strip().upper()
+                        link.status = 'paid'
+                        link.paid_at = dj_tz.now()
+                        link.save(update_fields=['status', 'paid_at'])
+                        if coupon_code:
+                            from coupons.models import Coupon, CouponUsage
+                            try:
+                                coupon_obj = Coupon.objects.select_for_update().get(code=coupon_code)
+                                # Approximate pre-tax base from charged amount (includes 14% HST)
+                                charged = float(link.amount or 0)
+                                final_base = round(charged / 1.14, 2) if charged else 0.0
+                                CouponUsage.objects.create(
+                                    coupon=coupon_obj,
+                                    customer_email=link.buyer_email or '',
+                                    customer_phone=link.buyer_phone or '',
+                                    payment_id=payment_id or str(link.temp_id),
+                                    payment_type=link.payment_type or 'package',
+                                    discount_amount=0,
+                                    original_amount=final_base,
+                                    final_amount=final_base,
+                                    item_label=link.item_description or '',
+                                )
+                                Coupon.objects.filter(pk=coupon_obj.pk).update(
+                                    uses_count=F('uses_count') + 1
+                                )
+                            except Coupon.DoesNotExist:
+                                logger.warning(
+                                    'Payment link coupon %s not found for temp %s',
+                                    coupon_code, temp_id_str,
+                                )
+                except Exception as exc:
+                    logger.warning('Payment link paid/coupon update failed: %s', exc)
         except Exception as exc:
             logger.error("Square webhook finalization error: %s", exc, exc_info=True)
 
@@ -1784,10 +1827,11 @@ class CreatePaymentLinkView(APIView):
       {
         "temp_id": "<UUID>",
         "payment_type": "package" | "simulator" | "event" | "asset",
-        "amount": 45.00,          # pre-tax base
+        "amount": 45.00,          # pre-tax base (before coupon)
         "buyer_email": "a@b.com",
         "item_description": optional,
-        "redirect_url": optional
+        "redirect_url": optional,
+        "coupon_code": optional
       }
     """
     permission_classes = [IsAuthenticated]
@@ -1803,6 +1847,7 @@ class CreatePaymentLinkView(APIView):
         buyer_email = (request.data.get('buyer_email') or '').strip()
         item_description = (request.data.get('item_description') or '').strip()
         redirect_url = (request.data.get('redirect_url') or '').strip() or None
+        coupon_code = (request.data.get('coupon_code') or '').strip().upper()
         currency = settings.SQUARE_CURRENCY
 
         if not temp_id_str:
@@ -1819,9 +1864,10 @@ class CreatePaymentLinkView(APIView):
         if original_amount <= 0:
             return Response({'error': 'amount must be greater than 0.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Resolve label / phone / location from temp record
+        # Resolve label / phone / location / package id from temp record
         guest_phone = ''
         ghl_location_id = ''
+        package_id_for_coupon = None
         try:
             if payment_type == 'package':
                 from coaching.models import TempPurchase
@@ -1838,6 +1884,10 @@ class CreatePaymentLinkView(APIView):
                     item_description = pkg.title
                 if pkg and getattr(pkg, 'location_id', None):
                     ghl_location_id = pkg.location_id
+                if tp.package_id:
+                    package_id_for_coupon = tp.package_id
+                elif tp.simulator_package_id:
+                    package_id_for_coupon = tp.simulator_package_id
             elif payment_type == 'simulator':
                 from bookings.models import TempBooking
                 tb = TempBooking.objects.filter(temp_id=temp_id_str).first()
@@ -1865,9 +1915,39 @@ class CreatePaymentLinkView(APIView):
             from users.utils import get_location_id_from_request
             ghl_location_id = get_location_id_from_request(request) or getattr(user, 'ghl_location_id', '') or ''
 
+        discount_amount = 0.0
+        final_amount = original_amount
+        if coupon_code:
+            from coupons.models import Coupon
+            try:
+                coupon_obj = Coupon.objects.select_for_update().get(code=coupon_code)
+            except Coupon.DoesNotExist:
+                return Response(
+                    {'error': f'Coupon "{coupon_code}" is invalid.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            purpose = payment_type
+            if payment_type == 'package' and package_id_for_coupon:
+                purpose = f'package:{package_id_for_coupon}'
+            valid, err = coupon_obj.is_valid(
+                payment_type=purpose,
+                email=buyer_email,
+                phone=guest_phone,
+                for_quick_checkout=resolve_for_quick_checkout(request),
+            )
+            if not valid:
+                return Response({'error': err}, status=status.HTTP_400_BAD_REQUEST)
+            discount_amount = coupon_obj.calculate_discount(original_amount)
+            final_amount = round(original_amount - discount_amount, 2)
+            if final_amount <= 0:
+                return Response(
+                    {'error': 'Fully discounted payments are not yet supported for payment links.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         HST_RATE = 0.14
-        tax_amount = round(original_amount * HST_RATE, 2)
-        total_with_tax = round(original_amount + tax_amount, 2)
+        tax_amount = round(final_amount * HST_RATE, 2)
+        total_with_tax = round(final_amount + tax_amount, 2)
         amount_cents = int(round(total_with_tax * 100))
 
         try:
@@ -1908,6 +1988,7 @@ class CreatePaymentLinkView(APIView):
             square_order_id=link_data.get('order_id') or '',
             created_by=user,
             ghl_location_id=ghl_location_id or '',
+            coupon_code=coupon_code or '',
         )
 
         ghl_location = None
@@ -1933,9 +2014,12 @@ class CreatePaymentLinkView(APIView):
             'payment_link_id': pending.id,
             'payment_url': link_data['url'],
             'amount': total_with_tax,
-            'base_amount': original_amount,
+            'base_amount': final_amount,
+            'original_amount': original_amount,
+            'discount_amount': discount_amount,
             'tax_amount': tax_amount,
             'currency': currency,
+            'coupon_applied': coupon_code or None,
             'email_sent': emailed,
             'message': 'Payment link created' + (' and emailed.' if emailed else ', but email failed.'),
         }, status=status.HTTP_201_CREATED)

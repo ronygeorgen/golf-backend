@@ -3,6 +3,28 @@ from django.core.validators import MinValueValidator, MaxValueValidator
 from django.utils import timezone
 
 
+def staff_may_use_quick_checkout_coupon(user) -> bool:
+    """Only staff/admin can apply quick_checkout_only coupons."""
+    if not user or not getattr(user, 'is_authenticated', False):
+        return False
+    if getattr(user, 'is_superuser', False):
+        return True
+    return getattr(user, 'role', None) in ('admin', 'staff', 'superadmin')
+
+
+def resolve_for_quick_checkout(request) -> bool:
+    """
+    True only when the client asked for Quick Checkout mode AND the user is staff.
+    Prevents clients from forging for_quick_checkout=true on public payment APIs.
+    """
+    raw = request.data.get('for_quick_checkout', False) if hasattr(request, 'data') else False
+    if isinstance(raw, bool):
+        wanted = raw
+    else:
+        wanted = str(raw).lower() in ('1', 'true', 'yes')
+    return bool(wanted and staff_may_use_quick_checkout_coupon(getattr(request, 'user', None)))
+
+
 class Coupon(models.Model):
     DISCOUNT_TYPES = (
         ('percentage', 'Percentage'),
@@ -34,6 +56,10 @@ class Coupon(models.Model):
     valid_from = models.DateTimeField(null=True, blank=True)
     valid_until = models.DateTimeField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
+    quick_checkout_only = models.BooleanField(
+        default=False,
+        help_text='If true, coupon can only be applied from staff Quick Checkout.',
+    )
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -41,12 +67,15 @@ class Coupon(models.Model):
     def __str__(self):
         return f"{self.code} ({self.discount_value} {self.discount_type})"
 
-    def is_valid(self, payment_type=None, user=None, email=None, phone=None):
+    def is_valid(self, payment_type=None, user=None, email=None, phone=None, for_quick_checkout=False):
         """Checks if coupon is globally valid + matches payment_type + respects per-user limits."""
         now = timezone.now()
 
         if not self.is_active:
             return False, "This coupon is no longer active."
+
+        if self.quick_checkout_only and not for_quick_checkout:
+            return False, "This coupon can only be used in Quick Checkout."
 
         if self.valid_from and now < self.valid_from:
             return False, f"This coupon is valid from {self.valid_from.strftime('%Y-%m-%d %H:%M')}."

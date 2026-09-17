@@ -234,6 +234,12 @@ class PendingPaymentLink(models.Model):
         related_name='payment_links_created',
     )
     ghl_location_id = models.CharField(max_length=100, blank=True, default='')
+    coupon_code = models.CharField(
+        max_length=50,
+        blank=True,
+        default='',
+        help_text='Optional coupon applied when this payment link was created.',
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     paid_at = models.DateTimeField(null=True, blank=True)
 
