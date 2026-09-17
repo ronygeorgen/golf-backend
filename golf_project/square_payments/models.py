@@ -202,3 +202,46 @@ class MemberSubscription(models.Model):
     def is_subscription_active(self):
         return self.status == 'active'
 
+
+class PendingPaymentLink(models.Model):
+    """
+    Tracks Square Checkout Payment Links created by staff for email pay-later flows.
+    When Square webhook reports COMPLETED payment, we resolve via order_id / temp_id.
+    """
+    STATUS_CHOICES = (
+        ('pending', 'Pending'),
+        ('paid', 'Paid'),
+        ('expired', 'Expired'),
+        ('cancelled', 'Cancelled'),
+    )
+
+    temp_id = models.UUIDField(db_index=True)
+    payment_type = models.CharField(max_length=40, help_text="package | simulator | event | asset | asset:<id>")
+    amount = models.DecimalField(max_digits=10, decimal_places=2)
+    currency = models.CharField(max_length=10, default='CAD')
+    buyer_email = models.EmailField()
+    buyer_phone = models.CharField(max_length=20, blank=True, default='')
+    item_description = models.CharField(max_length=255, blank=True, default='')
+    payment_url = models.URLField(max_length=1000)
+    square_payment_link_id = models.CharField(max_length=100, blank=True, default='')
+    square_order_id = models.CharField(max_length=100, blank=True, default='', db_index=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='payment_links_created',
+    )
+    ghl_location_id = models.CharField(max_length=100, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    paid_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'Pending Payment Link'
+        verbose_name_plural = 'Pending Payment Links'
+
+    def __str__(self):
+        return f'PaymentLink {self.temp_id} ({self.status})'
+

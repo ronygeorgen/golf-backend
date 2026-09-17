@@ -1163,6 +1163,13 @@ class BookingViewSet(viewsets.ModelViewSet):
                     end_time = booking_data.get('end_time')
                     duration_minutes = int((end_time - start_time).total_seconds() / 60)
 
+                    # Enforce admin calendar blackouts (same as slot API)
+                    from .resource_blocks import is_category_asset_blocked
+                    if is_category_asset_blocked(_asset_obj, start_time, end_time):
+                        raise serializers.ValidationError(
+                            "This asset is blocked during the selected time. Please choose another slot."
+                        )
+
                     # ── Prepaid hours path ─────────────────────────────────────────
                     if use_prepaid_hours is True:
                         from decimal import Decimal
@@ -1290,6 +1297,14 @@ class BookingViewSet(viewsets.ModelViewSet):
                 # the category asset IS the physical space.  Skip bay assignment entirely.
                 _category_asset_obj = booking_data.get('category_asset')
                 _is_dynamic_category_booking = bool(_category_asset_obj and getattr(_category_asset_obj, 'needs_staff', False))
+
+                # Enforce admin asset blackouts for staffed category bookings too
+                if _category_asset_obj and start_time and end_time:
+                    from .resource_blocks import is_category_asset_blocked
+                    if is_category_asset_blocked(_category_asset_obj, start_time, end_time):
+                        raise serializers.ValidationError(
+                            "This asset is blocked during the selected time. Please choose another slot."
+                        )
 
                 # Find available bay (Coaching Bay first, then Simulator Bay) using locking
                 # Order by is_coaching_bay DESC so we try coaching bays first, then by bay_number
@@ -2965,8 +2980,19 @@ class BookingViewSet(viewsets.ModelViewSet):
                     # Check if facility is closed
                     from admin_panel.models import ClosedDay
                     is_closed, closed_message = ClosedDay.check_if_closed(slot_start, location_id=location_id)
+
+                    # Check one-off bay blackouts (admin calendar blocks)
+                    from simulators.models import SimulatorBlockedDate
+                    local_slot_start_t = current_time.time()
+                    local_slot_end_dt = current_time + timedelta(minutes=duration_minutes)
+                    local_slot_end_t = local_slot_end_dt.time()
+                    is_bay_blocked = False
+                    for blk in SimulatorBlockedDate.objects.filter(simulator=simulator, date=booking_date):
+                        if blk.conflicts_with_time(local_slot_start_t, local_slot_end_t):
+                            is_bay_blocked = True
+                            break
                     
-                    if not conflicting_bookings.exists() and not conflicting_temp_bookings.exists() and not is_closed and not has_special_event:
+                    if not conflicting_bookings.exists() and not conflicting_temp_bookings.exists() and not is_closed and not has_special_event and not is_bay_blocked:
                         slot_start_str = slot_start.isoformat()
                         existing_slot = next((s for s in available_slots if s['start_time'] == slot_start_str), None)
                         

@@ -60,6 +60,53 @@ class SimulatorAvailability(models.Model):
         return f"{self.simulator.name} - {self.get_day_of_week_display()} ({self.start_time} - {self.end_time})"
 
 
+class SimulatorBlockedDate(models.Model):
+    """
+    One-off blackout for a specific simulator/bay (full day or time range).
+    Mirrors StaffBlockedDate so admins can block specific hours on a bay.
+    """
+    simulator = models.ForeignKey(Simulator, on_delete=models.CASCADE, related_name='blocked_dates')
+    date = models.DateField(help_text="Date when this bay is blocked")
+    start_time = models.TimeField(
+        null=True,
+        blank=True,
+        help_text="Start time of block (empty = full-day). Wall-clock in center local timezone.",
+    )
+    end_time = models.TimeField(
+        null=True,
+        blank=True,
+        help_text="End time of block (empty = full-day). Wall-clock in center local timezone.",
+    )
+    reason = models.CharField(max_length=255, blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='simulator_blocks_created',
+    )
+
+    class Meta:
+        unique_together = ['simulator', 'date', 'start_time', 'end_time']
+        ordering = ['date', 'start_time']
+        verbose_name = 'Simulator Blocked Date'
+        verbose_name_plural = 'Simulator Blocked Dates'
+
+    def is_full_day_block(self):
+        return self.start_time is None and self.end_time is None
+
+    def conflicts_with_time(self, check_start_time, check_end_time):
+        if self.is_full_day_block():
+            return True
+        return self.start_time < check_end_time and check_start_time < self.end_time
+
+    def __str__(self):
+        if self.is_full_day_block():
+            return f"{self.simulator.name} blocked {self.date} (Full Day)"
+        return f"{self.simulator.name} blocked {self.date} ({self.start_time}-{self.end_time})"
+
+
 class SimulatorCredit(models.Model):
     class Status(models.TextChoices):
         AVAILABLE = 'available', 'Available'

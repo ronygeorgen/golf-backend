@@ -97,7 +97,12 @@ class StaffBlockedDate(models.Model):
     - Full-day block (all categories): date=2026-02-16, start_time=None, end_time=None, service_category=None
     - Partial-day block (Fitness only): date=2026-02-16, start_time=10:00, end_time=15:00, service_category=<Fitness>
     """
-    staff = models.ForeignKey(User, on_delete=models.CASCADE, limit_choices_to={'role': 'staff'}, related_name='blocked_dates')
+    staff = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        limit_choices_to={'role__in': ['staff', 'admin', 'superadmin']},
+        related_name='blocked_dates',
+    )
     date = models.DateField(help_text="Date when staff is blocked/unavailable")
     start_time = models.TimeField(
         null=True,

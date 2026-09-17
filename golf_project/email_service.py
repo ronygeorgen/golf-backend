@@ -523,3 +523,182 @@ def send_invoice_for_user(
         ghl_location=ghl_location,
         booking_date=booking_date,
     )
+
+
+def send_payment_link_email(
+    *,
+    customer_email: str,
+    customer_name: str = '',
+    payment_url: str,
+    item_description: str,
+    amount: float,
+    currency: str = 'CAD',
+    company_name: str = 'Golf Portal',
+    ghl_location=None,
+) -> bool:
+    """
+    Email a Square payment link to the customer (Resend).
+    Returns True/False; never raises.
+    """
+    try:
+        import resend
+        resend.api_key = getattr(settings, 'RESEND_API_KEY', '') or ''
+        if not resend.api_key:
+            logger.error("RESEND_API_KEY not configured — cannot send payment link email.")
+            return False
+        if not customer_email:
+            logger.error("No customer email for payment link.")
+            return False
+
+        if ghl_location and getattr(ghl_location, 'company_name', None):
+            company_name = ghl_location.company_name or company_name
+
+        from_email = getattr(settings, 'RESEND_FROM_EMAIL', 'noreply@performgolf.net')
+        display_name = customer_name or customer_email
+        html = f'''
+        <div style="font-family: Arial, sans-serif; max-width: 560px; margin: 0 auto; color: #222;">
+          <h2 style="margin-bottom: 8px;">{company_name}</h2>
+          <p>Hi {display_name},</p>
+          <p>A staff member sent you a secure payment link for:</p>
+          <p style="font-size: 16px;"><strong>{item_description}</strong></p>
+          <p style="font-size: 18px;">Amount: <strong>{currency} ${float(amount):.2f}</strong></p>
+          <p style="margin: 28px 0;">
+            <a href="{payment_url}"
+               style="background:#1a5c3a;color:#fff;padding:12px 22px;text-decoration:none;border-radius:6px;display:inline-block;">
+              Pay Securely
+            </a>
+          </p>
+          <p style="color:#666;font-size:13px;">If the button does not work, copy this link:<br/>
+            <a href="{payment_url}">{payment_url}</a>
+          </p>
+          <p style="color:#666;font-size:12px;">This payment is processed securely by Square.</p>
+        </div>
+        '''
+
+        params = {
+            "from": f"{company_name} <{from_email}>",
+            "to": [customer_email],
+            "subject": f"Payment request from {company_name}",
+            "html": html,
+        }
+        resend.Emails.send(params)
+        logger.info("Payment link email sent to %s", customer_email)
+        return True
+    except Exception as exc:
+        logger.error("Failed to send payment link email: %s", exc, exc_info=True)
+        return False
+
+
+def send_booking_cancelled_by_block_email(
+    *,
+    booking,
+    resource_label: str = '',
+    block_date=None,
+    block_start=None,
+    block_end=None,
+    center_tz=None,
+    location_id=None,
+    reason: str = '',
+) -> bool:
+    """
+    Notify a customer that their booking was cancelled because a coach/bay/asset
+    was blocked. Returns True/False; never raises.
+    """
+    try:
+        import resend
+        from golf_project.timezone_utils import get_center_timezone
+
+        resend.api_key = getattr(settings, 'RESEND_API_KEY', '') or ''
+        if not resend.api_key:
+            logger.error("RESEND_API_KEY not configured — cannot send cancellation email.")
+            return False
+
+        client = booking.client
+        customer_email = (getattr(client, 'email', None) or '').strip()
+        if not customer_email:
+            logger.warning("No email for client %s — skip cancel notice for booking %s", client.id, booking.id)
+            return False
+
+        loc_id = location_id or getattr(booking, 'location_id', None) or getattr(client, 'ghl_location_id', None)
+        tz = center_tz or get_center_timezone(loc_id)
+
+        def _fmt_dt(aware_dt):
+            if not aware_dt:
+                return ''
+            local = aware_dt.astimezone(tz) if timezone.is_aware(aware_dt) else tz.localize(aware_dt)
+            return local.strftime('%A, %B %d, %Y at %I:%M %p')
+
+        def _fmt_block_window():
+            if block_date and block_start and block_end:
+                # Full day if spans min/max of day
+                start_t = block_start.astimezone(tz).strftime('%I:%M %p')
+                end_t = block_end.astimezone(tz).strftime('%I:%M %p')
+                day = block_date.strftime('%A, %B %d, %Y')
+                # Detect full-day roughly
+                if block_start.astimezone(tz).time().hour == 0 and block_start.astimezone(tz).time().minute == 0:
+                    if block_end.astimezone(tz).time().hour >= 23:
+                        return f"{day} (full day)"
+                return f"{day}, {start_t} – {end_t}"
+            if block_date:
+                return block_date.strftime('%A, %B %d, %Y')
+            return _fmt_dt(booking.start_time)
+
+        company_name = 'Golf Portal'
+        ghl_location = None
+        try:
+            from ghl.models import GHLLocation
+            if loc_id:
+                ghl_location = GHLLocation.objects.filter(location_id=loc_id).first()
+            if ghl_location and ghl_location.company_name:
+                company_name = ghl_location.company_name
+        except Exception:
+            pass
+
+        customer_name = (
+            f"{getattr(client, 'first_name', '') or ''} {getattr(client, 'last_name', '') or ''}".strip()
+            or getattr(client, 'username', '')
+            or customer_email
+        )
+        booking_when = _fmt_dt(booking.start_time)
+        block_when = _fmt_block_window()
+
+        import html as _html
+        safe_name = _html.escape(customer_name)
+        safe_resource = _html.escape(resource_label or '')
+        safe_reason = _html.escape(reason or '')
+        safe_company = _html.escape(company_name)
+        safe_booking_when = _html.escape(booking_when)
+        safe_block_when = _html.escape(block_when)
+
+        resource_bit = f" ({safe_resource})" if safe_resource else ''
+        reason_bit = f"<p><strong>Reason:</strong> {safe_reason}</p>" if safe_reason else ''
+
+        from_email = getattr(settings, 'RESEND_FROM_EMAIL', 'noreply@performgolf.net')
+        html = f'''
+        <div style="font-family: Arial, sans-serif; max-width: 560px; margin: 0 auto; color: #222;">
+          <h2 style="margin-bottom: 8px;">{safe_company}</h2>
+          <p>Hi {safe_name},</p>
+          <p>Your booking on <strong>{safe_booking_when}</strong> has been <strong>cancelled</strong>
+             because the scheduled resource{resource_bit} was blocked for
+             <strong>{safe_block_when}</strong>.</p>
+          {reason_bit}
+          <p>If this booking used package sessions or prepaid hours, those have been returned to your account.
+             If you paid another way, please contact us about a refund.</p>
+          <p>Please log in to rebook another time, or contact us if you need help.</p>
+          <p style="color:#666;font-size:12px;">Booking reference #{booking.id}</p>
+        </div>
+        '''
+
+        params = {
+            "from": f"{company_name} <{from_email}>",
+            "to": [customer_email],
+            "subject": f"Booking cancelled — {company_name}",
+            "html": html,
+        }
+        resend.Emails.send(params)
+        logger.info("Block-cancellation email sent to %s for booking %s", customer_email, booking.id)
+        return True
+    except Exception as exc:
+        logger.error("Failed to send block-cancellation email: %s", exc, exc_info=True)
+        return False
+

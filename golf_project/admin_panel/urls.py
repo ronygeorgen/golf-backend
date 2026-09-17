@@ -1,6 +1,7 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from . import views
+from .calendar_blocks import CalendarBlockView
 from simulators.views import SimulatorViewSet, DurationPriceViewSet
 from coaching.views import CoachingPackageViewSet
 from bookings.views import BookingViewSet
@@ -22,5 +23,6 @@ router.register(r'categories', ServiceCategoryViewSet, basename='admin-categorie
 router.register(r'category-assets', CategoryAssetViewSet, basename='admin-category-assets')
 
 urlpatterns = [
+    path('calendar-blocks/', CalendarBlockView.as_view(), name='admin-calendar-blocks'),
     path('', include(router.urls)),
 ]

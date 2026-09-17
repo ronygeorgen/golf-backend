@@ -47,6 +47,7 @@ from rest_framework.exceptions import PermissionDenied
 
 from .services import (
     create_payment,
+    create_payment_link,
     verify_webhook_signature,
     build_oauth_url,
     exchange_oauth_code,
@@ -476,11 +477,20 @@ def _resolve_square_credentials(temp_id_str: str, payment_type: str):
                     ghl_location_id = getattr(buyer, 'ghl_location_id', None) if buyer else None
         elif payment_type == 'package':
             from coaching.models import TempPurchase
-            tp = TempPurchase.objects.filter(temp_id=temp_id_str).first()
+            tp = TempPurchase.objects.filter(temp_id=temp_id_str).select_related(
+                'package', 'simulator_package', 'referral_id'
+            ).first()
             if tp:
                 from users.models import User
                 buyer = User.objects.filter(phone=tp.buyer_phone).first()
                 ghl_location_id = getattr(buyer, 'ghl_location_id', None) if buyer else None
+                # Fall back to package location (important for Quick Checkout one-offs /
+                # members whose ghl_location_id is empty).
+                if not ghl_location_id:
+                    pkg = tp.package or tp.simulator_package
+                    ghl_location_id = getattr(pkg, 'location_id', None) if pkg else None
+                if not ghl_location_id and tp.referral_id_id:
+                    ghl_location_id = getattr(tp.referral_id, 'ghl_location_id', None)
         elif payment_type == 'event':
             from special_events.models import TempSpecialEventBooking
             ter = TempSpecialEventBooking.objects.filter(temp_id=temp_id_str).first()
@@ -556,9 +566,12 @@ def _finalize_simulator_booking(temp_id_str: str, payment_id: str):
     active_simulators = active_simulators.select_for_update().order_by('bay_number')
 
     available_simulators = []
+    from bookings.resource_blocks import is_simulator_blocked
     for sim in active_simulators:
         if len(available_simulators) >= simulator_count:
             break
+        if is_simulator_blocked(sim, temp_booking.start_time, temp_booking.end_time):
+            continue
         conflict = Booking.objects.select_for_update().filter(
             simulator=sim,
             start_time__lt=temp_booking.end_time,
@@ -652,6 +665,14 @@ def _finalize_asset_booking(temp_id_str: str, payment_id: str):
         temp_booking.status = 'cancelled'
         temp_booking.save(update_fields=['status'])
         raise ValueError('This asset slot has already been taken by another booking.')
+
+    from bookings.resource_blocks import is_category_asset_blocked
+    if is_category_asset_blocked(
+        temp_booking.category_asset, temp_booking.start_time, temp_booking.end_time
+    ):
+        temp_booking.status = 'cancelled'
+        temp_booking.save(update_fields=['status'])
+        raise ValueError('This asset is blocked during the selected time.')
 
     booking = Booking.objects.create(
         client=buyer,
@@ -1107,9 +1128,43 @@ class SquareWebhookView(APIView):
         payment_obj = payload.get('data', {}).get('object', {}).get('payment', {})
         payment_id = payment_obj.get('id')
         payment_status = payment_obj.get('status', '')
-        payment_metadata = payment_obj.get('metadata', {})
+        payment_metadata = payment_obj.get('metadata', {}) or {}
         temp_id_str = payment_metadata.get('temp_id') or payment_obj.get('reference_id')
         payment_type = payment_metadata.get('payment_type')
+
+        # Payment Links often put temp_id in note / order — resolve PendingPaymentLink if needed
+        if not temp_id_str or not payment_type:
+            note = payment_obj.get('note') or ''
+            order_id = payment_obj.get('order_id') or ''
+            try:
+                from .models import PendingPaymentLink
+                link = None
+                if order_id:
+                    link = PendingPaymentLink.objects.filter(
+                        square_order_id=order_id, status='pending'
+                    ).first()
+                if not link and temp_id_str:
+                    link = PendingPaymentLink.objects.filter(
+                        temp_id=temp_id_str, status='pending'
+                    ).first()
+                if not link and 'temp_id=' in note:
+                    # note format: temp_id=UUID|payment_type=package
+                    parts = {}
+                    for chunk in note.split('|'):
+                        if '=' in chunk:
+                            k, v = chunk.split('=', 1)
+                            parts[k.strip()] = v.strip()
+                    if parts.get('temp_id'):
+                        link = PendingPaymentLink.objects.filter(
+                            temp_id=parts['temp_id'], status='pending'
+                        ).first()
+                        temp_id_str = temp_id_str or parts.get('temp_id')
+                        payment_type = payment_type or parts.get('payment_type')
+                if link:
+                    temp_id_str = str(link.temp_id)
+                    payment_type = link.payment_type
+            except Exception as exc:
+                logger.warning("Payment link lookup failed: %s", exc)
 
         # Only finalize if the payment has actually reached the COMPLETED state
         if payment_status != 'COMPLETED':
@@ -1137,6 +1192,16 @@ class SquareWebhookView(APIView):
                     _finalize_event_registration(temp_id_str, payment_id)
                 else:
                     logger.warning("Square webhook: unknown payment_type=%s", payment_type)
+
+                # Mark payment link paid if present
+                try:
+                    from .models import PendingPaymentLink
+                    from django.utils import timezone as dj_tz
+                    PendingPaymentLink.objects.filter(
+                        temp_id=temp_id_str, status='pending'
+                    ).update(status='paid', paid_at=dj_tz.now())
+                except Exception:
+                    pass
         except Exception as exc:
             logger.error("Square webhook finalization error: %s", exc, exc_info=True)
 
@@ -1707,4 +1772,171 @@ class MembershipStatusView(APIView):
             })
 
         return Response({'subscriptions': data, 'count': len(data)})
+
+
+class CreatePaymentLinkView(APIView):
+    """
+    POST /api/square/payment-link/
+
+    Staff creates a Square payment link for an existing temp_id and emails it via Resend.
+
+    Body:
+      {
+        "temp_id": "<UUID>",
+        "payment_type": "package" | "simulator" | "event" | "asset",
+        "amount": 45.00,          # pre-tax base
+        "buyer_email": "a@b.com",
+        "item_description": optional,
+        "redirect_url": optional
+      }
+    """
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request):
+        user = request.user
+        if not (user.is_superuser or getattr(user, 'role', None) in ['admin', 'staff', 'superadmin']):
+            return Response({'error': 'Staff or admin only.'}, status=status.HTTP_403_FORBIDDEN)
+
+        temp_id_str = request.data.get('temp_id')
+        payment_type = request.data.get('payment_type') or 'package'
+        buyer_email = (request.data.get('buyer_email') or '').strip()
+        item_description = (request.data.get('item_description') or '').strip()
+        redirect_url = (request.data.get('redirect_url') or '').strip() or None
+        currency = settings.SQUARE_CURRENCY
+
+        if not temp_id_str:
+            return Response({'error': 'temp_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not buyer_email:
+            return Response({'error': 'buyer_email is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if request.data.get('amount') is None:
+            return Response({'error': 'amount is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            original_amount = float(request.data.get('amount'))
+        except (ValueError, TypeError):
+            return Response({'error': 'Invalid amount.'}, status=status.HTTP_400_BAD_REQUEST)
+        if original_amount <= 0:
+            return Response({'error': 'amount must be greater than 0.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Resolve label / phone / location from temp record
+        guest_phone = ''
+        ghl_location_id = ''
+        try:
+            if payment_type == 'package':
+                from coaching.models import TempPurchase
+                tp = TempPurchase.objects.filter(temp_id=temp_id_str).select_related(
+                    'package', 'simulator_package'
+                ).first()
+                if not tp:
+                    return Response({'error': 'Temp purchase not found.'}, status=status.HTTP_404_NOT_FOUND)
+                if tp.is_expired:
+                    return Response({'error': 'Temp purchase has expired.'}, status=status.HTTP_400_BAD_REQUEST)
+                guest_phone = tp.buyer_phone or ''
+                pkg = tp.package or tp.simulator_package
+                if not item_description and pkg:
+                    item_description = pkg.title
+                if pkg and getattr(pkg, 'location_id', None):
+                    ghl_location_id = pkg.location_id
+            elif payment_type == 'simulator':
+                from bookings.models import TempBooking
+                tb = TempBooking.objects.filter(temp_id=temp_id_str).first()
+                if not tb:
+                    return Response({'error': 'Temp booking not found.'}, status=status.HTTP_404_NOT_FOUND)
+                guest_phone = tb.buyer_phone or ''
+                ghl_location_id = tb.location_id or ''
+                item_description = item_description or 'Simulator Booking'
+            elif payment_type == 'event':
+                from special_events.models import TempSpecialEventBooking
+                ter = TempSpecialEventBooking.objects.filter(temp_id=temp_id_str).select_related('event', 'user').first()
+                if not ter:
+                    return Response({'error': 'Temp event booking not found.'}, status=status.HTTP_404_NOT_FOUND)
+                guest_phone = getattr(ter.user, 'phone', '') if ter.user else ''
+                if ter.event:
+                    item_description = item_description or f'Event: {ter.event.title}'
+                    ghl_location_id = ter.event.location_id or ''
+            else:
+                item_description = item_description or 'Portal purchase'
+        except Exception as exc:
+            logger.error("Payment link temp resolve failed: %s", exc, exc_info=True)
+            return Response({'error': 'Failed to resolve temp record.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not ghl_location_id:
+            from users.utils import get_location_id_from_request
+            ghl_location_id = get_location_id_from_request(request) or getattr(user, 'ghl_location_id', '') or ''
+
+        HST_RATE = 0.14
+        tax_amount = round(original_amount * HST_RATE, 2)
+        total_with_tax = round(original_amount + tax_amount, 2)
+        amount_cents = int(round(total_with_tax * 100))
+
+        try:
+            sq_access_token, sq_location_id = _resolve_square_credentials(temp_id_str, payment_type)
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_402_PAYMENT_REQUIRED)
+
+        try:
+            link_data = create_payment_link(
+                amount_cents=amount_cents,
+                currency=currency,
+                idempotency_key=str(uuid.uuid4()),
+                item_name=item_description or 'Portal purchase',
+                temp_id=temp_id_str,
+                payment_type=payment_type,
+                access_token=sq_access_token,
+                location_id=sq_location_id,
+                buyer_email=buyer_email,
+                redirect_url=redirect_url,
+            )
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_402_PAYMENT_REQUIRED)
+        except Exception as exc:
+            logger.error("Unexpected payment link error: %s", exc, exc_info=True)
+            return Response({'error': 'Failed to create payment link.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        from .models import PendingPaymentLink
+        pending = PendingPaymentLink.objects.create(
+            temp_id=temp_id_str,
+            payment_type=payment_type,
+            amount=total_with_tax,
+            currency=currency,
+            buyer_email=buyer_email,
+            buyer_phone=guest_phone,
+            item_description=item_description or '',
+            payment_url=link_data['url'],
+            square_payment_link_id=link_data.get('payment_link_id') or '',
+            square_order_id=link_data.get('order_id') or '',
+            created_by=user,
+            ghl_location_id=ghl_location_id or '',
+        )
+
+        ghl_location = None
+        try:
+            from ghl.models import GHLLocation
+            if ghl_location_id:
+                ghl_location = GHLLocation.objects.filter(location_id=ghl_location_id).first()
+        except Exception:
+            pass
+
+        from email_service import send_payment_link_email
+        emailed = send_payment_link_email(
+            customer_email=buyer_email,
+            customer_name='',
+            payment_url=link_data['url'],
+            item_description=item_description or 'Portal purchase',
+            amount=total_with_tax,
+            currency=currency,
+            ghl_location=ghl_location,
+        )
+
+        return Response({
+            'payment_link_id': pending.id,
+            'payment_url': link_data['url'],
+            'amount': total_with_tax,
+            'base_amount': original_amount,
+            'tax_amount': tax_amount,
+            'currency': currency,
+            'email_sent': emailed,
+            'message': 'Payment link created' + (' and emailed.' if emailed else ', but email failed.'),
+        }, status=status.HTTP_201_CREATED)
 

@@ -193,6 +193,115 @@ def create_payment(
         raise ValueError(human_msg)
 
 
+def create_payment_link(
+    *,
+    amount_cents: int,
+    currency: str,
+    idempotency_key: str,
+    item_name: str,
+    temp_id: str,
+    payment_type: str,
+    access_token: str,
+    location_id: str,
+    buyer_email: str = None,
+    redirect_url: str = None,
+):
+    """
+    Create a Square Checkout Payment Link for email pay-later flows.
+
+    Returns dict: { url, payment_link_id, order_id }
+    """
+    import uuid as _uuid
+
+    client = get_square_client(access_token)
+    sq_location_id = (location_id or '').strip()
+    if not sq_location_id:
+        raise ValueError("square_location_id is required to create a payment link.")
+
+    # Keep reference_id short (Square max 40) — temp UUID is 36 chars.
+    reference_id = str(temp_id)[:40]
+    payment_note = f"temp_id={temp_id}|payment_type={payment_type}"
+
+    order = {
+        "location_id": sq_location_id,
+        "reference_id": reference_id,
+        "line_items": [
+            {
+                "name": (item_name or 'Portal purchase')[:500],
+                "quantity": "1",
+                "base_price_money": {
+                    "amount": int(amount_cents),
+                    "currency": currency,
+                },
+            }
+        ],
+        "metadata": {
+            "temp_id": str(temp_id),
+            "payment_type": str(payment_type),
+        },
+    }
+
+    checkout_options = {
+        "ask_for_shipping_address": False,
+        "allow_tipping": False,
+    }
+    if redirect_url:
+        checkout_options["redirect_url"] = redirect_url
+
+    kwargs = dict(
+        idempotency_key=idempotency_key or str(_uuid.uuid4()),
+        order=order,
+        checkout_options=checkout_options,
+        payment_note=payment_note[:500],
+    )
+    if buyer_email:
+        kwargs["pre_populated_data"] = {"buyer_email": buyer_email}
+
+    logger.info(
+        "Creating Square payment link: amount=%d %s location=%s temp_id=%s type=%s",
+        amount_cents, currency, sq_location_id, temp_id, payment_type,
+    )
+
+    try:
+        # SDK v44+: checkout.payment_links.create
+        # Prefer typed kwargs; fall back to body= for older SDK shapes.
+        try:
+            response = client.checkout.payment_links.create(**kwargs)
+        except TypeError:
+            response = client.checkout.payment_links.create(body=kwargs)
+
+        link = getattr(response, 'payment_link', None) or response
+        url = getattr(link, 'url', None) or getattr(link, 'long_url', None)
+        if isinstance(link, dict):
+            url = link.get('url') or link.get('long_url') or url
+            order_id = link.get('order_id') or ''
+            link_id = link.get('id') or ''
+        else:
+            order_id = None
+            order_obj = getattr(link, 'order', None) or getattr(link, 'order_id', None)
+            if isinstance(order_obj, str):
+                order_id = order_obj
+            elif order_obj is not None:
+                order_id = getattr(order_obj, 'id', None)
+            if not order_id:
+                order_id = getattr(link, 'order_id', None)
+            link_id = getattr(link, 'id', '') or ''
+
+        if not url:
+            raise ValueError("Square did not return a payment link URL.")
+
+        return {
+            'url': url,
+            'payment_link_id': link_id or '',
+            'order_id': order_id or '',
+        }
+    except ValueError:
+        raise
+    except Exception as exc:
+        human_msg = _extract_square_error_message(exc)
+        logger.error("Square payment link error (%s): %s", type(exc).__name__, human_msg)
+        raise ValueError(human_msg)
+
 
 # ---------------------------------------------------------------------------
 # Webhook signature verification

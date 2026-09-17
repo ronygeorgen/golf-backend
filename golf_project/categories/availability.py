@@ -486,6 +486,19 @@ def _compute_asset_slots(asset, booking_date, day_of_week, center_tz, location_i
             current += timedelta(minutes=slot_interval)
             continue
 
+        # One-off asset blackouts from admin calendar
+        from .models import CategoryAssetBlockedDate
+        local_start = current.astimezone(center_tz)
+        local_end = slot_end.astimezone(center_tz)
+        is_asset_blocked = False
+        for blk in CategoryAssetBlockedDate.objects.filter(asset=asset, date=booking_date):
+            if blk.conflicts_with_time(local_start.time(), local_end.time()):
+                is_asset_blocked = True
+                break
+        if is_asset_blocked:
+            current += timedelta(minutes=slot_interval)
+            continue
+
         # Check no existing booking overlaps
         is_booked = any(
             b.start_time < slot_end and b.end_time > current

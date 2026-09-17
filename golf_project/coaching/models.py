@@ -60,6 +60,10 @@ class CoachingPackage(models.Model):
         default=0,
         help_text="Category asset hours granted each billing cycle (memberships only). Resets on every renewal — no carry-over."
     )
+    is_one_off = models.BooleanField(
+        default=False,
+        help_text="Staff Quick Checkout one-off package. Hidden from public/online catalog listings.",
+    )
 
     def __str__(self):
         return self.title
@@ -518,6 +522,10 @@ class SimulatorPackage(models.Model):
         blank=True,
         related_name='simulator_packages',
         help_text="Service category this package belongs to (Phase C).",
+    )
+    is_one_off = models.BooleanField(
+        default=False,
+        help_text="Staff Quick Checkout one-off package. Hidden from public/online catalog listings.",
     )
 
     created_at = models.DateTimeField(auto_now_add=True)
