@@ -535,9 +535,14 @@ def send_payment_link_email(
     currency: str = 'CAD',
     company_name: str = 'Golf Portal',
     ghl_location=None,
+    original_amount: float = None,
+    discount_amount: float = 0.0,
+    tax_amount: float = None,
+    coupon_code: str = '',
 ) -> bool:
     """
     Email a Square payment link to the customer (Resend).
+    Includes base / discount / HST / total breakdown when amounts are provided.
     Returns True/False; never raises.
     """
     try:
@@ -555,13 +560,73 @@ def send_payment_link_email(
 
         from_email = getattr(settings, 'RESEND_FROM_EMAIL', 'noreply@performgolf.net')
         display_name = customer_name or customer_email
+
+        total = float(amount)
+        base = float(original_amount) if original_amount is not None else None
+        discount = float(discount_amount or 0)
+        tax = float(tax_amount) if tax_amount is not None else None
+        code = (coupon_code or '').strip().upper()
+
+        # Build breakdown rows (match portal checkout summary)
+        if base is not None:
+            discount_row = ''
+            if discount > 0 and code:
+                discount_row = f'''
+            <tr>
+              <td style="padding:10px 0;border-bottom:1px solid #eee;color:#15803d;">Discount ({code})</td>
+              <td style="padding:10px 0;border-bottom:1px solid #eee;text-align:right;color:#15803d;font-weight:600;">
+                -${discount:.2f}
+              </td>
+            </tr>'''
+            elif discount > 0:
+                discount_row = f'''
+            <tr>
+              <td style="padding:10px 0;border-bottom:1px solid #eee;color:#15803d;">Discount</td>
+              <td style="padding:10px 0;border-bottom:1px solid #eee;text-align:right;color:#15803d;font-weight:600;">
+                -${discount:.2f}
+              </td>
+            </tr>'''
+
+            tax_row = ''
+            if tax is not None:
+                tax_row = f'''
+            <tr>
+              <td style="padding:10px 0;border-bottom:1px solid #eee;color:#555;">HST (14%) — Nova Scotia</td>
+              <td style="padding:10px 0;border-bottom:1px solid #eee;text-align:right;color:#222;">
+                +${tax:.2f}
+              </td>
+            </tr>'''
+
+            amount_block = f'''
+          <table style="width:100%;border-collapse:collapse;margin:20px 0;font-size:14px;">
+            <tr>
+              <td style="padding:10px 0;border-bottom:1px solid #eee;color:#555;">Base Price</td>
+              <td style="padding:10px 0;border-bottom:1px solid #eee;text-align:right;color:#222;font-weight:500;">
+                ${base:.2f}
+              </td>
+            </tr>
+            {discount_row}
+            {tax_row}
+            <tr>
+              <td style="padding:12px 0;color:#111;font-weight:700;">Total to Pay</td>
+              <td style="padding:12px 0;text-align:right;color:#111;font-weight:700;font-size:18px;">
+                ${total:.2f} <span style="font-size:13px;font-weight:400;color:#666;">{currency}</span>
+              </td>
+            </tr>
+          </table>
+            '''
+        else:
+            amount_block = f'''
+          <p style="font-size:18px;">Amount: <strong>{currency} ${total:.2f}</strong></p>
+            '''
+
         html = f'''
         <div style="font-family: Arial, sans-serif; max-width: 560px; margin: 0 auto; color: #222;">
           <h2 style="margin-bottom: 8px;">{company_name}</h2>
           <p>Hi {display_name},</p>
           <p>A staff member sent you a secure payment link for:</p>
           <p style="font-size: 16px;"><strong>{item_description}</strong></p>
-          <p style="font-size: 18px;">Amount: <strong>{currency} ${float(amount):.2f}</strong></p>
+          {amount_block}
           <p style="margin: 28px 0;">
             <a href="{payment_url}"
                style="background:#1a5c3a;color:#fff;padding:12px 22px;text-decoration:none;border-radius:6px;display:inline-block;">

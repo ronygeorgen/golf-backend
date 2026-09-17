@@ -2008,6 +2008,10 @@ class CreatePaymentLinkView(APIView):
             amount=total_with_tax,
             currency=currency,
             ghl_location=ghl_location,
+            original_amount=original_amount,
+            discount_amount=discount_amount,
+            tax_amount=tax_amount,
+            coupon_code=coupon_code or '',
         )
 
         return Response({
