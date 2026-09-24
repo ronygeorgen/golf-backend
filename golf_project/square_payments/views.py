@@ -1013,49 +1013,63 @@ class InitiateSquarePaymentView(APIView):
             from django.utils import timezone as tz
             from .tasks import send_invoice_email_task
 
-            # Resolve customer info for invoice
+            # Prefer the buyer on the temp record (Quick Checkout / guest pay),
+            # NOT the logged-in staff who processed the sale.
             _inv_email = ''
             _inv_name = ''
             _inv_ghl_loc_id = ''
 
-            if request.user.is_authenticated:
+            _buyer = None
+            if guest_phone:
+                try:
+                    from users.models import User
+                    _buyer = User.objects.filter(phone=guest_phone).first()
+                except Exception:
+                    _buyer = None
+
+            if _buyer:
+                _inv_email = getattr(_buyer, 'email', '') or ''
+                _fn = getattr(_buyer, 'first_name', '') or ''
+                _ln = getattr(_buyer, 'last_name', '') or ''
+                _inv_name = f"{_fn} {_ln}".strip() or getattr(_buyer, 'username', '') or _inv_email
+                _inv_ghl_loc_id = getattr(_buyer, 'ghl_location_id', '') or ''
+            elif guest_email:
+                _inv_email = guest_email
+                _inv_name = guest_email
+            elif request.user.is_authenticated:
+                # Self-checkout only (no temp buyer phone)
                 _inv_email = getattr(request.user, 'email', '') or ''
                 _fn = getattr(request.user, 'first_name', '') or ''
                 _ln = getattr(request.user, 'last_name', '') or ''
                 _inv_name = f"{_fn} {_ln}".strip() or getattr(request.user, 'username', '') or _inv_email
                 _inv_ghl_loc_id = getattr(request.user, 'ghl_location_id', '') or ''
-            else:
-                # Guest: use phone from temp booking to look up user
-                if guest_phone:
-                    try:
-                        from users.models import User
-                        _buyer = User.objects.filter(phone=guest_phone).first()
-                        if _buyer:
-                            _inv_email = getattr(_buyer, 'email', '') or ''
-                            _fn = getattr(_buyer, 'first_name', '') or ''
-                            _ln = getattr(_buyer, 'last_name', '') or ''
-                            _inv_name = f"{_fn} {_ln}".strip() or _inv_email
-                            _inv_ghl_loc_id = getattr(_buyer, 'ghl_location_id', '') or ''
-                    except Exception:
-                        pass
-                _inv_email = _inv_email or guest_email
 
-            send_invoice_email_task.delay(
-                customer_email=_inv_email,
-                customer_name=_inv_name,
-                payment_id=payment_id,
-                payment_type=payment_type,
-                item_description=item_label or payment_type.replace('_', ' ').title(),
-                base_amount=float(original_amount),
-                discount_amount=float(discount_amount),
-                coupon_code=coupon_code,
-                tax_rate=float(TAX_RATE),
-                tax_amount=float(tax_amount),
-                total_amount=float(final_amount_with_tax),
-                ghl_location_id=_inv_ghl_loc_id,
-                booking_date_iso=tz.now().isoformat(),
-            )
-            logger.info("Invoice email task queued for payment %s → %s", payment_id, _inv_email)
+            if _inv_email:
+                send_invoice_email_task.delay(
+                    customer_email=_inv_email,
+                    customer_name=_inv_name,
+                    payment_id=payment_id,
+                    payment_type=payment_type,
+                    item_description=item_label or payment_type.replace('_', ' ').title(),
+                    base_amount=float(original_amount),
+                    discount_amount=float(discount_amount),
+                    coupon_code=coupon_code,
+                    tax_rate=float(TAX_RATE),
+                    tax_amount=float(tax_amount),
+                    total_amount=float(final_amount_with_tax),
+                    ghl_location_id=_inv_ghl_loc_id,
+                    booking_date_iso=tz.now().isoformat(),
+                )
+                logger.info(
+                    "Invoice email task queued for payment %s → %s (%s)",
+                    payment_id, _inv_email, _inv_name,
+                )
+            else:
+                logger.warning(
+                    "Invoice email skipped for payment %s — no customer email "
+                    "(guest_phone=%s). Staff receipt will not be sent.",
+                    payment_id, guest_phone or '',
+                )
         except Exception as _inv_exc:
             logger.warning("Invoice email task could not be queued for payment %s: %s", payment_id, _inv_exc)
 
@@ -2062,9 +2076,22 @@ class CreatePaymentLinkView(APIView):
             pass
 
         from email_service import send_payment_link_email
+        # Prefer member name from temp buyer phone (not the staff who created the link)
+        customer_name = ''
+        if guest_phone:
+            try:
+                from users.models import User
+                _buyer = User.objects.filter(phone=guest_phone).first()
+                if _buyer:
+                    _fn = getattr(_buyer, 'first_name', '') or ''
+                    _ln = getattr(_buyer, 'last_name', '') or ''
+                    customer_name = f"{_fn} {_ln}".strip() or getattr(_buyer, 'username', '') or ''
+            except Exception:
+                pass
+
         emailed = send_payment_link_email(
             customer_email=buyer_email,
-            customer_name='',
+            customer_name=customer_name,
             payment_url=link_data['url'],
             item_description=item_description or 'Portal purchase',
             amount=total_with_tax,
