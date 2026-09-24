@@ -1165,6 +1165,12 @@ class BookingViewSet(viewsets.ModelViewSet):
                     end_time = booking_data.get('end_time')
                     duration_minutes = int((end_time - start_time).total_seconds() / 60)
 
+                    from .resource_blocks import is_category_asset_blocked
+                    if is_category_asset_blocked(_asset_obj, start_time, end_time):
+                        raise serializers.ValidationError(
+                            "This asset is blocked during the selected time. Please choose another slot."
+                        )
+
                     # ── Prepaid hours path ─────────────────────────────────────────
                     if use_prepaid_hours is True:
                         from decimal import Decimal
@@ -1292,6 +1298,13 @@ class BookingViewSet(viewsets.ModelViewSet):
                 # the category asset IS the physical space.  Skip bay assignment entirely.
                 _category_asset_obj = booking_data.get('category_asset')
                 _is_dynamic_category_booking = bool(_category_asset_obj and getattr(_category_asset_obj, 'needs_staff', False))
+
+                if _category_asset_obj and start_time and end_time:
+                    from .resource_blocks import is_category_asset_blocked
+                    if is_category_asset_blocked(_category_asset_obj, start_time, end_time):
+                        raise serializers.ValidationError(
+                            "This asset is blocked during the selected time. Please choose another slot."
+                        )
 
                 # Find available bay (Coaching Bay first, then Simulator Bay) using locking
                 # Order by is_coaching_bay DESC so we try coaching bays first, then by bay_number

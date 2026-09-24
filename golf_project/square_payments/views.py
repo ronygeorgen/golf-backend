@@ -40,14 +40,16 @@ from django.conf import settings
 from django.http import HttpResponse
 from django.shortcuts import redirect
 from rest_framework.views import APIView
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from users.permissions import IsActiveLocationMember
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.exceptions import PermissionDenied
 
+from coupons.models import resolve_for_quick_checkout
 from .services import (
     create_payment,
+    create_payment_link,
     verify_webhook_signature,
     build_oauth_url,
     exchange_oauth_code,
@@ -477,11 +479,19 @@ def _resolve_square_credentials(temp_id_str: str, payment_type: str):
                     ghl_location_id = getattr(buyer, 'ghl_location_id', None) if buyer else None
         elif payment_type == 'package':
             from coaching.models import TempPurchase
-            tp = TempPurchase.objects.filter(temp_id=temp_id_str).first()
+            tp = TempPurchase.objects.filter(temp_id=temp_id_str).select_related(
+                'package', 'simulator_package', 'referral_id'
+            ).first()
             if tp:
                 from users.models import User
                 buyer = User.objects.filter(phone=tp.buyer_phone).first()
                 ghl_location_id = getattr(buyer, 'ghl_location_id', None) if buyer else None
+                # Fall back to package location (Quick Checkout one-offs / empty member location)
+                if not ghl_location_id:
+                    pkg = tp.package or tp.simulator_package
+                    ghl_location_id = getattr(pkg, 'location_id', None) if pkg else None
+                if not ghl_location_id and tp.referral_id_id:
+                    ghl_location_id = getattr(tp.referral_id, 'ghl_location_id', None)
         elif payment_type == 'event':
             from special_events.models import TempSpecialEventBooking
             ter = TempSpecialEventBooking.objects.filter(temp_id=temp_id_str).first()
@@ -796,6 +806,7 @@ class InitiateSquarePaymentView(APIView):
 
         try:
             tp = None  # Will be populated for 'package' payment type
+            ter = None
 
             if payment_type == 'simulator':
                 item_label = 'Simulator Booking'
@@ -836,41 +847,57 @@ class InitiateSquarePaymentView(APIView):
         discount_amount = 0.0
         final_amount = original_amount  # post-coupon base (still pre-tax)
 
-        if coupon_code:
-            from coupons.models import Coupon, CouponUsage
-            try:
-                coupon_obj = Coupon.objects.select_for_update().get(code=coupon_code)
-            except Coupon.DoesNotExist:
-                return Response({'error': f'Coupon "{coupon_code}" is invalid.'}, status=status.HTTP_400_BAD_REQUEST)
-
-            is_auth = request.user.is_authenticated
-            user_obj = request.user if is_auth else None
-            email = getattr(request.user, 'email', None) or guest_email
-            phone = getattr(request.user, 'phone', None) or guest_phone
-
-            valid, err = coupon_obj.is_valid(
-                payment_type=(
-                    # Use specific package token if a package is involved so that
-                    # per-package coupon restrictions (package:ID in applicable_to) are enforced.
-                    f'package:{tp.package.id}' if payment_type == 'package' and tp and tp.package
-                    else f'package:{tp.simulator_package.id}' if payment_type == 'package' and tp and tp.simulator_package
-                    else f'event:{ter.event.id}' if payment_type == 'event' and ter and ter.event
-                    else payment_type
-                ),
-                user=user_obj, email=email, phone=phone)
-
-            if not valid:
-                return Response({'error': err}, status=status.HTTP_400_BAD_REQUEST)
-
-            discount_amount = coupon_obj.calculate_discount(original_amount)
-            final_amount = round(original_amount - discount_amount, 2)  # post-coupon base, still pre-tax
-            logger.info("Coupon %s applied: -%s → discounted_base=%s", coupon_code, discount_amount, final_amount)
-
         # ── Resolve per-location Square credentials ──────────────────────────
         try:
             sq_access_token, sq_location_id, ghl_location_id = _resolve_square_credentials(temp_id_str, payment_type)
         except ValueError as exc:
             return Response({'error': str(exc)}, status=status.HTTP_402_PAYMENT_REQUIRED)
+
+        if coupon_code:
+            from coupons.models import Coupon, CouponUsage, coupon_applicable_at_location
+            try:
+                coupon_obj = Coupon.objects.select_for_update().get(code=coupon_code)
+            except Coupon.DoesNotExist:
+                return Response({'error': f'Coupon "{coupon_code}" is invalid.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            if not coupon_applicable_at_location(coupon_obj, ghl_location_id):
+                return Response({'error': f'Coupon "{coupon_code}" is invalid.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Per-user limits: use the buyer on temp records (Quick Checkout staff-on-behalf).
+            user_obj = None
+            email = guest_email
+            phone = guest_phone
+            if payment_type == 'package' and tp and tp.buyer_phone:
+                phone = tp.buyer_phone
+                try:
+                    from users.models import User
+                    buyer = User.objects.filter(phone=tp.buyer_phone).first()
+                    if buyer:
+                        email = buyer.email or email
+                except Exception:
+                    pass
+            elif request.user.is_authenticated:
+                user_obj = request.user
+                email = getattr(request.user, 'email', None) or guest_email
+                phone = getattr(request.user, 'phone', None) or guest_phone
+
+            valid, err = coupon_obj.is_valid(
+                payment_type=(
+                    f'package:{tp.package.id}' if payment_type == 'package' and tp and tp.package
+                    else f'package:{tp.simulator_package.id}' if payment_type == 'package' and tp and tp.simulator_package
+                    else f'event:{ter.event.id}' if payment_type == 'event' and ter and ter.event
+                    else payment_type
+                ),
+                user=user_obj, email=email, phone=phone,
+                for_quick_checkout=resolve_for_quick_checkout(request),
+            )
+
+            if not valid:
+                return Response({'error': err}, status=status.HTTP_400_BAD_REQUEST)
+
+            discount_amount = coupon_obj.calculate_discount(original_amount)
+            final_amount = round(original_amount - discount_amount, 2)
+            logger.info("Coupon %s applied: -%s → discounted_base=%s", coupon_code, discount_amount, final_amount)
 
         # ── Look up this location's tax rate & status ─────────────────────────────────
         from decimal import Decimal as _Decimal
@@ -1123,9 +1150,41 @@ class SquareWebhookView(APIView):
         payment_obj = payload.get('data', {}).get('object', {}).get('payment', {})
         payment_id = payment_obj.get('id')
         payment_status = payment_obj.get('status', '')
-        payment_metadata = payment_obj.get('metadata', {})
+        payment_metadata = payment_obj.get('metadata', {}) or {}
         temp_id_str = payment_metadata.get('temp_id') or payment_obj.get('reference_id')
         payment_type = payment_metadata.get('payment_type')
+
+        if not temp_id_str or not payment_type:
+            note = payment_obj.get('note') or ''
+            order_id = payment_obj.get('order_id') or ''
+            try:
+                from .models import PendingPaymentLink
+                link = None
+                if order_id:
+                    link = PendingPaymentLink.objects.filter(
+                        square_order_id=order_id, status='pending'
+                    ).first()
+                if not link and temp_id_str:
+                    link = PendingPaymentLink.objects.filter(
+                        temp_id=temp_id_str, status='pending'
+                    ).first()
+                if not link and 'temp_id=' in note:
+                    parts = {}
+                    for chunk in note.split('|'):
+                        if '=' in chunk:
+                            k, v = chunk.split('=', 1)
+                            parts[k.strip()] = v.strip()
+                    if parts.get('temp_id'):
+                        link = PendingPaymentLink.objects.filter(
+                            temp_id=parts['temp_id'], status='pending'
+                        ).first()
+                        temp_id_str = temp_id_str or parts.get('temp_id')
+                        payment_type = payment_type or parts.get('payment_type')
+                if link:
+                    temp_id_str = str(link.temp_id)
+                    payment_type = link.payment_type
+            except Exception as exc:
+                logger.warning("Payment link lookup failed: %s", exc)
 
         # Only finalize if the payment has actually reached the COMPLETED state
         if payment_status != 'COMPLETED':
@@ -1153,6 +1212,57 @@ class SquareWebhookView(APIView):
                     _finalize_event_registration(temp_id_str, payment_id)
                 else:
                     logger.warning("Square webhook: unknown payment_type=%s", payment_type)
+
+                try:
+                    from .models import PendingPaymentLink
+                    from django.utils import timezone as dj_tz
+                    from django.db.models import F
+                    link = PendingPaymentLink.objects.filter(
+                        temp_id=temp_id_str, status='pending'
+                    ).first()
+                    if link:
+                        coupon_code = (link.coupon_code or '').strip().upper()
+                        link.status = 'paid'
+                        link.paid_at = dj_tz.now()
+                        link.save(update_fields=['status', 'paid_at'])
+                        if coupon_code:
+                            from coupons.models import Coupon, CouponUsage
+                            try:
+                                coupon_obj = Coupon.objects.select_for_update().get(code=coupon_code)
+                                charged = float(link.amount or 0)
+                                tax_rate = 0.14
+                                if link.ghl_location_id:
+                                    try:
+                                        from ghl.models import GHLLocation
+                                        loc = GHLLocation.objects.filter(
+                                            location_id=link.ghl_location_id
+                                        ).only('tax_rate').first()
+                                        if loc and loc.tax_rate is not None:
+                                            tax_rate = float(loc.tax_rate)
+                                    except Exception:
+                                        pass
+                                final_base = round(charged / (1 + tax_rate), 2) if charged else 0.0
+                                CouponUsage.objects.create(
+                                    coupon=coupon_obj,
+                                    customer_email=link.buyer_email or '',
+                                    customer_phone=link.buyer_phone or '',
+                                    payment_id=payment_id or str(link.temp_id),
+                                    payment_type=link.payment_type or 'package',
+                                    discount_amount=0,
+                                    original_amount=final_base,
+                                    final_amount=final_base,
+                                    item_label=link.item_description or '',
+                                )
+                                Coupon.objects.filter(pk=coupon_obj.pk).update(
+                                    uses_count=F('uses_count') + 1
+                                )
+                            except Coupon.DoesNotExist:
+                                logger.warning(
+                                    'Payment link coupon %s not found for temp %s',
+                                    coupon_code, temp_id_str,
+                                )
+                except Exception as exc:
+                    logger.warning('Payment link paid/coupon update failed: %s', exc)
         except Exception as exc:
             logger.error("Square webhook finalization error: %s", exc, exc_info=True)
 
@@ -1521,10 +1631,13 @@ class MembershipSubscribeView(APIView):
         coupon_obj = None
         discount_amount = 0.0
         if coupon_code:
-            from coupons.models import Coupon, CouponUsage
+            from coupons.models import Coupon, CouponUsage, coupon_applicable_at_location
             try:
                 coupon_obj = Coupon.objects.select_for_update().get(code=coupon_code)
             except Coupon.DoesNotExist:
+                return Response({'error': f'Coupon "{coupon_code}" is invalid.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            if not coupon_applicable_at_location(coupon_obj, ghl_location_id):
                 return Response({'error': f'Coupon "{coupon_code}" is invalid.'}, status=status.HTTP_400_BAD_REQUEST)
 
             valid, err = coupon_obj.is_valid(
@@ -1754,4 +1867,227 @@ class MembershipStatusView(APIView):
             })
 
         return Response({'subscriptions': data, 'count': len(data)})
+
+
+class CreatePaymentLinkView(APIView):
+    """
+    POST /api/square/payment-link/
+
+    Staff creates a Square payment link for an existing temp_id and emails it via Resend.
+    """
+    permission_classes = [IsAuthenticated]
+
+    @transaction.atomic
+    def post(self, request):
+        user = request.user
+        if not (user.is_superuser or getattr(user, 'role', None) in ['admin', 'staff', 'superadmin']):
+            return Response({'error': 'Staff or admin only.'}, status=status.HTTP_403_FORBIDDEN)
+
+        temp_id_str = request.data.get('temp_id')
+        payment_type = request.data.get('payment_type') or 'package'
+        buyer_email = (request.data.get('buyer_email') or '').strip()
+        item_description = (request.data.get('item_description') or '').strip()
+        redirect_url = (request.data.get('redirect_url') or '').strip() or None
+        coupon_code = (request.data.get('coupon_code') or '').strip().upper()
+        currency = settings.SQUARE_CURRENCY
+
+        if not temp_id_str:
+            return Response({'error': 'temp_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not buyer_email:
+            return Response({'error': 'buyer_email is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if request.data.get('amount') is None:
+            return Response({'error': 'amount is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            original_amount = float(request.data.get('amount'))
+        except (ValueError, TypeError):
+            return Response({'error': 'Invalid amount.'}, status=status.HTTP_400_BAD_REQUEST)
+        if original_amount <= 0:
+            return Response({'error': 'amount must be greater than 0.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        guest_phone = ''
+        ghl_location_id = ''
+        package_id_for_coupon = None
+        try:
+            if payment_type == 'package':
+                from coaching.models import TempPurchase
+                tp = TempPurchase.objects.filter(temp_id=temp_id_str).select_related(
+                    'package', 'simulator_package'
+                ).first()
+                if not tp:
+                    return Response({'error': 'Temp purchase not found.'}, status=status.HTTP_404_NOT_FOUND)
+                if tp.is_expired:
+                    return Response({'error': 'Temp purchase has expired.'}, status=status.HTTP_400_BAD_REQUEST)
+                guest_phone = tp.buyer_phone or ''
+                pkg = tp.package or tp.simulator_package
+                if not item_description and pkg:
+                    item_description = pkg.title
+                if pkg and getattr(pkg, 'location_id', None):
+                    ghl_location_id = pkg.location_id
+                if tp.package_id:
+                    package_id_for_coupon = tp.package_id
+                elif tp.simulator_package_id:
+                    package_id_for_coupon = tp.simulator_package_id
+            elif payment_type == 'simulator':
+                from bookings.models import TempBooking
+                tb = TempBooking.objects.filter(temp_id=temp_id_str).first()
+                if not tb:
+                    return Response({'error': 'Temp booking not found.'}, status=status.HTTP_404_NOT_FOUND)
+                guest_phone = tb.buyer_phone or ''
+                ghl_location_id = tb.location_id or ''
+                item_description = item_description or 'Simulator Booking'
+            elif payment_type == 'event':
+                from special_events.models import TempSpecialEventBooking
+                ter = TempSpecialEventBooking.objects.filter(temp_id=temp_id_str).select_related('event', 'user').first()
+                if not ter:
+                    return Response({'error': 'Temp event booking not found.'}, status=status.HTTP_404_NOT_FOUND)
+                guest_phone = getattr(ter.user, 'phone', '') if ter.user else ''
+                if ter.event:
+                    item_description = item_description or f'Event: {ter.event.title}'
+                    ghl_location_id = ter.event.location_id or ''
+            else:
+                item_description = item_description or 'Portal purchase'
+        except Exception as exc:
+            logger.error("Payment link temp resolve failed: %s", exc, exc_info=True)
+            return Response({'error': 'Failed to resolve temp record.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not ghl_location_id:
+            from users.utils import get_location_id_from_request
+            ghl_location_id = get_location_id_from_request(request) or getattr(user, 'ghl_location_id', '') or ''
+
+        discount_amount = 0.0
+        final_amount = original_amount
+        if coupon_code:
+            from coupons.models import Coupon, coupon_applicable_at_location
+            try:
+                coupon_obj = Coupon.objects.select_for_update().get(code=coupon_code)
+            except Coupon.DoesNotExist:
+                return Response(
+                    {'error': f'Coupon "{coupon_code}" is invalid.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if not coupon_applicable_at_location(coupon_obj, ghl_location_id):
+                return Response(
+                    {'error': f'Coupon "{coupon_code}" is invalid.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            purpose = payment_type
+            if payment_type == 'package' and package_id_for_coupon:
+                purpose = f'package:{package_id_for_coupon}'
+            valid, err = coupon_obj.is_valid(
+                payment_type=purpose,
+                email=buyer_email,
+                phone=guest_phone,
+                for_quick_checkout=resolve_for_quick_checkout(request),
+            )
+            if not valid:
+                return Response({'error': err}, status=status.HTTP_400_BAD_REQUEST)
+            discount_amount = coupon_obj.calculate_discount(original_amount)
+            final_amount = round(original_amount - discount_amount, 2)
+            if final_amount <= 0:
+                return Response(
+                    {'error': 'Fully discounted payments are not yet supported for payment links.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        from decimal import Decimal as _Decimal
+        tax_rate = _Decimal('0.14')
+        try:
+            from ghl.models import GHLLocation
+            _loc = GHLLocation.objects.filter(location_id=ghl_location_id).only('tax_rate', 'status').first()
+            if _loc is not None:
+                if _loc.status != 'active':
+                    return Response(
+                        {'error': 'This location is currently inactive. Payments are disabled.'},
+                        status=status.HTTP_403_FORBIDDEN,
+                    )
+                if _loc.tax_rate is not None:
+                    tax_rate = _Decimal(str(_loc.tax_rate))
+        except Exception as _tax_exc:
+            logger.warning("Could not fetch tax_rate for payment link location %s: %s", ghl_location_id, _tax_exc)
+
+        tax_amount = round(float(final_amount) * float(tax_rate), 2)
+        total_with_tax = round(final_amount + tax_amount, 2)
+        amount_cents = int(round(total_with_tax * 100))
+
+        try:
+            sq_access_token, sq_location_id, resolved_ghl = _resolve_square_credentials(temp_id_str, payment_type)
+            if not ghl_location_id:
+                ghl_location_id = resolved_ghl or ghl_location_id
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_402_PAYMENT_REQUIRED)
+
+        try:
+            link_data = create_payment_link(
+                amount_cents=amount_cents,
+                currency=currency,
+                idempotency_key=str(uuid.uuid4()),
+                item_name=item_description or 'Portal purchase',
+                temp_id=temp_id_str,
+                payment_type=payment_type,
+                access_token=sq_access_token,
+                location_id=sq_location_id,
+                buyer_email=buyer_email,
+                redirect_url=redirect_url,
+            )
+        except ValueError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_402_PAYMENT_REQUIRED)
+        except Exception as exc:
+            logger.error("Unexpected payment link error: %s", exc, exc_info=True)
+            return Response({'error': 'Failed to create payment link.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        from .models import PendingPaymentLink
+        pending = PendingPaymentLink.objects.create(
+            temp_id=temp_id_str,
+            payment_type=payment_type,
+            amount=total_with_tax,
+            currency=currency,
+            buyer_email=buyer_email,
+            buyer_phone=guest_phone,
+            item_description=item_description or '',
+            payment_url=link_data['url'],
+            square_payment_link_id=link_data.get('payment_link_id') or '',
+            square_order_id=link_data.get('order_id') or '',
+            created_by=user,
+            ghl_location_id=ghl_location_id or '',
+            coupon_code=coupon_code or '',
+        )
+
+        ghl_location = None
+        try:
+            from ghl.models import GHLLocation
+            if ghl_location_id:
+                ghl_location = GHLLocation.objects.filter(location_id=ghl_location_id).first()
+        except Exception:
+            pass
+
+        from email_service import send_payment_link_email
+        emailed = send_payment_link_email(
+            customer_email=buyer_email,
+            customer_name='',
+            payment_url=link_data['url'],
+            item_description=item_description or 'Portal purchase',
+            amount=total_with_tax,
+            currency=currency,
+            ghl_location=ghl_location,
+            original_amount=original_amount,
+            discount_amount=discount_amount,
+            tax_amount=tax_amount,
+            tax_rate=float(tax_rate),
+            coupon_code=coupon_code or '',
+        )
+
+        return Response({
+            'payment_link_id': pending.id,
+            'payment_url': link_data['url'],
+            'amount': total_with_tax,
+            'base_amount': final_amount,
+            'original_amount': original_amount,
+            'discount_amount': discount_amount,
+            'tax_amount': tax_amount,
+            'currency': currency,
+            'coupon_applied': coupon_code or None,
+            'email_sent': emailed,
+            'message': 'Payment link created' + (' and emailed.' if emailed else ', but email failed.'),
+        }, status=status.HTTP_201_CREATED)
 

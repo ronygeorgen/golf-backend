@@ -1,9 +1,16 @@
 from django.urls import path
-from .views import CouponListCreateView, CouponDetailView, CouponUsageListView, CouponValidateView
+from .views import (
+    CouponListCreateView,
+    CouponDetailView,
+    CouponUsageListView,
+    CouponValidateView,
+    CouponQuickCreateView,
+)
 
 urlpatterns = [
     # Public (authenticated users)
     path('validate/', CouponValidateView.as_view(), name='coupon-validate'),
+    path('quick-create/', CouponQuickCreateView.as_view(), name='coupon-quick-create'),
 
     # Admin only
     path('', CouponListCreateView.as_view(), name='coupon-list-create'),

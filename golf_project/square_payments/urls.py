@@ -11,11 +11,13 @@ from .views import (
     MembershipSubscribeView,
     MembershipCancelView,
     MembershipStatusView,
+    CreatePaymentLinkView,
 )
 
 urlpatterns = [
     # ── Existing payment endpoints ──────────────────────────────────────────
     path('initiate-payment/', InitiateSquarePaymentView.as_view(), name='square-initiate-payment'),
+    path('payment-link/', CreatePaymentLinkView.as_view(), name='square-payment-link'),
     path('webhook/', SquareWebhookView.as_view(), name='square-webhook'),
     path('config/', SquareConfigView.as_view(), name='square-config'),
 

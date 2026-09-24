@@ -10,7 +10,7 @@ from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.pagination import PageNumberPagination
 from rest_framework import permissions
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from users.permissions import IsActiveLocationMember
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -74,7 +74,7 @@ class TenPerPagePagination(PageNumberPagination):
         })
 
 class CoachingPackageViewSet(viewsets.ModelViewSet):
-    queryset = CoachingPackage.objects.all().order_by('-id')
+    queryset = CoachingPackage.objects.filter(is_one_off=False).order_by('-id')
     serializer_class = CoachingPackageSerializer
     
     def get_permissions(self):
@@ -89,7 +89,7 @@ class CoachingPackageViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         location_id = get_location_id_from_request(self.request)
-        queryset = CoachingPackage.objects.all().order_by('-id')
+        queryset = CoachingPackage.objects.filter(is_one_off=False).order_by('-id')
         
         # Filter by location_id (applies to all users including superadmins)
         if location_id:
@@ -177,7 +177,7 @@ class CoachingPackageViewSet(viewsets.ModelViewSet):
         #   1. TPI Assessment packages (legacy)
         #   2. Packages with a redirect_url (legacy pay-flow)
         #   3. Packages linked to any ServiceCategory (Phase C+: all sport categories)
-        active_packages = queryset.filter(is_active=True).filter(
+        active_packages = queryset.filter(is_active=True, is_one_off=False).filter(
             Q(is_tpi_assessment=True) |
             (Q(redirect_url__isnull=False) & ~Q(redirect_url='')) |
             Q(service_category__isnull=False)
@@ -1600,6 +1600,7 @@ class PackagePurchaseWebhookView(APIView):
                 else:
                     # Create coaching package purchase
                     simulator_hours = Decimal(str(package.simulator_hours)) if package.simulator_hours else Decimal('0')
+                    category_hours = Decimal(str(package.category_hours)) if package.category_hours else Decimal('0')
                     purchase = CoachingPackagePurchase.objects.create(
                         client=buyer,
                         package=package,
@@ -1609,6 +1610,8 @@ class PackagePurchaseWebhookView(APIView):
                         sessions_remaining=package.session_count,
                         simulator_hours_total=simulator_hours,
                         simulator_hours_remaining=simulator_hours,
+                        category_hours_total=category_hours,
+                        category_hours_remaining=category_hours,
                         package_status='active',
                         gift_status=None,
                         referral_id=temp_purchase.referral_id  # Copy referral_id from temp_purchase
@@ -1687,6 +1690,7 @@ class PackagePurchaseWebhookView(APIView):
                     )
                 else:
                     simulator_hours = Decimal(str(package.simulator_hours)) if package.simulator_hours else Decimal('0')
+                    category_hours = Decimal(str(package.category_hours)) if package.category_hours else Decimal('0')
                     purchase = CoachingPackagePurchase.objects.create(
                         client=recipient,
                         package=package,
@@ -1696,6 +1700,8 @@ class PackagePurchaseWebhookView(APIView):
                         sessions_remaining=package.session_count,
                         simulator_hours_total=simulator_hours,
                         simulator_hours_remaining=simulator_hours,
+                        category_hours_total=category_hours,
+                        category_hours_remaining=category_hours,
                         package_status='gifted',
                         gift_status='pending',
                         original_owner=buyer,
@@ -1784,6 +1790,7 @@ class PackagePurchaseWebhookView(APIView):
                 from coaching.models import OrganizationPackageMember
                 
                 simulator_hours = Decimal(str(package.simulator_hours)) if package.simulator_hours else Decimal('0')
+                category_hours = Decimal(str(package.category_hours)) if package.category_hours else Decimal('0')
                 purchase = CoachingPackagePurchase.objects.create(
                     client=buyer,
                     package=package,
@@ -1793,6 +1800,8 @@ class PackagePurchaseWebhookView(APIView):
                     sessions_remaining=package.session_count,
                     simulator_hours_total=simulator_hours,
                     simulator_hours_remaining=simulator_hours,
+                    category_hours_total=category_hours,
+                    category_hours_remaining=category_hours,
                     package_status='active',
                     gift_status=None
                 )
@@ -1936,7 +1945,7 @@ class ListPendingRecipientsView(APIView):
 
 
 class SimulatorPackageViewSet(viewsets.ModelViewSet):
-    queryset = SimulatorPackage.objects.all().order_by('-id')
+    queryset = SimulatorPackage.objects.filter(is_one_off=False).order_by('-id')
     serializer_class = SimulatorPackageSerializer
     
     def get_permissions(self):
@@ -1951,7 +1960,7 @@ class SimulatorPackageViewSet(viewsets.ModelViewSet):
     
     def get_queryset(self):
         location_id = get_location_id_from_request(self.request)
-        queryset = SimulatorPackage.objects.all().order_by('-id')
+        queryset = SimulatorPackage.objects.filter(is_one_off=False).order_by('-id')
         
         # Filter by location_id (applies to all users including superadmins)
         if location_id:
@@ -2057,7 +2066,7 @@ class SimulatorPackageViewSet(viewsets.ModelViewSet):
     def active_packages(self, request):
         """Get all active simulator packages"""
         location_id = get_location_id_from_request(request)
-        packages = SimulatorPackage.objects.filter(is_active=True)
+        packages = SimulatorPackage.objects.filter(is_active=True, is_one_off=False)
         
         # Filter by location_id (applies to all users including superadmins)
         if location_id:
@@ -2283,7 +2292,8 @@ class GuestPackagesView(APIView):
         from coaching.models import CoachingPackage, CoachingPackagePurchase
         tpi_packages = CoachingPackage.objects.filter(
             is_tpi_assessment=True,
-            is_active=True
+            is_active=True,
+            is_one_off=False,
         ).prefetch_related('staff_members')
         
         # Filter by location if available

@@ -126,7 +126,12 @@ class BookingCreateSerializer(serializers.ModelSerializer):
                 )
                 if conflicting_bookings.exists():
                     raise serializers.ValidationError("This time slot is already booked for the selected simulator")
-            
+                from .resource_blocks import is_simulator_blocked
+                if is_simulator_blocked(simulator, start_time, end_time):
+                    raise serializers.ValidationError(
+                        "This bay is blocked during the selected time. Please choose another slot."
+                    )
+
             # Note: Coach conflict check is moved to perform_create() in views.py
             # to prevent race conditions using select_for_update() locking
         
@@ -153,6 +158,13 @@ class BookingCreateSerializer(serializers.ModelSerializer):
                     asset_conflict = asset_conflict.exclude(id=exclude_id)
                 if asset_conflict.exists():
                     raise serializers.ValidationError("This asset is already booked for the selected time slot.")
+
+            if category_asset and start_time and end_time:
+                from .resource_blocks import is_category_asset_blocked
+                if is_category_asset_blocked(category_asset, start_time, end_time):
+                    raise serializers.ValidationError(
+                        "This asset is blocked during the selected time. Please choose another slot."
+                    )
 
             if coaching_package:
                 session_duration = coaching_package.session_duration_minutes

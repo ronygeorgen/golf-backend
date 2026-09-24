@@ -15,13 +15,13 @@ class CouponSerializer(serializers.ModelSerializer):
             'applicable_to',
             'max_uses', 'uses_count', 'remaining_uses',
             'per_user_limit', 'valid_from', 'valid_until',
-            'is_active', 'is_currently_valid',
+            'is_active', 'quick_checkout_only', 'is_currently_valid',
             'created_at', 'updated_at',
         ]
-        read_only_fields = ['uses_count', 'created_at', 'updated_at']
+        read_only_fields = ['uses_count', 'quick_checkout_only', 'created_at', 'updated_at']
 
     def get_is_currently_valid(self, obj):
-        valid, _ = obj.is_valid()
+        valid, _ = obj.is_valid(for_quick_checkout=bool(obj.quick_checkout_only))
         return valid
 
     def get_remaining_uses(self, obj):
@@ -72,3 +72,6 @@ class CouponValidateSerializer(serializers.Serializer):
     package_id = serializers.IntegerField(required=False)
     # Optional: specific event ID for per-event coupon restriction checks
     event_id = serializers.IntegerField(required=False)
+    customer_email = serializers.EmailField(required=False, allow_blank=True)
+    customer_phone = serializers.CharField(max_length=20, required=False, allow_blank=True)
+    for_quick_checkout = serializers.BooleanField(required=False, default=False)

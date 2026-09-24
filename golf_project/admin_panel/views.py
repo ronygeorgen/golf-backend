@@ -529,92 +529,38 @@ class StaffViewSet(viewsets.ModelViewSet):
                 service_category_id=category_id,
             )
             
-            # Find and cancel conflicting coaching bookings
-            
-            # Use center timezone (DST-aware — reads from GHLLocation.timezone)
-            from golf_project.timezone_utils import get_center_timezone
-            center_tz = get_center_timezone(location_id)
-            
-            if is_full_day:
-                # Full-day block: cancel all bookings on this date
-                start_of_day_local = center_tz.localize(dt.combine(block_date, dt_time.min))
-                end_of_day_local = center_tz.localize(dt.combine(block_date, dt_time.max))
-                
-                bookings_to_cancel = Booking.objects.filter(
-                    coach=staff,
-                    booking_type='coaching',
-                    start_time__range=(start_of_day_local, end_of_day_local),
-                    status='confirmed'
-                ).select_related('client', 'package_purchase', 'coaching_package')
-            else:
-                # Partial-day block: cancel only bookings that overlap with the blocked time range
-                # Convert block times to datetime for comparison
-                block_start_dt = center_tz.localize(dt.combine(block_date, start_time))
-                block_end_dt = center_tz.localize(dt.combine(block_date, end_time))
-                
-                # Fetch bookings for the whole local day (converted to UTC range)
-                # Avoid using start_time__date as it compares against UTC date
-                start_of_day_local = center_tz.localize(dt.combine(block_date, dt.min.time()))
-                end_of_day_local = center_tz.localize(dt.combine(block_date, dt.max.time()))
-                
-                bookings_to_cancel = Booking.objects.filter(
-                    coach=staff,
-                    booking_type='coaching',
-                    start_time__range=(start_of_day_local, end_of_day_local),
-                    status='confirmed'
-                ).select_related('client', 'package_purchase', 'coaching_package')
-                
-                # Filter for time overlap in memory (to handle exact minutes/seconds properly)
-                # booking_start < block_end AND booking_end > block_start
-                bookings_to_cancel = [
-                    b for b in bookings_to_cancel
-                    if b.start_time < block_end_dt and b.end_time > block_start_dt
-                ]
-            
-            cancelled_count = 0
-            refunded_sessions = 0
-            refunded_hours = Decimal('0')
-            
-            with transaction.atomic():
-                for booking in bookings_to_cancel:
-                    # Cancel the booking
-                    booking.status = 'cancelled'
-                    booking.save()
-                    
-                    # Refund credits based on booking type
-                    if booking.package_purchase:
-                        # Refund coaching session
-                        purchase = booking.package_purchase
-                        purchase.sessions_remaining = F('sessions_remaining') + 1
-                        purchase.save()
-                        purchase.refresh_from_db()
-                        refunded_sessions += 1
-                    
-                    cancelled_count += 1
-                    
-                    # Log the cancellation
-                    print(
-                        f"Cancelled booking {booking.id} for {booking.client.username} "
-                        f"due to staff {staff.username} being blocked on {block_date}"
-                    )
-            
-            
-            # Prepare response
+            # Cancel overlapping coaching bookings + refund + email (shared helper)
+            from admin_panel.block_cancellations import cancel_for_staff_block
+            cancel_stats = cancel_for_staff_block(
+                staff=staff,
+                block_date=block_date,
+                start_time=start_time,
+                end_time=end_time,
+                location_id=location_id or staff.ghl_location_id,
+                issued_by=request.user,
+                reason=reason,
+            )
+            cancel_stats.pop('_email_ctx', None)
+
             serializer = StaffBlockedDateSerializer(blocked_date)
-            
-            # Create appropriate message based on block type
+
             if is_full_day:
                 block_description = f"full day on {date_str}"
             else:
                 block_description = f"{date_str} from {start_time_str} to {end_time_str}"
-            
+
             return Response({
                 'blocked_date': serializer.data,
-                'cancelled_bookings': cancelled_count,
-                'refunded_sessions': refunded_sessions,
-                'refunded_simulator_hours': float(refunded_hours),
-                'message': f'Successfully blocked {block_description} for {staff.first_name} {staff.last_name}. '
-                          f'Cancelled {cancelled_count} booking(s) and refunded credits to clients.'
+                'cancelled_bookings': cancel_stats['cancelled_bookings'],
+                'refunded_sessions': cancel_stats['refunded_sessions'],
+                'refunded_simulator_hours': cancel_stats['refunded_simulator_hours'],
+                'refunded_category_hours': cancel_stats['refunded_category_hours'],
+                'emails_sent': cancel_stats['emails_sent'],
+                'message': (
+                    f'Successfully blocked {block_description} for {staff.first_name} {staff.last_name}. '
+                    f"Cancelled {cancel_stats['cancelled_bookings']} booking(s), "
+                    f"refunded credits, emailed {cancel_stats['emails_sent']} client(s)."
+                ),
             }, status=status.HTTP_201_CREATED)
         
         elif request.method == 'DELETE':

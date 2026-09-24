@@ -16,6 +16,7 @@ from .views import (
     SimulatorPackagePurchaseViewSet,
     GuestPackagesView,
 )
+from .quick_checkout_views import QuickCheckoutOneOffView, QuickCheckoutCatalogTempView
 
 router = DefaultRouter()
 router.register(r'packages', CoachingPackageViewSet, basename='coaching-package')
@@ -34,6 +35,8 @@ urlpatterns = [
     path('pending-recipients/', ListPendingRecipientsView.as_view(), name='list-pending-recipients'),
     path('webhook/purchase/', PackagePurchaseWebhookView.as_view(), name='package-purchase-webhook'),
     path('guest-packages/', GuestPackagesView.as_view(), name='guest-packages'),
+    path('quick-checkout/one-off/', QuickCheckoutOneOffView.as_view(), name='quick-checkout-one-off'),
+    path('quick-checkout/temp-purchase/', QuickCheckoutCatalogTempView.as_view(), name='quick-checkout-temp-purchase'),
 ]
 
 

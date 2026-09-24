@@ -20,9 +20,20 @@ def is_simulator_slot_available(
     use_locking=True,
 ):
     """
-    True if no confirmed/completed booking and no active reserved TempBooking
-    overlaps [start_time, end_time) on this simulator.
+    True if no confirmed/completed booking, no active reserved TempBooking,
+    and no admin bay blackout overlaps [start_time, end_time) on this simulator.
     """
+    from .resource_blocks import is_simulator_blocked
+
+    if is_simulator_blocked(simulator, start_time, end_time):
+        logger.info(
+            "Simulator %s blocked by admin blackout for time slot %s - %s",
+            getattr(simulator, "bay_number", simulator.pk),
+            start_time,
+            end_time,
+        )
+        return False
+
     booking_query = Booking.objects.filter(
         simulator=simulator,
         start_time__lt=end_time,
