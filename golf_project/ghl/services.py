@@ -557,7 +557,16 @@ class GHLClient:
                         return update_response.json()
                     else:
                         logger.error(f"Failed to update contact {phone}: {update_response.text}")
-                        # If update fails, try to get the contact by phone
+                        # PUT often fails with "duplicated contacts" when phone is in body —
+                        # still push custom fields (OTP) by known contact_id.
+                        if custom_fields and contact_id:
+                            get_contact_custom_field_mapping(location_id)
+                            if set_contact_custom_values(contact_id, location_id, custom_fields):
+                                logger.info(
+                                    "Set custom fields for duplicate contact %s after PUT failed",
+                                    contact_id,
+                                )
+                                return {'contact': {'id': contact_id}, 'custom_fields_only': True}
                         return self._get_contact_by_phone_and_update(phone, location_id, payload, custom_fields)
                 else:
                     logger.error(f"Could not extract contact ID from duplicate error")
@@ -725,7 +734,9 @@ def sync_user_contact(user, *, location_id: Optional[str] = None,
                       tags: Optional[List[str]] = None, custom_fields: Optional[dict] = None):
     """
     Production-ready contact sync with custom fields.
-    Follows the same pattern as login: create/update contact, then set custom field values.
+    If user already has ghl_contact_id and custom fields (e.g. Login Otp), update those
+    only — do not create-by-phone (avoids duplicated contacts / 403).
+    Otherwise create/update contact, then set custom field values.
     """
     if not user or not getattr(user, 'phone', None):
         logger.warning("Cannot sync user to GHL: user or phone missing")
@@ -776,8 +787,35 @@ def sync_user_contact(user, *, location_id: Optional[str] = None,
         date_of_birth = None
         if hasattr(user, 'date_of_birth') and user.date_of_birth:
             date_of_birth = user.date_of_birth.strftime('%Y-%m-%d')
+
+        existing_contact_id = (getattr(user, 'ghl_contact_id', None) or '').strip() or None
+
+        # Fast path: known contact — only push custom fields (OTP, etc.). Avoid POST create-by-phone.
+        if existing_contact_id and mapped_custom_fields:
+            logger.info(
+                "Using existing GHL contact_id %s for user %s — setting custom fields only",
+                existing_contact_id,
+                user.id,
+            )
+            get_contact_custom_field_mapping(resolved_location)
+            ok = set_contact_custom_values(
+                existing_contact_id, resolved_location, mapped_custom_fields
+            )
+            if ok:
+                logger.info(
+                    "Successfully set custom fields for user %s contact %s (location %s)",
+                    user.id,
+                    existing_contact_id,
+                    resolved_location,
+                )
+                return {'contact': {'id': existing_contact_id}, 'custom_fields_only': True}, existing_contact_id
+            logger.warning(
+                "Custom-field update failed for contact %s (user %s); falling back to upsert",
+                existing_contact_id,
+                user.id,
+            )
         
-        # Try to sync contact
+        # Try to sync contact (create new or recover existing)
         response = client.upsert_contact(
             phone=user.phone,
             email=getattr(user, 'email', None),
@@ -792,6 +830,9 @@ def sync_user_contact(user, *, location_id: Optional[str] = None,
         contact_id = None
         if response and isinstance(response, dict):
             contact_id = response.get('contact', {}).get('id') or response.get('id')
+
+        if not contact_id and existing_contact_id:
+            contact_id = existing_contact_id
 
         if contact_id and user.ghl_contact_id != contact_id:
             user.ghl_contact_id = contact_id
@@ -814,7 +855,14 @@ def sync_user_contact(user, *, location_id: Optional[str] = None,
                     set_contact_custom_values(contact_id, resolved_location, mapped_custom_fields)
                     logger.info("Set custom fields for existing contact %s", contact_id)
 
-        logger.info("Successfully synced user %s to GHL location %s", user.id, resolved_location)
+        if contact_id:
+            logger.info("Successfully synced user %s to GHL location %s (contact %s)", user.id, resolved_location, contact_id)
+        else:
+            logger.warning(
+                "GHL sync incomplete for user %s (location %s): no contact_id; custom fields may be missing",
+                user.id,
+                resolved_location,
+            )
         return response, contact_id
         
     except Exception as exc:
