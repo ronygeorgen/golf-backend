@@ -24,6 +24,20 @@ def _staff_only(user):
     )
 
 
+def _normalize_location_id(value):
+    if not value:
+        return None
+    normalized = str(value).strip().rstrip('+').strip()
+    return normalized or None
+
+
+def _location_mismatch(resource_location_id, request_location_id):
+    """True only when both sides are set and differ after normalize."""
+    req = _normalize_location_id(request_location_id)
+    res = _normalize_location_id(resource_location_id)
+    return bool(req and res and req != res)
+
+
 def _get_blockable_coach(resource_id):
     """Staff, admin, or superadmin who can be blocked as a coach."""
     from users.models import User
@@ -417,7 +431,7 @@ class CalendarBlockView(APIView):
                             staff = _get_blockable_coach(resource_id)
                         except User.DoesNotExist:
                             return Response({'error': f'Coach not found (id={resource_id}).'}, status=status.HTTP_404_NOT_FOUND)
-                        if location_id and staff.ghl_location_id and staff.ghl_location_id != location_id:
+                        if _location_mismatch(staff.ghl_location_id, location_id):
                             return Response({'error': 'Coach not in your location.'}, status=status.HTTP_403_FORBIDDEN)
                         data = preview_for_staff_block(
                             staff, parsed['date'], parsed['start_time'], parsed['end_time'],
@@ -429,7 +443,7 @@ class CalendarBlockView(APIView):
                             sim = Simulator.objects.get(id=resource_id)
                         except Simulator.DoesNotExist:
                             return Response({'error': f'Simulator not found (id={resource_id}).'}, status=status.HTTP_404_NOT_FOUND)
-                        if location_id and sim.location_id and sim.location_id != location_id:
+                        if _location_mismatch(sim.location_id, location_id):
                             return Response({'error': 'Simulator not in your location.'}, status=status.HTTP_403_FORBIDDEN)
                         data = preview_for_simulator_block(
                             sim, parsed['date'], parsed['start_time'], parsed['end_time'],
@@ -441,7 +455,7 @@ class CalendarBlockView(APIView):
                             asset = CategoryAsset.objects.get(id=resource_id)
                         except CategoryAsset.DoesNotExist:
                             return Response({'error': f'Asset not found (id={resource_id}).'}, status=status.HTTP_404_NOT_FOUND)
-                        if location_id and asset.location_id and asset.location_id != location_id:
+                        if _location_mismatch(asset.location_id, location_id):
                             return Response({'error': 'Asset not in your location.'}, status=status.HTTP_403_FORBIDDEN)
                         data = preview_for_asset_block(
                             asset, parsed['date'], parsed['start_time'], parsed['end_time'],
@@ -477,7 +491,7 @@ class CalendarBlockView(APIView):
                     staff = _get_blockable_coach(resource_id)
                 except User.DoesNotExist:
                     return Response({'error': f'Coach not found (id={resource_id}).'}, status=status.HTTP_404_NOT_FOUND)
-                if location_id and staff.ghl_location_id and staff.ghl_location_id != location_id:
+                if _location_mismatch(staff.ghl_location_id, location_id):
                     return Response({'error': 'Coach not in your location.'}, status=status.HTTP_403_FORBIDDEN)
                 resolved.append(('staff', staff))
             elif resource_type == 'simulator':
@@ -486,7 +500,7 @@ class CalendarBlockView(APIView):
                     sim = Simulator.objects.get(id=resource_id)
                 except Simulator.DoesNotExist:
                     return Response({'error': f'Simulator not found (id={resource_id}).'}, status=status.HTTP_404_NOT_FOUND)
-                if location_id and sim.location_id and sim.location_id != location_id:
+                if _location_mismatch(sim.location_id, location_id):
                     return Response({'error': 'Simulator not in your location.'}, status=status.HTTP_403_FORBIDDEN)
                 resolved.append(('simulator', sim))
             else:
@@ -495,7 +509,7 @@ class CalendarBlockView(APIView):
                     asset = CategoryAsset.objects.get(id=resource_id)
                 except CategoryAsset.DoesNotExist:
                     return Response({'error': f'Asset not found (id={resource_id}).'}, status=status.HTTP_404_NOT_FOUND)
-                if location_id and asset.location_id and asset.location_id != location_id:
+                if _location_mismatch(asset.location_id, location_id):
                     return Response({'error': 'Asset not in your location.'}, status=status.HTTP_403_FORBIDDEN)
                 resolved.append(('asset', asset))
 
