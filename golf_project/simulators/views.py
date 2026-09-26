@@ -1,7 +1,7 @@
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated, IsAdminUser, AllowAny
+from rest_framework.permissions import IsAuthenticated, IsAdminUser, AllowAny, BasePermission
 from rest_framework.exceptions import PermissionDenied
 from django.utils import timezone
 from datetime import datetime
@@ -13,6 +13,31 @@ from .serializers import (
     SimulatorCreditSerializer
 )
 
+
+def _normalize_location_id(value):
+    if not value:
+        return None
+    normalized = str(value).strip().rstrip('+').strip()
+    return normalized or None
+
+
+class IsPortalAdminOrSuperadmin(BasePermission):
+    """
+    Portal admin/superadmin (by role), not Django is_staff.
+    JWT users often have role=admin but is_staff=False — IsAdminUser wrongly 403s.
+    Staff may block bays on the calendar; they may not create/update/deactivate bays here.
+    """
+
+    def has_permission(self, request, view):
+        user = request.user
+        if not user or not user.is_authenticated:
+            return False
+        if getattr(user, 'is_superuser', False):
+            return True
+        role = getattr(user, 'role', '') or ''
+        return role in ('admin', 'superadmin')
+
+
 class SimulatorViewSet(viewsets.ModelViewSet):
     queryset = Simulator.objects.all().order_by('bay_number')
     serializer_class = SimulatorSerializer
@@ -23,11 +48,9 @@ class SimulatorViewSet(viewsets.ModelViewSet):
         """
         if self.action in ['list', 'retrieve', 'active_simulators']:
             permission_classes = [AllowAny]  # Public access for viewing simulators
-        elif self.action == 'deactivate_and_reassign':
-            # Role check in the action; JWT staff may not have Django is_staff.
-            permission_classes = [IsAuthenticated]
         else:
-            permission_classes = [IsAuthenticated, IsAdminUser]  # Admin only for create/update/delete
+            # Admin page bay CRUD / deactivate: admin + superadmin only (not staff).
+            permission_classes = [IsAuthenticated, IsPortalAdminOrSuperadmin]
         return [permission() for permission in permission_classes]
     
     def get_queryset(self):
@@ -104,7 +127,9 @@ class SimulatorViewSet(viewsets.ModelViewSet):
     
     @action(detail=True, methods=['post'])
     def toggle_active(self, request, pk=None):
+        from users.utils import get_location_id_from_request
         simulator = self.get_object()
+        self._assert_simulator_in_location(simulator, get_location_id_from_request(request))
         simulator.is_active = not simulator.is_active
         simulator.save()
         return Response({
@@ -112,13 +137,13 @@ class SimulatorViewSet(viewsets.ModelViewSet):
             'is_active': simulator.is_active
         })
 
-    def _staff_can_manage_simulators(self, user):
-        if not user or not user.is_authenticated:
-            return False
-        if getattr(user, 'is_superuser', False):
-            return True
-        role = getattr(user, 'role', '') or ''
-        return role in ('admin', 'staff', 'superadmin')
+    def _assert_simulator_in_location(self, simulator, location_id):
+        loc = _normalize_location_id(location_id)
+        sim_loc = _normalize_location_id(simulator.location_id)
+        if loc and sim_loc and sim_loc != loc:
+            raise PermissionDenied(
+                'You can only manage simulators for your assigned location.'
+            )
 
     @action(detail=True, methods=['post'], url_path='deactivate_and_reassign')
     def deactivate_and_reassign(self, request, pk=None):
@@ -126,17 +151,12 @@ class SimulatorViewSet(viewsets.ModelViewSet):
         Preview or run: move confirmed future bookings on this bay to other active bays
         (same start/end), optionally allow coaching bays, optionally deactivate this bay after.
         """
-        if not self._staff_can_manage_simulators(request.user):
-            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
-
+        # Permission already enforced by IsPortalAdminOrSuperadmin
         simulator = self.get_object()
         from users.utils import get_location_id_from_request
 
         location_id = get_location_id_from_request(request)
-        if location_id and simulator.location_id and simulator.location_id != location_id:
-            raise PermissionDenied(
-                'You can only manage simulators for your assigned location.'
-            )
+        self._assert_simulator_in_location(simulator, location_id)
 
         def _as_bool(value, default=False):
             if value is None:
@@ -179,11 +199,9 @@ class SimulatorViewSet(viewsets.ModelViewSet):
         from users.utils import get_location_id_from_request
         simulator = self.get_object()
         
-        # Verify simulator belongs to admin's location
+        # Verify simulator belongs to admin's location (normalize + / whitespace)
         location_id = get_location_id_from_request(request)
-        if location_id and simulator.location_id != location_id:
-            from rest_framework.exceptions import PermissionDenied
-            raise PermissionDenied("You can only manage availability for simulators in your location.")
+        self._assert_simulator_in_location(simulator, location_id)
         
         if request.method == 'GET':
             # Get all recurring weekly availability
